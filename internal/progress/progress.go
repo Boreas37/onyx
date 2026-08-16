@@ -28,9 +28,14 @@ type Bar struct {
 	findings atomic.Int64
 	current  atomic.Value // string
 
-	pad int // width of the last drawn progress line
-	mu  sync.Mutex
+	pad    int       // width of the last drawn progress line
+	mu     sync.Mutex
+	lastSh time.Time // last throttle window start
 }
+
+// renderThrottle is the minimum interval between live progress redraws.
+// It is a variable so tests can disable throttling (set to 0).
+var renderThrottle = 80 * time.Millisecond
 
 // New returns a Bar writing to out. silent suppresses all output.
 func New(out io.Writer, silent bool) *Bar {
@@ -99,6 +104,18 @@ func (b *Bar) render() {
 	if b.silent || !b.tty {
 		return
 	}
+	// Throttle redraws: with a fast worker pool (5-20 threads) the bar would
+	// otherwise redraw for every request, which some terminals render as a
+	// flood of lines. Redraw at most ~12 times per second and always make
+	// the final state visible when Finish is called.
+	b.mu.Lock()
+	if time.Since(b.lastSh) < renderThrottle {
+		b.mu.Unlock()
+		return
+	}
+	b.lastSh = time.Now()
+	b.mu.Unlock()
+
 	line := b.line()
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -132,10 +149,17 @@ func (b *Bar) Finish() {
 	if b.silent || !b.tty {
 		return
 	}
+	// Force a final redraw so the completed state is visible even if the
+	// last render was throttled, then erase the line.
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.pad > 0 {
-		fmt.Fprintf(b.out, "\r%s\r", strings.Repeat(" ", b.pad))
-		b.pad = 0
+	line := b.line()
+	if b.pad >= len(line) {
+		fmt.Fprintf(b.out, "\r%s%s", line, strings.Repeat(" ", b.pad-len(line)))
+	} else {
+		fmt.Fprint(b.out, "\r"+line)
 	}
+	b.pad = len(line)
+	fmt.Fprintf(b.out, "\r%s\r", strings.Repeat(" ", b.pad))
+	b.pad = 0
+	b.mu.Unlock()
 }

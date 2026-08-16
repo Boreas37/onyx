@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestNonTTYNoProgressCarriage verifies that a non-terminal output never
@@ -49,6 +50,9 @@ func TestSilentSuppressesEverything(t *testing.T) {
 // TestTTYRenderSingleLine forces terminal rendering and checks the live
 // single-line format: counter, current item, findings and elapsed time.
 func TestTTYRenderSingleLine(t *testing.T) {
+	renderThrottle = 0 // disable throttling for deterministic output
+	defer func() { renderThrottle = 80 * time.Millisecond }()
+
 	var buf bytes.Buffer
 	b := New(&buf, false)
 	b.tty = true // white-box: force the terminal code path
