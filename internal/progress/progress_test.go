@@ -63,10 +63,14 @@ func TestTTYRenderSingleLine(t *testing.T) {
 	b.SetCurrent("plugin:elementor readme.txt (3.24.0)")
 
 	got := buf.String()
-	for _, want := range []string{"[12/200]", "plugin:elementor readme.txt (3.24.0)", "2 findings", "elapsed"} {
+	for _, want := range []string{"%", "12/200", "0s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("progress line missing %q: %q", want, got)
 		}
+	}
+	// The live line must be a percentage bar, not a per-request label flood.
+	if strings.Contains(got, "plugin:elementor") {
+		t.Errorf("bar must not embed per-request labels: %q", got)
 	}
 	if strings.Contains(got, "\n") {
 		t.Errorf("progress render must stay on a single line: %q", got)
@@ -84,6 +88,9 @@ func TestTTYRenderSingleLine(t *testing.T) {
 // TestTTYInfClearsLine verifies an [INF] log on a TTY erases the in-flight
 // progress line before printing, then redraws it.
 func TestTTYInfClearsLine(t *testing.T) {
+	renderThrottle = 0 // disable throttling for deterministic output
+	defer func() { renderThrottle = 80 * time.Millisecond }()
+
 	var buf bytes.Buffer
 	b := New(&buf, false)
 	b.tty = true
@@ -95,7 +102,7 @@ func TestTTYInfClearsLine(t *testing.T) {
 	if !strings.Contains(got, "[INF] scan started") {
 		t.Errorf("expected INF log, got %q", got)
 	}
-	if !strings.Contains(got, "[0/10]") {
+	if !strings.Contains(got, "0/10") {
 		t.Errorf("expected progress redraw after INF log, got %q", got)
 	}
 }
