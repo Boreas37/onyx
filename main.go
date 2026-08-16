@@ -68,6 +68,7 @@ type scanOptions struct {
 	maxReq      int
 	output      string
 	silent      bool
+	progress    bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -89,6 +90,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.stealth = true
 		case a == "--verbose":
 			o.verbose = true
+		case a == "--progress":
+			o.progress = true
 		case a == "--silent":
 			o.silent = true
 		case a == "--min-severity" && i+1 < len(args):
@@ -168,6 +171,7 @@ Scan flags:
   --max-requests N   cap on brute-force enumeration requests (default: 500)
   --output FILE      write JSON results to FILE (table still prints to stdout)
   --silent           suppress progress output
+  --progress         show live progress bar while scanning (off by default)
 `, defaultDB)
 }
 
@@ -204,8 +208,12 @@ func runScan(target string, o scanOptions) {
 		os.Exit(1)
 	}
 
-	bar := progress.New(os.Stderr, o.silent)
-	sc.SetProgress(bar)
+	// Progress bar is opt-in (--progress). By default the scan runs silently
+	// and only results are printed — no per-request noise on the terminal.
+	if o.progress {
+		bar := progress.New(os.Stderr, o.silent)
+		sc.SetProgress(bar)
+	}
 
 	res, err := sc.Scan()
 	if err != nil && res == nil {
@@ -213,11 +221,15 @@ func runScan(target string, o scanOptions) {
 		os.Exit(1)
 	}
 
+	if pr := sc.Progress(); pr != nil {
+		pr.Finish()
+	}
+
 	if o.output != "" {
 		if werr := writeScanOutput(o.output, res); werr != nil {
 			fmt.Fprintln(os.Stderr, "error writing output:", werr)
-		} else {
-			bar.LogInf("results written to %s", o.output)
+		} else if pr := sc.Progress(); pr != nil {
+			pr.LogInf("results written to %s", o.output)
 		}
 	}
 

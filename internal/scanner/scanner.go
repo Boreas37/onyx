@@ -140,6 +140,11 @@ func (s *Scanner) SetProgress(b *progress.Bar) {
 	s.progress = b
 }
 
+// Progress returns the attached progress bar, or nil.
+func (s *Scanner) Progress() *progress.Bar {
+	return s.progress
+}
+
 // enumeratePlugins reports whether plugins should be enumerated.
 func (s *Scanner) enumeratePlugins() bool { return strings.Contains(s.enum, "p") }
 
