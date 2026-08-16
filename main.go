@@ -236,6 +236,10 @@ func update(dst string) error {
 	}
 	defer zr.Close()
 
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".onyx-db-*")
 	if err != nil {
 		return err
