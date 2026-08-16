@@ -44,10 +44,11 @@ func severityColor(rating string) string {
 
 // PrintBanner prints the startup banner (nuclei-style MOTD).
 func PrintBanner(version string, dbRecords int) {
-	fmt.Printf(`  _____  ____  __   ____
- / ___/ / __ \/ /  / __ \
-/ /__  / /_/ / /__/ /_/ /
-\___/  \____/____/\____/  v%s
+	fmt.Printf(`____  ____  __  ___  __
+ / __ \/ __ \/ / / / |/_/
+/ /_/ / / / / /_/ />  <
+\____/_/ /_/\__, /_/|_|
+           /____/  v%s
 
 `, version)
 	if dbRecords > 0 {
