@@ -1,10 +1,14 @@
 package main
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -50,12 +54,13 @@ func main() {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath   string
-	threads  int
-	timeout  int
-	asJSON   bool
-	apiOnly  bool
-	stealth  bool
+	dbPath    string
+	threads   int
+	timeout   int
+	asJSON    bool
+	apiOnly   bool
+	stealth   bool
+	rateLimit float64
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -83,6 +88,12 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--timeout" && i+1 < len(args):
 			i++
 			o.timeout = atoi(args[i], 10)
+		case a == "--rate-limit" && i+1 < len(args):
+			i++
+			rl, err := strconv.ParseFloat(args[i], 64)
+			if err == nil && rl > 0 {
+				o.rateLimit = rl
+			}
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
@@ -112,12 +123,13 @@ Usage:
   onyx version               print the version
 
 Scan flags:
-  --db PATH      database file (default: %s)
-  --threads N    concurrent requests (default: 5)
-  --timeout S    per-request timeout in seconds (default: 10)
-  --json         print results as JSON
-  --api          only query the REST API, skip brute-force enumeration
-  --stealth      one request per second
+  --db PATH        database file (default: %s)
+  --threads N      concurrent requests (default: 5)
+  --timeout S      per-request timeout in seconds (default: 10)
+  --json           print results as JSON
+  --api            only query the REST API, skip brute-force enumeration
+  --stealth        one request per second
+  --rate-limit N   max requests per second (overrides --stealth)
 `, defaultDB)
 }
 
@@ -135,10 +147,11 @@ func runScan(target string, o scanOptions) {
 	}
 
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
-		Threads: o.threads,
-		Timeout: time.Duration(o.timeout) * time.Second,
-		APIOnly: o.apiOnly,
-		Stealth: o.stealth,
+		Threads:   o.threads,
+		Timeout:   time.Duration(o.timeout) * time.Second,
+		APIOnly:   o.apiOnly,
+		Stealth:   o.stealth,
+		RateLimit: o.rateLimit,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -159,9 +172,89 @@ func runScan(target string, o scanOptions) {
 	report.PrintTable(res)
 }
 
+// update fetches the newest database release from the onyx-db GitHub repo,
+// downloads the compressed feed asset, and unpacks it to dst.
 func update(dst string) error {
-	fmt.Println("update: fetching latest database from GitHub...")
-	// TODO: pull the newest release asset from the onyx-db repo and unpack it to dst.
-	// Until then, point --db at a local copy of the Wordfence feed.
+	const repo = "Boreas37/onyx-db"
+	const asset = "wordfence-latest.json.gz"
+
+	fmt.Printf("update: fetching latest database from %s...\n", repo)
+
+	// 1. Latest release metadata
+	relURL := "https://api.github.com/repos/" + repo + "/releases/latest"
+	req, err := http.NewRequest("GET", relURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "onyx")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("release lookup: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("release lookup: HTTP %d", resp.StatusCode)
+	}
+
+	var rel struct {
+		TagName string `json:"tag_name"`
+		Assets  []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return fmt.Errorf("release decode: %w", err)
+	}
+
+	var assetURL string
+	for _, a := range rel.Assets {
+		if a.Name == asset {
+			assetURL = a.BrowserDownloadURL
+			break
+		}
+	}
+	if assetURL == "" {
+		return fmt.Errorf("asset %s not found in release %s", asset, rel.TagName)
+	}
+
+	// 2. Download the gzipped feed
+	gzResp, err := http.Get(assetURL)
+	if err != nil {
+		return fmt.Errorf("asset download: %w", err)
+	}
+	defer gzResp.Body.Close()
+	if gzResp.StatusCode != 200 {
+		return fmt.Errorf("asset download: HTTP %d", gzResp.StatusCode)
+	}
+
+	// 3. Gunzip into a temp file, then move into place
+	zr, err := gzip.NewReader(gzResp.Body)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer zr.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".onyx-db-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := io.Copy(tmp, zr); err != nil {
+		tmp.Close()
+		return fmt.Errorf("unpack: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), dst); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+
+	if fi, err := os.Stat(dst); err == nil {
+		fmt.Printf("update: done — %s (%d bytes)\n", dst, fi.Size())
+	}
 	return nil
 }
