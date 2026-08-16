@@ -148,6 +148,10 @@ func runScan(target string, o scanOptions) {
 		os.Exit(1)
 	}
 
+	if !o.asJSON {
+		report.PrintBanner("0.1.0", database.Count())
+	}
+
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
 		Threads:   o.threads,
 		Timeout:   time.Duration(o.timeout) * time.Second,
