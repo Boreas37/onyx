@@ -16,10 +16,11 @@ scan as many sites as you want.
 ## Install
 
 ```bash
-go build -o onyx .
+go install github.com/Boreas37/onyx@latest
 ```
 
-That's it. One binary, no runtime deps.
+That puts `onyx` in `$(go env GOPATH)/bin`. Make sure that's on your PATH.
+No runtime deps, one binary.
 
 ## Usage
 
@@ -30,7 +31,7 @@ onyx update
 ```
 
 This downloads the latest compressed feed from the `onyx-db` repository and
-unpacks it to `data/wordfence.json`.
+unpacks it to `data/wordfence.json` (creating the directory if needed).
 
 Then scan a site:
 
