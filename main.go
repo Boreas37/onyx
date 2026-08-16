@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/report"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
@@ -54,15 +55,19 @@ func main() {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath     string
-	threads    int
-	timeout    int
-	asJSON     bool
-	apiOnly    bool
-	stealth    bool
-	rateLimit  float64
-	verbose    bool
+	dbPath      string
+	threads     int
+	timeout     int
+	asJSON      bool
+	apiOnly     bool
+	stealth     bool
+	rateLimit   float64
+	verbose     bool
 	minSeverity string
+	enumerate   string
+	maxReq      int
+	output      string
+	silent      bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -72,6 +77,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.dbPath = defaultDB
 	o.threads = 5
 	o.timeout = 10
+	o.maxReq = 500
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -83,6 +89,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.stealth = true
 		case a == "--verbose":
 			o.verbose = true
+		case a == "--silent":
+			o.silent = true
 		case a == "--min-severity" && i+1 < len(args):
 			i++
 			o.minSeverity = strings.ToLower(args[i])
@@ -101,12 +109,29 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			if err == nil && rl > 0 {
 				o.rateLimit = rl
 			}
+		case a == "--enumerate" && i+1 < len(args):
+			i++
+			o.enumerate = strings.ToLower(args[i])
+		case a == "--max-requests" && i+1 < len(args):
+			i++
+			o.maxReq = atoi(args[i], 500)
+		case a == "--output" && i+1 < len(args):
+			i++
+			o.output = args[i]
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
 		default:
 			if target == "" {
 				target = a
+			}
+		}
+	}
+	if o.enumerate != "" {
+		for _, c := range o.enumerate {
+			if !strings.ContainsRune("ptu", c) {
+				fmt.Fprintf(os.Stderr, "invalid --enumerate value %q (use p, t and/or u)\n", o.enumerate)
+				os.Exit(2)
 			}
 		}
 	}
@@ -139,6 +164,10 @@ Scan flags:
   --rate-limit N     max requests per second (overrides --stealth)
   --verbose          full one-line-per-finding output (default: compact)
   --min-severity S   only show findings >= severity (critical|high|medium|low)
+  --enumerate M      enumerate p (plugins), t (themes), u (users); combine (default: pt)
+  --max-requests N   cap on brute-force enumeration requests (default: 500)
+  --output FILE      write JSON results to FILE (table still prints to stdout)
+  --silent           suppress progress output
 `, defaultDB)
 }
 
@@ -162,21 +191,34 @@ func runScan(target string, o scanOptions) {
 	}
 
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
-		Threads:   o.threads,
-		Timeout:   time.Duration(o.timeout) * time.Second,
-		APIOnly:   o.apiOnly,
-		Stealth:   o.stealth,
-		RateLimit: o.rateLimit,
+		Threads:     o.threads,
+		Timeout:     time.Duration(o.timeout) * time.Second,
+		APIOnly:     o.apiOnly,
+		Stealth:     o.stealth,
+		RateLimit:   o.rateLimit,
+		MaxRequests: o.maxReq,
+		Enumerate:   o.enumerate,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 
+	bar := progress.New(os.Stderr, o.silent)
+	sc.SetProgress(bar)
+
 	res, err := sc.Scan()
 	if err != nil && res == nil {
 		fmt.Fprintln(os.Stderr, "scan failed:", err)
 		os.Exit(1)
+	}
+
+	if o.output != "" {
+		if werr := writeScanOutput(o.output, res); werr != nil {
+			fmt.Fprintln(os.Stderr, "error writing output:", werr)
+		} else {
+			bar.LogInf("results written to %s", o.output)
+		}
 	}
 
 	if o.asJSON {
@@ -185,6 +227,20 @@ func runScan(target string, o scanOptions) {
 		return
 	}
 	report.PrintTable(res, o.verbose, o.minSeverity)
+}
+
+// writeScanOutput serializes res as indented JSON to path, creating the
+// parent directory if needed.
+func writeScanOutput(path string, res *scanner.Result) error {
+	out, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, out, 0o644)
 }
 
 // update fetches the newest database release from the onyx-db GitHub repo,

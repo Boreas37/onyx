@@ -49,6 +49,15 @@ onyx scan https://example.com
 | `--json` | Machine-readable output |
 | `--api` | Only query the REST API, skip brute-force enumeration |
 | `--stealth` | One request per second, for noisy environments |
+| `--rate-limit N` | Max requests per second (overrides `--stealth`) |
+| `--verbose` | Full one-line-per-finding output (default is a compact summary) |
+| `--min-severity S` | Only show findings >= `critical`/`high`/`medium`/`low` |
+| `--enumerate M` | What to probe: `p` plugins, `t` themes, `u` users — combine letters (default `pt`) |
+| `--max-requests N` | Cap on brute-force enumeration requests (default 500); enumeration stops once exceeded |
+| `--output FILE` | Also write JSON results to `FILE` (the table still prints to stdout) |
+| `--silent` | Suppress all progress output; only the result is printed |
+
+Run `onyx` with no arguments for the full flag reference.
 
 ## How it works
 
@@ -56,12 +65,20 @@ onyx scan https://example.com
    WordPress-ish comes back, it stops.
 2. Walk the most vuln-heavy plugin and theme slugs from the database, fetch
    their `readme.txt` / `style.css`, and read the version out of it.
-3. Compare each installed version against the affected ranges in the
+3. Enumerate users (`--enumerate u`): read `/wp-json/wp/v2/users` when it is
+   open, then follow up to 10 `/?author=N` redirect chains to `/author/<slug>/`.
+4. Compare each installed version against the affected ranges in the
    database, and report anything that matches.
 
 Version detection is read-only — `onyx` never sends exploit payloads. If a
 version can't be determined, it's reported as-is and skipped for matching,
 so you don't get false positives from unknown installs.
+
+During a scan a live progress line is rendered on stderr when you're in a
+terminal (`[12/200] plugin:elementor readme.txt (3.24.0) | 2 findings |
+1m20s elapsed`). When the output is piped or logged, no control characters
+are emitted — just `[INF]` log lines. `--silent` disables progress
+entirely, and stdout always carries only the results.
 
 ## The database
 
@@ -73,10 +90,11 @@ See its README for the license terms.
 
 ## Roadmap
 
-- `onyx update` currently needs wiring to the GitHub Releases API (the
-  database is already mirrored; the download code is a stub).
-- Per-plugin rate limiting and resume for interrupted scans.
-- Output formats beyond table and JSON.
+- [x] `onyx update` wired to the GitHub Releases API (auto-updates on a missing database)
+- [x] User enumeration via `--enumerate u`
+- [x] `--max-requests` cap on brute-force enumeration
+- [x] JSON output to a file with `--output FILE`
+- [x] Live progress on a TTY with `--silent` to turn it off
 
 ## License
 
