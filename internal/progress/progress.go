@@ -92,12 +92,26 @@ func (b *Bar) SetCurrent(label string) {
 // line renders the one-line progress status without any newlines.
 func (b *Bar) line() string {
 	elapsed := time.Since(b.start).Round(time.Second).String()
-	var current string
-	if c, ok := b.current.Load().(string); ok && c != "" {
-		current = c + " | "
+	total := b.total.Load()
+	done := b.done.Load()
+
+	// Simple percentage bar — no per-request labels, just progress.
+	const barWidth = 30
+	frac := 0.0
+	if total > 0 {
+		frac = float64(done) / float64(total)
+		if frac > 1 {
+			frac = 1
+		}
 	}
-	return fmt.Sprintf("[%d/%d] %s%d findings | %s elapsed",
-		b.done.Load(), b.total.Load(), current, b.findings.Load(), elapsed)
+	filled := int(frac * barWidth)
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", barWidth-filled)
+
+	label := fmt.Sprintf("[%s] %3d%%", bar, int(frac*100))
+	if total > 0 {
+		label += fmt.Sprintf(" %d/%d", done, total)
+	}
+	return label + " " + elapsed
 }
 
 func (b *Bar) render() {

@@ -208,10 +208,10 @@ func runScan(target string, o scanOptions) {
 		os.Exit(1)
 	}
 
-	// Progress bar is opt-in (--progress). By default the scan runs silently
-	// and only results are printed — no per-request noise on the terminal.
-	if o.progress {
-		bar := progress.New(os.Stderr, o.silent)
+	// Progress bar is on by default (a single live line showing a
+	// percentage bar — no per-request noise). --silent disables it.
+	if !o.silent {
+		bar := progress.New(os.Stderr, false)
 		sc.SetProgress(bar)
 	}
 
