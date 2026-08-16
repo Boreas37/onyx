@@ -57,11 +57,11 @@ func PrintBanner(version string, dbRecords int) {
 	fmt.Println()
 }
 
-// PrintTable prints res to stdout in a nuclei-style one-line-per-finding
-// format, e.g.:
-//
-//	[medium] [plugin:elementor:3.24.0] Elementor <= 3.30.2 - Arbitrary File Read (CVE-2025-8081)
-func PrintTable(res *scanner.Result) {
+// PrintTable prints res to stdout. Default is a compact per-component
+// summary; pass verbose=true for the full one-line-per-finding listing.
+// minSeverity filters findings below the given rating ("critical", "high",
+// "medium", "low").
+func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 	if !res.IsWordPress {
 		fmt.Printf("Target %s does not look like WordPress.\n", res.Target)
 		return
@@ -72,22 +72,78 @@ func PrintTable(res *scanner.Result) {
 		fmt.Printf("WordPress core: %s\n", res.WordPressVersion)
 	}
 
-	if len(res.Findings) == 0 {
-		fmt.Println("\nNo known vulnerable components found.")
+	threshold := severityRank(minSeverity)
+
+	// Group findings by component, filtered by severity.
+	type comp struct {
+		f     *scanner.Finding
+		vulns []scanner.Vulnerability
+	}
+	var comps []comp
+	for i := range res.Findings {
+		f := &res.Findings[i]
+		var kept []scanner.Vulnerability
+		for _, v := range f.Vulnerabilities {
+			if severityRank(v.Rating) >= threshold {
+				kept = append(kept, v)
+			}
+		}
+		if len(kept) > 0 {
+			comps = append(comps, comp{f: f, vulns: kept})
+		}
+	}
+
+	if len(comps) == 0 {
+		fmt.Println("\nNo matching vulnerabilities found.")
 		return
 	}
 
 	fmt.Println()
-	for _, f := range res.Findings {
-		for _, v := range f.Vulnerabilities {
-			sev := severityColor(v.Rating)
-			cve := v.CVE
-			if cve == "" {
-				cve = v.ID
+	if verbose {
+		for _, c := range comps {
+			for _, v := range c.vulns {
+				sev := severityColor(v.Rating)
+				cve := v.CVE
+				if cve == "" {
+					cve = v.ID
+				}
+				fmt.Printf("[%s] [%s:%s:%s] %s (%s)\n",
+					sev, c.f.Type, c.f.Slug, c.f.InstalledVersion, v.Title, cve)
 			}
-			fmt.Printf("[%s] [%s:%s:%s] %s (%s)\n",
-				sev, f.Type, f.Slug, f.InstalledVersion, v.Title, cve)
 		}
+		fmt.Println()
+		return
+	}
+
+	// Compact summary: one line per component.
+	for _, c := range comps {
+		maxRank := 0
+		var worst scanner.Vulnerability
+		for _, v := range c.vulns {
+			if severityRank(v.Rating) > maxRank {
+				maxRank = severityRank(v.Rating)
+				worst = v
+			}
+		}
+		worstSev := severityColor(worst.Rating)
+		fmt.Printf("[%s] [%s:%s:%s] %d vulnerabilities (worst: %s)\n",
+			worstSev, c.f.Type, c.f.Slug, c.f.InstalledVersion, len(c.vulns), worst.Title)
 	}
 	fmt.Println()
+}
+
+// severityRank maps a rating to a numeric level for filtering/sorting.
+func severityRank(rating string) int {
+	switch strings.ToLower(rating) {
+	case "critical":
+		return 4
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	case "low":
+		return 1
+	default:
+		return 0
+	}
 }
