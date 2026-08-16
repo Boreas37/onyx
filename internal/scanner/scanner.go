@@ -27,10 +27,11 @@ const defaultTopSlugs = 200
 
 // Options tunes the scan behaviour. Zero values fall back to defaults.
 type Options struct {
-	Threads int           // concurrent HTTP requests (default 5)
-	Timeout time.Duration // per-request timeout (default 10s)
-	Stealth bool          // throttle to 1 request/second
-	APIOnly bool          // skip brute-force enumeration, only wp-json/plugins
+	Threads   int           // concurrent HTTP requests (default 5)
+	Timeout   time.Duration // per-request timeout (default 10s)
+	Stealth   bool          // throttle to 1 request/second
+	RateLimit float64       // max requests per second (0 = unlimited)
+	APIOnly   bool          // skip brute-force enumeration, only wp-json/plugins
 }
 
 // Scanner drives one scan against a single target.
@@ -95,6 +96,9 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	}
 	if opts.Stealth {
 		s.lim = &rateLimiter{interval: time.Second}
+	}
+	if opts.RateLimit > 0 {
+		s.lim = &rateLimiter{interval: time.Duration(float64(time.Second) / opts.RateLimit)}
 	}
 	return s, nil
 }
