@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"onyx/internal/scanner"
+	"github.com/Boreas37/onyx/internal/scanner"
 )
 
 // severityColor wraps a severity label in ANSI color codes. Returns the

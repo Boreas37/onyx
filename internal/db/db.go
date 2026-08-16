@@ -12,7 +12,7 @@ import (
 	"os"
 	"sort"
 
-	"onyx/internal/version"
+	"github.com/Boreas37/onyx/internal/version"
 )
 
 // AffectedVersion is a single affected-version entry for a piece of

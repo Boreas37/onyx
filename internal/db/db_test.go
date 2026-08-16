@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"onyx/internal/version"
+	"github.com/Boreas37/onyx/internal/version"
 )
 
 func writeFeed(t *testing.T, records map[string]Vuln) string {

@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"onyx/internal/db"
-	"onyx/internal/report"
-	"onyx/internal/scanner"
+	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/report"
+	"github.com/Boreas37/onyx/internal/scanner"
 )
 
 const defaultDB = "data/wordfence.json"
