@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"onyx/internal/db"
-	"onyx/internal/version"
+	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/version"
 )
 
 // ErrNotWordPress is returned when a scan target shows no WordPress signs.

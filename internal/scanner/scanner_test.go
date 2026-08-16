@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"onyx/internal/db"
-	"onyx/internal/version"
+	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/version"
 )
 
 // minimalFeed writes a small Wordfence-shaped feed and returns its path.
