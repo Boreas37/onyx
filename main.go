@@ -135,9 +135,11 @@ Scan flags:
 
 func runScan(target string, o scanOptions) {
 	if _, err := os.Stat(o.dbPath); err != nil {
-		fmt.Fprintln(os.Stderr, "error: database not found at", o.dbPath)
-		fmt.Fprintln(os.Stderr, "run 'onyx update' to fetch it first")
-		os.Exit(1)
+		fmt.Fprintf(os.Stderr, "database not found at %s — fetching it first...\n", o.dbPath)
+		if err := update(o.dbPath); err != nil {
+			fmt.Fprintln(os.Stderr, "update failed:", err)
+			os.Exit(1)
+		}
 	}
 
 	database, err := db.Load(o.dbPath)
