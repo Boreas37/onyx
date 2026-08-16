@@ -72,6 +72,22 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 		fmt.Printf("WordPress core: %s\n", res.WordPressVersion)
 	}
 
+	if len(res.Users) > 0 {
+		fmt.Printf("Users:\n")
+		for _, u := range res.Users {
+			id := ""
+			if u.ID > 0 {
+				id = fmt.Sprintf(" (ID %d)", u.ID)
+			}
+			name := ""
+			if u.Name != "" && u.Name != u.Slug {
+				name = fmt.Sprintf(" (%s)", u.Name)
+			}
+			fmt.Printf("  - %s%s%s\n", u.Slug, id, name)
+		}
+		fmt.Println()
+	}
+
 	threshold := severityRank(minSeverity)
 
 	// Group findings by component, filtered by severity.
