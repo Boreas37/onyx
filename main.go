@@ -54,13 +54,15 @@ func main() {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath    string
-	threads   int
-	timeout   int
-	asJSON    bool
-	apiOnly   bool
-	stealth   bool
-	rateLimit float64
+	dbPath     string
+	threads    int
+	timeout    int
+	asJSON     bool
+	apiOnly    bool
+	stealth    bool
+	rateLimit  float64
+	verbose    bool
+	minSeverity string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -79,6 +81,11 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.apiOnly = true
 		case a == "--stealth":
 			o.stealth = true
+		case a == "--verbose":
+			o.verbose = true
+		case a == "--min-severity" && i+1 < len(args):
+			i++
+			o.minSeverity = strings.ToLower(args[i])
 		case a == "--db" && i+1 < len(args):
 			i++
 			o.dbPath = args[i]
@@ -123,13 +130,15 @@ Usage:
   onyx version               print the version
 
 Scan flags:
-  --db PATH        database file (default: %s)
-  --threads N      concurrent requests (default: 5)
-  --timeout S      per-request timeout in seconds (default: 10)
-  --json           print results as JSON
-  --api            only query the REST API, skip brute-force enumeration
-  --stealth        one request per second
-  --rate-limit N   max requests per second (overrides --stealth)
+  --db PATH          database file (default: %s)
+  --threads N        concurrent requests (default: 5)
+  --timeout S        per-request timeout in seconds (default: 10)
+  --json             print results as JSON
+  --api              only query the REST API, skip brute-force enumeration
+  --stealth          one request per second
+  --rate-limit N     max requests per second (overrides --stealth)
+  --verbose          full one-line-per-finding output (default: compact)
+  --min-severity S   only show findings >= severity (critical|high|medium|low)
 `, defaultDB)
 }
 
@@ -175,7 +184,7 @@ func runScan(target string, o scanOptions) {
 		fmt.Println(string(out))
 		return
 	}
-	report.PrintTable(res)
+	report.PrintTable(res, o.verbose, o.minSeverity)
 }
 
 // update fetches the newest database release from the onyx-db GitHub repo,
