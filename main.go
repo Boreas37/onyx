@@ -2,6 +2,8 @@ package main
 
 import (
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -21,11 +23,20 @@ import (
 	"github.com/Boreas37/onyx/internal/scanner"
 )
 
-const defaultDB = "data/wordfence.json"
+const (
+	defaultDB       = "data/wordfence.json"
+	feedProduction  = "production"
+	feedScanner     = "scanner"
+	scannerFeedURL  = "https://www.wordfence.com/api/intelligence/v3/vulnerabilities/scanner"
+	productionRepo  = "Boreas37/onyx-db"
+	productionAsset = "wordfence-latest.json.gz"
+)
 
 func main() {
 	updCmd := flag.NewFlagSet("update", flag.ExitOnError)
 	updDB := updCmd.String("db", defaultDB, "destination database path")
+	updFeed := updCmd.String("feed", feedProduction, "feed to fetch (production or scanner)")
+	updForce := updCmd.Bool("force", false, "skip the checksum check and always rewrite the database")
 
 	if len(os.Args) < 2 {
 		usage()
@@ -43,7 +54,12 @@ func main() {
 		os.Exit(runScan(target, opts))
 	case "update":
 		updCmd.Parse(os.Args[2:])
-		if err := update(*updDB); err != nil {
+		feed := strings.ToLower(*updFeed)
+		if feed != feedProduction && feed != feedScanner {
+			fmt.Fprintf(os.Stderr, "error: invalid --feed %q (use production or scanner)\n", feed)
+			os.Exit(2)
+		}
+		if err := update(*updDB, feed, *updForce); err != nil {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
 			os.Exit(2)
 		}
@@ -88,6 +104,7 @@ type scanOptions struct {
 	excludeContentBased string
 	scope               string
 	noUpdateCheck       bool
+	noUpdate            bool
 	pluginsList         string
 	themesList          string
 	maxScanDuration     time.Duration
@@ -191,6 +208,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.scope = args[i]
 		case a == "--no-update-check":
 			o.noUpdateCheck = true
+		case a == "--no-update":
+			o.noUpdate = true
 		case a == "--format" && i+1 < len(args):
 			i++
 			o.format = strings.ToLower(args[i])
@@ -366,14 +385,36 @@ func atoi(s string, def int) int {
 	return n
 }
 
-// staleDays returns how many whole days old the file at path is, or -1 when
-// its age cannot be determined (e.g. missing file).
-func staleDays(path string) int {
-	fi, err := os.Stat(path)
+// dbAgeDays returns how many whole days have passed since the database at
+// dbPath was last downloaded, or -1 when its age cannot be determined. The
+// age is measured from the .sha256 sidecar (written on every real
+// download); when the sidecar is missing the database file's own mtime is
+// used as a fallback.
+func dbAgeDays(dbPath string) int {
+	agePath := dbPath
+	if _, err := os.Stat(dbPath + ".sha256"); err == nil {
+		agePath = dbPath + ".sha256"
+	}
+	fi, err := os.Stat(agePath)
 	if err != nil {
 		return -1
 	}
 	return int(time.Since(fi.ModTime()).Hours() / 24)
+}
+
+// dbFeedType returns the feed that produced the database at dbPath
+// ("production" or "scanner"), read from the .feedtype sidecar written by
+// update. Missing or unknown sidecar content falls back to production.
+func dbFeedType(dbPath string) string {
+	b, err := os.ReadFile(dbPath + ".feedtype")
+	if err != nil {
+		return feedProduction
+	}
+	switch strings.TrimSpace(string(b)) {
+	case feedProduction, feedScanner:
+		return strings.TrimSpace(string(b))
+	}
+	return feedProduction
 }
 
 func usage() {
@@ -417,6 +458,7 @@ Scan flags:
   --exclude-content-based REGEX  abort the scan when homepage HTML matches REGEX (WAF/error page)
   --scope REGEX     only scan when the target URL matches REGEX
   --no-update-check suppress the stale-database warning
+  --no-update       error out (exit 2) instead of auto-downloading the database when it is missing
   --plugins-list FILE  enumerate exactly the plugin slugs listed in FILE (one per line, # comments)
   --themes-list FILE   enumerate exactly the theme slugs listed in FILE (one per line, # comments)
   --max-scan-duration D  stop the scan after D (Go duration format, e.g. 30s or 5m)
@@ -435,13 +477,22 @@ Scan flags:
   --wp-auth USER:PASS  authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (wp-admin → Users → Profile → Application Passwords)
   --no-brute         disable credential brute force (wp-login and XML-RPC)
   --config FILE      JSON config file; explicit CLI flags win over config values
-`, defaultDB)
+
+Update flags:
+  --db PATH          destination database file (default: %s)
+  --feed F           feed to fetch: production (default) or scanner
+  --force            skip the checksum check and rewrite the database even when unchanged
+`, defaultDB, defaultDB)
 }
 
 func runScan(target string, o scanOptions) int {
 	if _, err := os.Stat(o.dbPath); err != nil {
+		if o.noUpdate {
+			fmt.Fprintf(os.Stderr, "error: database not found at %s (--no-update given — run 'onyx update' first)\n", o.dbPath)
+			return 2
+		}
 		fmt.Fprintf(os.Stderr, "database not found at %s — fetching it first...\n", o.dbPath)
-		if err := update(o.dbPath); err != nil {
+		if err := update(o.dbPath, feedProduction, false); err != nil {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
 			return 2
 		}
@@ -453,10 +504,12 @@ func runScan(target string, o scanOptions) int {
 		return 2
 	}
 
-	// Warn (informational only) when the local database is over 14 days old.
+	// Warn (informational only) when the local database is over 14 days
+	// old; the age reflects the last download and the warning names the
+	// feed that produced the database.
 	if !o.noUpdateCheck {
-		if days := staleDays(o.dbPath); days > 14 {
-			fmt.Fprintf(os.Stderr, "[WARN] database is %d days old — run 'onyx update' for fresh data\n", days)
+		if days := dbAgeDays(o.dbPath); days > 14 {
+			fmt.Fprintf(os.Stderr, "[WARN] database is %d days old (%s feed) — run 'onyx update' for fresh data\n", days, dbFeedType(o.dbPath))
 		}
 	}
 
@@ -784,29 +837,54 @@ func writeScanOutput(path string, res *scanner.Result) error {
 	return os.WriteFile(path, out, 0o644)
 }
 
-// update fetches the newest database release from the onyx-db GitHub repo,
-// downloads the compressed feed asset, and unpacks it to dst.
-func update(dst string) error {
-	const repo = "Boreas37/onyx-db"
-	const asset = "wordfence-latest.json.gz"
+// update fetches the newest feed and unpacks it to dst. feed selects the
+// source: the production feed (gzipped asset of the latest onyx-db
+// release, the default) or the scanner feed (broad-coverage Wordfence
+// Intelligence endpoint). The raw downloaded bytes are SHA-256 hashed and
+// stored next to the database; when the digest matches the previous
+// download and force is false the database is left untouched ("already up
+// to date"). force skips that check and always rewrites.
+func update(dst, feed string, force bool) error {
+	var (
+		url string
+		gz  bool
+	)
+	switch feed {
+	case feedScanner:
+		url, gz = scannerFeedURL, false
+	case feedProduction:
+		var err error
+		url, err = productionAssetURL()
+		if err != nil {
+			return err
+		}
+		gz = true
+	default:
+		return fmt.Errorf("unknown feed %q (use production or scanner)", feed)
+	}
+	return updateFromURL(dst, url, gz, feed, force)
+}
 
-	fmt.Printf("update: fetching latest database from %s...\n", repo)
+// productionAssetURL resolves the browser download URL of the production
+// feed asset from the latest onyx-db release.
+func productionAssetURL() (string, error) {
+	fmt.Printf("update: fetching latest database from %s...\n", productionRepo)
 
 	// 1. Latest release metadata
-	relURL := "https://api.github.com/repos/" + repo + "/releases/latest"
+	relURL := "https://api.github.com/repos/" + productionRepo + "/releases/latest"
 	req, err := http.NewRequest("GET", relURL, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "onyx")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("release lookup: %w", err)
+		return "", fmt.Errorf("release lookup: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("release lookup: HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("release lookup: HTTP %d", resp.StatusCode)
 	}
 
 	var rel struct {
@@ -817,37 +895,22 @@ func update(dst string) error {
 		} `json:"assets"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return fmt.Errorf("release decode: %w", err)
+		return "", fmt.Errorf("release decode: %w", err)
 	}
-
-	var assetURL string
 	for _, a := range rel.Assets {
-		if a.Name == asset {
-			assetURL = a.BrowserDownloadURL
-			break
+		if a.Name == productionAsset {
+			return a.BrowserDownloadURL, nil
 		}
 	}
-	if assetURL == "" {
-		return fmt.Errorf("asset %s not found in release %s", asset, rel.TagName)
-	}
+	return "", fmt.Errorf("asset %s not found in release %s", productionAsset, rel.TagName)
+}
 
-	// 2. Download the gzipped feed
-	gzResp, err := http.Get(assetURL)
-	if err != nil {
-		return fmt.Errorf("asset download: %w", err)
-	}
-	defer gzResp.Body.Close()
-	if gzResp.StatusCode != 200 {
-		return fmt.Errorf("asset download: HTTP %d", gzResp.StatusCode)
-	}
-
-	// 3. Gunzip into a temp file, then move into place
-	zr, err := gzip.NewReader(gzResp.Body)
-	if err != nil {
-		return fmt.Errorf("gzip: %w", err)
-	}
-	defer zr.Close()
-
+// updateFromURL downloads url into dst, unpacking a gzip payload when gz is
+// set. The raw downloaded bytes are SHA-256 hashed into dst+".sha256";
+// when the digest matches a previous download the database file is not
+// rewritten. The feed name is recorded in dst+".feedtype" so scans can
+// report which feed produced the database.
+func updateFromURL(dst, url string, gz bool, feed string, force bool) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -858,19 +921,75 @@ func update(dst string) error {
 	}
 	defer os.Remove(tmp.Name())
 
-	if _, err := io.Copy(tmp, zr); err != nil {
-		tmp.Close()
-		return fmt.Errorf("unpack: %w", err)
+	checksum, err := downloadFeed(url, gz, tmp)
+	if err != nil {
+		return err
 	}
+
+	// Incremental check: the same checksum as the last successful download
+	// means the feed has not changed — leave the database untouched.
+	if !force {
+		if prev, err := os.ReadFile(dst + ".sha256"); err == nil && strings.TrimSpace(string(prev)) == checksum {
+			tmp.Close()
+			fmt.Printf("update: already up to date — %s\n", dst)
+			return nil
+		}
+	}
+
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), dst); err != nil {
 		return fmt.Errorf("rename: %w", err)
 	}
+	if err := os.WriteFile(dst+".sha256", []byte(checksum+"\n"), 0o644); err != nil {
+		return fmt.Errorf("checksum write: %w", err)
+	}
+	if err := os.WriteFile(dst+".feedtype", []byte(feed+"\n"), 0o644); err != nil {
+		return fmt.Errorf("feed type write: %w", err)
+	}
 
 	if fi, err := os.Stat(dst); err == nil {
 		fmt.Printf("update: done — %s (%d bytes)\n", dst, fi.Size())
 	}
 	return nil
+}
+
+// downloadFeed GETs url and streams the payload into out (unpacking a
+// gzip file first when gz is set). It returns the hex SHA-256 of the raw
+// downloaded bytes — the gzip file for the production feed, the JSON body
+// for the scanner feed — so repeated downloads can be compared cheaply.
+func downloadFeed(url string, gz bool, out io.Writer) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "onyx")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("feed download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("feed download: HTTP %d", resp.StatusCode)
+	}
+
+	h := sha256.New()
+	raw := io.TeeReader(resp.Body, h)
+	stream := io.Reader(raw)
+	if gz {
+		zr, err := gzip.NewReader(raw)
+		if err != nil {
+			return "", fmt.Errorf("gzip: %w", err)
+		}
+		defer zr.Close()
+		stream = zr
+	}
+	if _, err := io.Copy(out, stream); err != nil {
+		return "", fmt.Errorf("unpack: %w", err)
+	}
+	// Drain whatever the decompressor did not consume so every raw byte
+	// contributes to the digest.
+	io.Copy(io.Discard, raw)
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

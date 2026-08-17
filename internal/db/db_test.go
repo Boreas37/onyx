@@ -226,3 +226,136 @@ func TestLookupReturnsCopies(t *testing.T) {
 		t.Errorf("Lookup should return copies, not internal pointers")
 	}
 }
+
+// scannerFeed writes a minimal scanner-feed JSON document (records carry
+// only detection info, no software array).
+func scannerFeed(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "scanner.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func mustParseV(t *testing.T, s string) version.Version {
+	t.Helper()
+	v, ok := version.Parse(s)
+	if !ok {
+		t.Fatalf("version.Parse(%q) failed", s)
+	}
+	return v
+}
+
+func TestLoadScannerFeedTitleBased(t *testing.T) {
+	path := scannerFeed(t, `{
+		"11111111-0000-0000-0000-000000000001": {
+			"id": "11111111-0000-0000-0000-000000000001",
+			"title": "Elementor < 3.25.0 - SQL Injection"
+		},
+		"22222222-0000-0000-0000-000000000002": {
+			"id": "22222222-0000-0000-0000-000000000002",
+			"title": "WooCommerce <= 7.1.0 - Missing Authorization"
+		},
+		"33333333-0000-0000-0000-000000000003": {
+			"id": "33333333-0000-0000-0000-000000000003",
+			"title": "Akismet = 4.0.0 - Stored XSS",
+			"software": []
+		}
+	}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Skipped() != 0 {
+		t.Errorf("Skipped() = %d, want 0", got.Skipped())
+	}
+	if got.Count() != 3 {
+		t.Fatalf("Count() = %d, want 3", got.Count())
+	}
+
+	// "<" — exclusive upper bound, slug lowercased/hyphenated from the name.
+	ele := got.Lookup("elementor")
+	if len(ele) != 1 {
+		t.Fatalf("Lookup(elementor) len = %d, want 1", len(ele))
+	}
+	if ele[0].Title != "Elementor < 3.25.0 - SQL Injection" {
+		t.Errorf("unexpected record: %q", ele[0].Title)
+	}
+	s := ele[0].Software[0]
+	if s.Slug != "elementor" || s.Type != "plugin" || s.Name != "Elementor" {
+		t.Errorf("software = %+v, want slug=elementor type=plugin name=Elementor", s)
+	}
+	ranges := s.AffectedVersions["< 3.25.0"].Ranges
+	if len(ranges) != 1 {
+		t.Fatalf("AffectedVersions[\"< 3.25.0\"] ranges = %+v, want 1 range", ranges)
+	}
+	if !version.InRanges(ranges, mustParseV(t, "3.24.9")) {
+		t.Error("3.24.9 should be affected by < 3.25.0")
+	}
+	if version.InRanges(ranges, mustParseV(t, "3.25.0")) {
+		t.Error("3.25.0 should not be affected by < 3.25.0")
+	}
+
+	// "<=" — inclusive upper bound.
+	woo := got.Lookup("woocommerce")
+	if len(woo) != 1 {
+		t.Fatalf("Lookup(woocommerce) len = %d, want 1", len(woo))
+	}
+	wooRanges := woo[0].Software[0].AffectedVersions["<= 7.1.0"].Ranges
+	if !version.InRanges(wooRanges, mustParseV(t, "7.1.0")) {
+		t.Error("7.1.0 should be affected by <= 7.1.0")
+	}
+	if version.InRanges(wooRanges, mustParseV(t, "7.1.1")) {
+		t.Error("7.1.1 should not be affected by <= 7.1.0")
+	}
+
+	// "=" — exact version; also covers an explicit empty software array.
+	aki := got.Lookup("akismet")
+	if len(aki) != 1 {
+		t.Fatalf("Lookup(akismet) len = %d, want 1", len(aki))
+	}
+	akiRanges := aki[0].Software[0].AffectedVersions["= 4.0.0"].Ranges
+	if !version.InRanges(akiRanges, mustParseV(t, "4.0.0")) {
+		t.Error("4.0.0 should be affected by = 4.0.0")
+	}
+	if version.InRanges(akiRanges, mustParseV(t, "4.0.1")) {
+		t.Error("4.0.1 should not be affected by = 4.0.0")
+	}
+}
+
+func TestLoadScannerFeedUnparseableSkipped(t *testing.T) {
+	path := scannerFeed(t, `{
+		"11111111-0000-0000-0000-000000000001": {
+			"id": "11111111-0000-0000-0000-000000000001",
+			"title": "No version hint here"
+		},
+		"22222222-0000-0000-0000-000000000002": {
+			"id": "22222222-0000-0000-0000-000000000002",
+			"title": "Plugin < nope"
+		}
+	}`)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Skipped() != 2 {
+		t.Errorf("Skipped() = %d, want 2", got.Skipped())
+	}
+	if got.Count() != 0 {
+		t.Errorf("Count() = %d, want 0 (unparseable records must be dropped)", got.Count())
+	}
+	if len(got.Lookup("plugin")) != 0 {
+		t.Errorf("Lookup(plugin) = %v, want empty", got.Lookup("plugin"))
+	}
+}
+
+func TestTitleSoftwareSlugify(t *testing.T) {
+	s, ok := titleSoftware("Hello Dolly <= 1.7.2 - XSS")
+	if !ok {
+		t.Fatal("titleSoftware failed on valid title")
+	}
+	if s.Slug != "hello-dolly" || s.Name != "Hello Dolly" {
+		t.Errorf("slug/name = %q/%q, want hello-dolly/Hello Dolly", s.Slug, s.Name)
+	}
+}
