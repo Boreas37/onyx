@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Boreas37/onyx/internal/pocs"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
 
@@ -173,6 +174,23 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 			fmt.Printf("  [%s] [%s] %s (matched at %s)\n",
 				severityColor(n.Severity), strings.ToLower(id), n.Name, n.MatchedAt)
 		}
+		fmt.Println()
+	}
+
+	if len(res.PoCs) > 0 {
+		fmt.Println("PoC references (from CVE-PoC-Tracker):")
+		lastCVE := ""
+		for _, p := range res.PoCs {
+			if p.CVE != lastCVE {
+				if lastCVE != "" {
+					fmt.Println()
+				}
+				fmt.Printf("  %s:\n", p.CVE)
+				lastCVE = p.CVE
+			}
+			fmt.Printf("    \u2b50 %-5d %s\n", p.Stars, p.URL)
+		}
+		fmt.Printf("more: %s\n", pocs.TrackerURL)
 		fmt.Println()
 	}
 }

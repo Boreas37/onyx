@@ -22,6 +22,7 @@ import (
 
 	"github.com/Boreas37/onyx/internal/db"
 	"github.com/Boreas37/onyx/internal/nuclei"
+	"github.com/Boreas37/onyx/internal/pocs"
 	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/version"
 )
@@ -445,21 +446,22 @@ type User struct {
 
 // Result is the output of a scan.
 type Result struct {
-	Target           string     `json:"target"`
-	IsWordPress      bool       `json:"is_wordpress"`
-	WordPressVersion string     `json:"wordpress_version,omitempty"`
-	Evidence         []string   `json:"evidence,omitempty"`
-	Detected         []Detected `json:"detected,omitempty"`
-	Findings         []Finding                `json:"findings,omitempty"`
-	Nuclei           []nuclei.NucleiResult    `json:"nuclei,omitempty"`
-	Users            []User                   `json:"users,omitempty"`
-	XMLRPC           bool       `json:"xmlrpc,omitempty"` // xmlrpc.php ping answered
-	Interesting      []string   `json:"interesting,omitempty"`
-	ConfigBackups    []string   `json:"config_backups,omitempty"`
-	DBExports        []string   `json:"db_exports,omitempty"`
-	RateLimitHits    int        `json:"rate_limit_hits,omitempty"` // 429s seen
-	TimedOut         bool       `json:"timed_out,omitempty"`        // --max-scan-duration expired
-	Errors           []string   `json:"errors,omitempty"`
+	Target           string                `json:"target"`
+	IsWordPress      bool                  `json:"is_wordpress"`
+	WordPressVersion string                `json:"wordpress_version,omitempty"`
+	Evidence         []string              `json:"evidence,omitempty"`
+	Detected         []Detected            `json:"detected,omitempty"`
+	Findings         []Finding             `json:"findings,omitempty"`
+	Nuclei           []nuclei.NucleiResult `json:"nuclei,omitempty"`
+	PoCs             []pocs.PoCLink        `json:"pocs,omitempty"`
+	Users            []User                `json:"users,omitempty"`
+	XMLRPC           bool                  `json:"xmlrpc,omitempty"` // xmlrpc.php ping answered
+	Interesting      []string              `json:"interesting,omitempty"`
+	ConfigBackups    []string              `json:"config_backups,omitempty"`
+	DBExports        []string              `json:"db_exports,omitempty"`
+	RateLimitHits    int                   `json:"rate_limit_hits,omitempty"` // 429s seen
+	TimedOut         bool                  `json:"timed_out,omitempty"`       // --max-scan-duration expired
+	Errors           []string              `json:"errors,omitempty"`
 }
 
 func (s *Scanner) fetch(path string) (int, []byte, error) {

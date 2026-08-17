@@ -489,3 +489,63 @@ func TestNucleiMissingTemplateWarns(t *testing.T) {
 		t.Errorf("stderr = %q, want no-template WARN", out)
 	}
 }
+
+func TestParseScanArgsPocFlags(t *testing.T) {
+	target, o := parseScanArgs([]string{
+		"http://example.test",
+		"--poc-tracker-dir", "/srv/tracker",
+		"--no-pocs",
+	})
+	if target != "http://example.test" {
+		t.Errorf("target = %q", target)
+	}
+	if o.pocTrackerDir != "/srv/tracker" {
+		t.Errorf("pocTrackerDir = %q, want /srv/tracker", o.pocTrackerDir)
+	}
+	if !o.noPocs {
+		t.Error("noPocs = false, want true")
+	}
+
+	_, o = parseScanArgs([]string{"http://example.test"})
+	if o.pocTrackerDir != "" || o.noPocs {
+		t.Errorf("defaults: pocTrackerDir=%q noPocs=%v, want empty/false", o.pocTrackerDir, o.noPocs)
+	}
+}
+
+// TestCollectPoCsSoftFails verifies the soft-fail behavior of the PoC
+// pipeline: a missing tracker clone warns on stderr and leaves res.PoCs
+// empty; a CVE absent from an existing tracker is skipped silently. No
+// crash in either case.
+func TestCollectPoCsSoftFails(t *testing.T) {
+	res := &scanner.Result{
+		Target:      "https://host/",
+		IsWordPress: true,
+		Nuclei: []nuclei.NucleiResult{
+			{TemplateID: "CVE-2026-8081", CVE: "CVE-2026-8081", Severity: "critical"},
+		},
+	}
+
+	missing := filepath.Join(t.TempDir(), "no-such-tracker")
+	out := captureStderr(t, func() {
+		collectPoCs(res, scanOptions{pocTrackerDir: missing})
+	})
+	if len(res.PoCs) != 0 {
+		t.Errorf("res.PoCs = %+v, want empty when tracker is missing", res.PoCs)
+	}
+	wantWarn := fmt.Sprintf("[WARN] CVE-PoC-Tracker not found at %s — skipping PoC lookup", missing)
+	if !strings.Contains(out, wantWarn) {
+		t.Errorf("stderr = %q, want %q", out, wantWarn)
+	}
+
+	empty := t.TempDir()
+	res.PoCs = nil
+	out = captureStderr(t, func() {
+		collectPoCs(res, scanOptions{pocTrackerDir: empty})
+	})
+	if len(res.PoCs) != 0 {
+		t.Errorf("res.PoCs = %+v, want empty when CVE file is absent", res.PoCs)
+	}
+	if strings.Contains(out, "[WARN]") {
+		t.Errorf("stderr = %q, want no WARN for a CVE missing from the tracker", out)
+	}
+}
