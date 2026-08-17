@@ -110,8 +110,16 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 	}
 
 	if len(comps) == 0 {
-		fmt.Println("\nNo matching vulnerabilities found.")
+		if res.RateLimitHits > 0 {
+			fmt.Printf("\nNo matching vulnerabilities found. (%d request(s) were rate limited — results may be incomplete)\n", res.RateLimitHits)
+		} else {
+			fmt.Println("\nNo matching vulnerabilities found.")
+		}
 		return
+	}
+
+	if res.RateLimitHits > 0 {
+		fmt.Printf("Note: %d request(s) were rate limited (HTTP 429) — results may be incomplete. Try --rate-limit N or --stealth.\n", res.RateLimitHits)
 	}
 
 	fmt.Println()
