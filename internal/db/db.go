@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/Boreas37/onyx/internal/version"
 )
@@ -121,6 +123,56 @@ func (d *DB) SlugType(slug string) string {
 	return ""
 }
 
+// titleVersionRe matches the version hint inside a scanner-feed record
+// title, e.g. "Plugin Name < 4.0.1": name, operator and version.
+var titleVersionRe = regexp.MustCompile(`(.+) (<|<=|=) ([0-9.]+)`)
+
+// titleSoftware derives a software entry from a minimal scanner-feed
+// record whose title embeds the affected version, e.g. "Plugin Name <
+// 4.0.1". The slug is the lowercased, hyphenated name. It reports ok=false
+// when the title carries no parseable version hint.
+func titleSoftware(title string) (Software, bool) {
+	m := titleVersionRe.FindStringSubmatch(title)
+	if len(m) != 4 {
+		return Software{}, false
+	}
+	name := strings.TrimSpace(m[1])
+	label := m[2] + " " + m[3]
+	slug := slugify(name)
+	if slug == "" {
+		return Software{}, false
+	}
+	ranges, err := version.ParseRanges(label)
+	if err != nil {
+		return Software{}, false
+	}
+	av := AffectedVersion{Label: label, Ranges: ranges}
+	return Software{
+		Type:             "plugin",
+		Name:             name,
+		Slug:             slug,
+		AffectedVersions: map[string]AffectedVersion{label: av},
+	}, true
+}
+
+// slugify lowercases s and replaces every run of characters outside
+// [a-z0-9] with a single hyphen, matching the WordPress slug convention.
+func slugify(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var b strings.Builder
+	dash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			dash = false
+		} else if !dash {
+			b.WriteByte('-')
+			dash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 // Load opens path and streams the feed, building the slug index and the
 // top-slug list.
 func Load(path string) (*DB, error) {
@@ -177,13 +229,26 @@ func Load(path string) (*DB, error) {
 			CVSS:          raw.CVSS,
 			PublishedAt:   raw.PublishedAt,
 		}
-		for _, sm := range raw.Software {
-			s, drop := decodeSoftware(sm)
-			if drop {
+		if len(raw.Software) == 0 {
+			// Scanner-feed tolerance: minimal records carry only detection
+			// info, so the software slug and version range are extracted
+			// from the title ("Plugin Name < X.Y.Z"). Records that parse
+			// to nothing are dropped.
+			if s, ok := titleSoftware(raw.Title); ok {
+				rec.Software = []Software{s}
+			} else {
 				db.skipped++
 				continue
 			}
-			rec.Software = append(rec.Software, s)
+		} else {
+			for _, sm := range raw.Software {
+				s, drop := decodeSoftware(sm)
+				if drop {
+					db.skipped++
+					continue
+				}
+				rec.Software = append(rec.Software, s)
+			}
 		}
 		db.Records = append(db.Records, rec)
 

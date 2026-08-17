@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -259,6 +263,54 @@ func captureStderr(t *testing.T, fn func()) string {
 	return string(out)
 }
 
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns
+// everything written to it.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(r)
+	r.Close()
+	return string(out)
+}
+
+// gzBytes compresses data into a gzip payload, mimicking the production
+// feed asset.
+func gzBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// feedServer serves the given payload for every request.
+func feedServer(t *testing.T, payload []byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+}
+
 // staleDatabase writes an empty DB whose mtime is 21 days in the past.
 func staleDatabase(t *testing.T) string {
 	t.Helper()
@@ -280,7 +332,7 @@ func TestStaleDatabaseWarning(t *testing.T) {
 			t.Errorf("exit code = %d, want 0 (warning is informational)", code)
 		}
 	})
-	want := fmt.Sprintf("[WARN] database is %d days old — run 'onyx update' for fresh data",
+	want := fmt.Sprintf("[WARN] database is %d days old (production feed) — run 'onyx update' for fresh data",
 		int(time.Since(mustModTime(t, path)).Hours()/24))
 	if !strings.Contains(out, want) {
 		t.Errorf("stderr = %q, want %q", out, want)
@@ -636,5 +688,257 @@ func TestParseScanArgsWAFFlags(t *testing.T) {
 		if o.perHostRateLimit != 0 {
 			t.Errorf("--per-host-rate-limit %q: got %v, want 0", bad, o.perHostRateLimit)
 		}
+	}
+}
+
+func TestParseScanArgsNoUpdateFlag(t *testing.T) {
+	_, o := parseScanArgs([]string{"http://example.test", "--no-update"})
+	if !o.noUpdate {
+		t.Error("noUpdate = false, want true")
+	}
+	_, o = parseScanArgs([]string{"http://example.test"})
+	if o.noUpdate {
+		t.Error("default noUpdate = true, want false")
+	}
+}
+
+func TestRunScanNoUpdateMissingDBExits2(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	out := captureStderr(t, func() {
+		if code := runScan("http://example.test", scanOptions{dbPath: missing, noUpdate: true, silent: true}); code != 2 {
+			t.Errorf("exit code = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(out, "not found") {
+		t.Errorf("stderr = %q, want a database-not-found error", out)
+	}
+	if strings.Contains(out, "fetching it first") {
+		t.Errorf("stderr = %q, --no-update must not auto-download", out)
+	}
+}
+
+func TestUpdateIncrementalChecksumNoOp(t *testing.T) {
+	payload := []byte(`{"11111111-0000-0000-0000-000000000001":{"id":"11111111-0000-0000-0000-000000000001","title":"Elementor < 3.25.0"}}`)
+	gz := gzBytes(t, payload)
+	srv := feedServer(t, gz)
+	defer srv.Close()
+
+	dst := filepath.Join(t.TempDir(), "feed.json")
+	if err := updateFromURL(dst, srv.URL, true, feedProduction, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("database = %s, want gunzipped payload %s", got, payload)
+	}
+	side, err := os.ReadFile(dst + ".sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := sha256Hex(gz); strings.TrimSpace(string(side)) != want {
+		t.Errorf("sha256 sidecar = %q, want %q", side, want)
+	}
+	ft, err := os.ReadFile(dst + ".feedtype")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(ft)) != feedProduction {
+		t.Errorf("feedtype sidecar = %q, want %q", ft, feedProduction)
+	}
+
+	before, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sideBefore, err := os.Stat(dst + ".sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := updateFromURL(dst, srv.URL, true, feedProduction, false); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "already up to date") {
+		t.Errorf("stdout = %q, want an \"already up to date\" message", out)
+	}
+	after, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) || after.Size() != before.Size() {
+		t.Errorf("database rewritten on no-op: before %v after %v", before.ModTime(), after.ModTime())
+	}
+	sideAfter, err := os.Stat(dst + ".sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sideAfter.ModTime().Equal(sideBefore.ModTime()) {
+		t.Errorf("sha256 sidecar rewritten on no-op")
+	}
+}
+
+func TestUpdateChecksumChangedRewrites(t *testing.T) {
+	payload := []byte(`{"1":"one"}`)
+	gz := gzBytes(t, payload)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(gz)
+	}))
+	defer srv.Close()
+
+	dst := filepath.Join(t.TempDir(), "feed.json")
+	if err := updateFromURL(dst, srv.URL, true, feedProduction, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The feed changes upstream: a different gzip body.
+	newPayload := []byte(`{"1":"two"}`)
+	newGz := gzBytes(t, newPayload)
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(newGz)
+	})
+
+	out := captureStdout(t, func() {
+		if err := updateFromURL(dst, srv.URL, true, feedProduction, false); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "already up to date") {
+		t.Errorf("stdout = %q, changed feed must not be a no-op", out)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newPayload) {
+		t.Errorf("database = %s, want %s", got, newPayload)
+	}
+	side, err := os.ReadFile(dst + ".sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := sha256Hex(newGz); strings.TrimSpace(string(side)) != want {
+		t.Errorf("sha256 sidecar = %q, want %q", side, want)
+	}
+}
+
+func TestUpdateForceAlwaysRewrites(t *testing.T) {
+	payload := []byte(`{"1":"one"}`)
+	gz := gzBytes(t, payload)
+	srv := feedServer(t, gz)
+	defer srv.Close()
+
+	dst := filepath.Join(t.TempDir(), "feed.json")
+	if err := updateFromURL(dst, srv.URL, true, feedProduction, false); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	out := captureStdout(t, func() {
+		if err := updateFromURL(dst, srv.URL, true, feedProduction, true); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Contains(out, "already up to date") {
+		t.Errorf("stdout = %q, --force must skip the checksum check", out)
+	}
+	after, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().After(before.ModTime()) {
+		t.Errorf("--force should rewrite the database (mtime %v -> %v)", before.ModTime(), after.ModTime())
+	}
+}
+
+func TestUpdateScannerFeedPlainJSON(t *testing.T) {
+	payload := []byte(`{"11111111-0000-0000-0000-000000000001":{"id":"11111111-0000-0000-0000-000000000001","title":"Elementor < 3.25.0"}}`)
+	srv := feedServer(t, payload)
+	defer srv.Close()
+
+	dst := filepath.Join(t.TempDir(), "wordfence-scanner.json")
+	if err := updateFromURL(dst, srv.URL, false, feedScanner, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("database = %s, want the served JSON payload", got)
+	}
+	side, err := os.ReadFile(dst + ".sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := sha256Hex(payload); strings.TrimSpace(string(side)) != want {
+		t.Errorf("sha256 sidecar = %q, want %q", side, want)
+	}
+	ft, err := os.ReadFile(dst + ".feedtype")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(ft)) != feedScanner {
+		t.Errorf("feedtype sidecar = %q, want %q", ft, feedScanner)
+	}
+}
+
+func TestUpdateRejectsUnknownFeed(t *testing.T) {
+	if err := update("x.json", "scann3r", false); err == nil {
+		t.Error("expected error for unknown feed")
+	}
+}
+
+// TestStalenessWarningDownloadAgeAndFeedType verifies the richer staleness
+// prompt: the age comes from the last download (the .sha256 sidecar mtime,
+// not the database mtime) and the feed type is read from the .feedtype
+// sidecar.
+func TestStalenessWarningDownloadAgeAndFeedType(t *testing.T) {
+	path := emptyDB(t) // fresh database mtime — must not drive the age
+	side := path + ".sha256"
+	if err := os.WriteFile(side, []byte("sum\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	download := time.Now().AddDate(0, 0, -30)
+	if err := os.Chtimes(side, download, download); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".feedtype", []byte("scanner\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := staticSite()
+	defer srv.Close()
+
+	out := captureStderr(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: path, silent: true, format: "json"}); code != 0 {
+			t.Errorf("exit code = %d, want 0 (warning is informational)", code)
+		}
+	})
+	want := fmt.Sprintf("[WARN] database is %d days old (scanner feed) — run 'onyx update' for fresh data",
+		int(time.Since(mustModTime(t, side)).Hours()/24))
+	if !strings.Contains(out, want) {
+		t.Errorf("stderr = %q, want %q", out, want)
+	}
+}
+
+func TestFeedTypeSidecarDefaults(t *testing.T) {
+	dir := t.TempDir()
+	if got := dbFeedType(filepath.Join(dir, "db.json")); got != feedProduction {
+		t.Errorf("missing sidecar: dbFeedType = %q, want production", got)
+	}
+	path := filepath.Join(dir, "db.json")
+	if err := os.WriteFile(path+".feedtype", []byte("garbage\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := dbFeedType(path); got != feedProduction {
+		t.Errorf("unknown sidecar content: dbFeedType = %q, want production", got)
 	}
 }
