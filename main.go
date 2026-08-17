@@ -600,8 +600,9 @@ func verifyWithNuclei(res *scanner.Result, o scanOptions) {
 // collectPoCs enriches nuclei findings with the top-5 most-starred PoC
 // repositories per CVE, looked up in a local clone of CVE-PoC-Tracker.
 // Every failure is soft: a missing tracker clone produces a WARN, a CVE
-// missing from the tracker is skipped silently, and unknown star counts
-// (GitHub API errors) fall back to 0 with the links still listed.
+// missing from the tracker is skipped silently, and GitHub API errors
+// fall back to the star counts from the tracker table (never 0) with the
+// links still listed.
 func collectPoCs(res *scanner.Result, o scanOptions) {
 	if len(res.Nuclei) == 0 {
 		return
@@ -640,11 +641,11 @@ func collectPoCs(res *scanner.Result, o scanOptions) {
 
 	fetcher := pocs.NewFetcher(os.Getenv("GITHUB_TOKEN"))
 	for _, cve := range cves {
-		links := pocs.ExtractLinks(dir, cve)
-		if len(links) == 0 {
+		found := pocs.ExtractLinks(dir, cve)
+		if len(found) == 0 {
 			continue
 		}
-		top := pocs.TopByStars(fetcher.Fetch(links))
+		top := pocs.TopByStars(fetcher.Fetch(found))
 		for i := range top {
 			top[i].CVE = cve
 		}
