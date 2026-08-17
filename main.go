@@ -38,12 +38,12 @@ func main() {
 			usage()
 			os.Exit(2)
 		}
-		runScan(target, opts)
+		os.Exit(runScan(target, opts))
 	case "update":
 		updCmd.Parse(os.Args[2:])
 		if err := update(*updDB); err != nil {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
-			os.Exit(1)
+			os.Exit(2)
 		}
 	case "version":
 		fmt.Println("onyx 0.1.0")
@@ -55,20 +55,23 @@ func main() {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath      string
-	threads     int
-	timeout     int
-	asJSON      bool
-	apiOnly     bool
-	stealth     bool
-	rateLimit   float64
-	verbose     bool
-	minSeverity string
-	enumerate   string
-	maxReq      int
-	output      string
-	silent      bool
-	progress    bool
+	dbPath        string
+	threads       int
+	timeout       int
+	format        string
+	apiOnly       bool
+	stealth       bool
+	rateLimit     float64
+	verbose       bool
+	minSeverity   string
+	enumerate     string
+	maxReq        int
+	output        string
+	silent        bool
+	progress      bool
+	userAgent     string
+	randomUA      bool
+	detectionMode string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -79,11 +82,12 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.threads = 5
 	o.timeout = 10
 	o.maxReq = 500
+	o.format = "table"
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--json":
-			o.asJSON = true
+			o.format = "json"
 		case a == "--api":
 			o.apiOnly = true
 		case a == "--stealth":
@@ -94,6 +98,17 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.progress = true
 		case a == "--silent":
 			o.silent = true
+		case a == "--random-user-agent":
+			o.randomUA = true
+		case a == "--user-agent" && i+1 < len(args):
+			i++
+			o.userAgent = args[i]
+		case a == "--detection-mode" && i+1 < len(args):
+			i++
+			o.detectionMode = strings.ToLower(args[i])
+		case a == "--format" && i+1 < len(args):
+			i++
+			o.format = strings.ToLower(args[i])
 		case a == "--min-severity" && i+1 < len(args):
 			i++
 			o.minSeverity = strings.ToLower(args[i])
@@ -138,6 +153,12 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			}
 		}
 	}
+	switch o.format {
+	case "table", "json", "jsonl", "sarif":
+	default:
+		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, json, jsonl or sarif)\n", o.format)
+		os.Exit(2)
+	}
 	return target, o
 }
 
@@ -161,7 +182,8 @@ Scan flags:
   --db PATH          database file (default: %s)
   --threads N        concurrent requests (default: 5)
   --timeout S        per-request timeout in seconds (default: 10)
-  --json             print results as JSON
+  --format F         output format: table, json, jsonl, sarif (default: table)
+  --json             print results as JSON (same as --format json)
   --api              only query the REST API, skip brute-force enumeration
   --stealth          one request per second
   --rate-limit N     max requests per second (overrides --stealth)
@@ -172,40 +194,46 @@ Scan flags:
   --output FILE      write JSON results to FILE (table still prints to stdout)
   --silent           suppress progress output
   --progress         show live progress bar while scanning (off by default)
+  --user-agent UA    send a custom User-Agent string on every request
+  --random-user-agent  use a random browser User-Agent per request
+  --detection-mode M detection: passive (homepage only), aggressive (DB only), mixed (default)
 `, defaultDB)
 }
 
-func runScan(target string, o scanOptions) {
+func runScan(target string, o scanOptions) int {
 	if _, err := os.Stat(o.dbPath); err != nil {
 		fmt.Fprintf(os.Stderr, "database not found at %s — fetching it first...\n", o.dbPath)
 		if err := update(o.dbPath); err != nil {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
-			os.Exit(1)
+			return 2
 		}
 	}
 
 	database, err := db.Load(o.dbPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error loading database:", err)
-		os.Exit(1)
+		return 2
 	}
 
-	if !o.asJSON {
+	if o.format == "table" {
 		report.PrintBanner("0.1.0", database.Count())
 	}
 
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
-		Threads:     o.threads,
-		Timeout:     time.Duration(o.timeout) * time.Second,
-		APIOnly:     o.apiOnly,
-		Stealth:     o.stealth,
-		RateLimit:   o.rateLimit,
-		MaxRequests: o.maxReq,
-		Enumerate:   o.enumerate,
+		Threads:       o.threads,
+		Timeout:       time.Duration(o.timeout) * time.Second,
+		APIOnly:       o.apiOnly,
+		Stealth:       o.stealth,
+		RateLimit:     o.rateLimit,
+		MaxRequests:   o.maxReq,
+		Enumerate:     o.enumerate,
+		UserAgent:     o.userAgent,
+		RandomUA:      o.randomUA,
+		DetectionMode: o.detectionMode,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		return 2
 	}
 
 	// Progress bar is on by default (a single live line showing a
@@ -218,7 +246,7 @@ func runScan(target string, o scanOptions) {
 	res, err := sc.Scan()
 	if err != nil && res == nil {
 		fmt.Fprintln(os.Stderr, "scan failed:", err)
-		os.Exit(1)
+		return 2
 	}
 
 	if pr := sc.Progress(); pr != nil {
@@ -233,12 +261,31 @@ func runScan(target string, o scanOptions) {
 		}
 	}
 
-	if o.asJSON {
+	switch o.format {
+	case "json":
 		out, _ := json.MarshalIndent(res, "", "  ")
 		fmt.Println(string(out))
-		return
+	case "jsonl":
+		report.PrintJSONL(res)
+	case "sarif":
+		report.PrintSARIF("0.1.0", res)
+	default:
+		report.PrintTable(res, o.verbose, o.minSeverity)
 	}
-	report.PrintTable(res, o.verbose, o.minSeverity)
+	return scanExitCode(res, err)
+}
+
+// scanExitCode maps a scan outcome onto the onyx exit codes: 0 when the
+// scan completed with no findings (including non-WordPress targets), 5 when
+// findings were found, 2 on outright failure.
+func scanExitCode(res *scanner.Result, err error) int {
+	if err != nil && res == nil {
+		return 2
+	}
+	if len(res.Findings) > 0 {
+		return 5
+	}
+	return 0
 }
 
 // writeScanOutput serializes res as indented JSON to path, creating the

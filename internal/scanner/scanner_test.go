@@ -597,3 +597,116 @@ func multiPluginFeed(t *testing.T, n int) string {
 	}
 	return path
 }
+
+// uaRecorder returns a server that records every request's User-Agent.
+func uaRecorder() (*httptest.Server, func() []string) {
+	var mu sync.Mutex
+	var uas []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		uas = append(uas, r.Header.Get("User-Agent"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><img src="/wp-content/themes/twentytwentyfour/style.css" /></body></html>`))
+	}))
+	recorded := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), uas...)
+	}
+	return srv, recorded
+}
+
+func TestCustomUserAgentOnEveryRequest(t *testing.T) {
+	srv, recorded := uaRecorder()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{UserAgent: "onyx-test/1.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Scan(); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	uas := recorded()
+	if len(uas) == 0 {
+		t.Fatal("expected at least one request")
+	}
+	for _, ua := range uas {
+		if ua != "onyx-test/1.0" {
+			t.Errorf("User-Agent = %q, want onyx-test/1.0", ua)
+		}
+	}
+}
+
+func TestRandomUserAgentFromFixedSet(t *testing.T) {
+	srv, recorded := uaRecorder()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{RandomUA: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Scan(); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	uas := recorded()
+	if len(uas) == 0 {
+		t.Fatal("expected at least one request")
+	}
+	inSet := func(ua string) bool {
+		for _, u := range browserUAs {
+			if u == ua {
+				return true
+			}
+		}
+		return false
+	}
+	for _, ua := range uas {
+		if ua == "" {
+			t.Error("expected a User-Agent on every request")
+		}
+		if !inSet(ua) {
+			t.Errorf("User-Agent %q not in the random set", ua)
+		}
+	}
+}
+
+func TestDetectionModes(t *testing.T) {
+	cases := []struct {
+		mode    string
+		wantHit int
+	}{
+		{"passive", 1},    // only the theme referenced in homepage HTML
+		{"aggressive", 3}, // only the DB top slugs (plugin-1..3)
+		{"mixed", 4},      // both
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.mode, func(t *testing.T) {
+			srv, counter := fakeWPServer(t, `[]`, 200, nil)
+			defer srv.Close()
+			d, _ := db.Load(multiPluginFeed(t, 3))
+			sc, err := NewScanner(d, srv.URL, Options{DetectionMode: c.mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sc.Scan(); err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+			if got := counter.content.Load(); got != int64(c.wantHit) {
+				t.Errorf("%s mode: /wp-content requests = %d, want %d", c.mode, got, c.wantHit)
+			}
+		})
+	}
+}
+
+func TestNewScannerRejectsUnknownDetectionMode(t *testing.T) {
+	if _, err := NewScanner(nil, "http://example.test", Options{DetectionMode: "loud"}); err == nil {
+		t.Fatal("expected error for invalid detection mode")
+	}
+}

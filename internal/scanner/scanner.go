@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -40,13 +41,16 @@ var authorSlugRe = regexp.MustCompile(`^/author/([^/]+)`)
 
 // Options tunes the scan behaviour. Zero values fall back to defaults.
 type Options struct {
-	Threads     int           // concurrent HTTP requests (default 5)
-	Timeout     time.Duration // per-request timeout (default 10s)
-	Stealth     bool          // throttle to 1 request/second
-	RateLimit   float64       // max requests per second (0 = unlimited)
-	APIOnly     bool          // skip brute-force enumeration, only wp-json/plugins
-	MaxRequests int           // cap on brute-force enumeration requests (default 500)
-	Enumerate   string        // what to enumerate: u/p/t, combinable (default "pt")
+	Threads       int           // concurrent HTTP requests (default 5)
+	Timeout       time.Duration // per-request timeout (default 10s)
+	Stealth       bool          // throttle to 1 request/second
+	RateLimit     float64       // max requests per second (0 = unlimited)
+	APIOnly       bool          // skip brute-force enumeration, only wp-json/plugins
+	MaxRequests   int           // cap on brute-force enumeration requests (default 500)
+	Enumerate     string        // what to enumerate: u/p/t, combinable (default "pt")
+	UserAgent     string        // custom User-Agent for all requests
+	RandomUA      bool          // pick a random browser User-Agent per request
+	DetectionMode string        // passive (homepage only), aggressive (DB only), mixed (default)
 }
 
 // Scanner drives one scan against a single target.
@@ -58,6 +62,7 @@ type Scanner struct {
 	lim         *rateLimiter
 	enum        string
 	maxRequests int
+	mode        string // detection mode: passive | aggressive | mixed
 	progress    *progress.Bar
 	homepage    string // raw homepage HTML for passive slug detection
 
@@ -71,6 +76,39 @@ type rateLimiter struct {
 	mu       sync.Mutex
 	interval time.Duration
 	last     time.Time
+}
+
+// browserUAs is a small fixed set of realistic desktop browser User-Agent
+// strings used by --random-user-agent.
+var browserUAs = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+}
+
+// uaTransport stamps the configured or a random browser User-Agent onto
+// every outbound request.
+type uaTransport struct {
+	base      http.RoundTripper
+	userAgent string
+	randomUA  bool
+}
+
+func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ua := t.userAgent
+	if ua == "" && t.randomUA {
+		ua = browserUAs[rand.IntN(len(browserUAs))]
+	}
+	if ua != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set("User-Agent", ua)
+	}
+	return t.base.RoundTrip(req)
 }
 
 func (r *rateLimiter) wait() {
@@ -116,6 +154,15 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	if opts.MaxRequests <= 0 {
 		opts.MaxRequests = defaultMaxRequests
 	}
+	mode := strings.ToLower(strings.TrimSpace(opts.DetectionMode))
+	if mode == "" {
+		mode = "mixed"
+	}
+	switch mode {
+	case "passive", "aggressive", "mixed":
+	default:
+		return nil, fmt.Errorf("invalid --detection-mode %q (use passive, aggressive or mixed)", opts.DetectionMode)
+	}
 	client := &http.Client{
 		Timeout: opts.Timeout,
 		Transport: &http.Transport{
@@ -124,6 +171,13 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
+	if opts.UserAgent != "" || opts.RandomUA {
+		client.Transport = &uaTransport{
+			base:      client.Transport,
+			userAgent: opts.UserAgent,
+			randomUA:  opts.RandomUA,
+		}
+	}
 	s := &Scanner{
 		db:          database,
 		base:        strings.TrimRight(base, "/"),
@@ -131,6 +185,7 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		opts:        opts,
 		enum:        enum,
 		maxRequests: opts.MaxRequests,
+		mode:        mode,
 	}
 	if opts.Stealth {
 		s.lim = &rateLimiter{interval: time.Second}
@@ -498,9 +553,11 @@ func (j job) label(version string) string {
 func (s *Scanner) buildJobs() []job {
 	var jobs []job
 	seen := make(map[string]bool)
+	passive := s.mode == "mixed" || s.mode == "passive"
+	aggressive := s.mode == "mixed" || s.mode == "aggressive"
 
 	// Passive detection: slugs referenced in the homepage HTML (WPScan-style).
-	if s.homepage != "" {
+	if passive && s.homepage != "" {
 		passiveP, passiveT := ExtractPassiveSlugs(s.homepage)
 		for _, slug := range passiveP {
 			if !s.enumeratePlugins() {
@@ -525,28 +582,30 @@ func (s *Scanner) buildJobs() []job {
 	if budget <= 0 {
 		budget = defaultTopSlugs
 	}
-	for _, slug := range s.db.TopSlugs(budget) {
-		switch s.db.SlugType(slug) {
-		case "plugin":
-			if !s.enumeratePlugins() {
-				continue
+	if aggressive {
+		for _, slug := range s.db.TopSlugs(budget) {
+			switch s.db.SlugType(slug) {
+			case "plugin":
+				if !s.enumeratePlugins() {
+					continue
+				}
+				if seen["p:"+slug] {
+					continue
+				}
+				seen["p:"+slug] = true
+				jobs = append(jobs, job{kind: "plugin", slug: slug,
+					path: "/wp-content/plugins/" + slug + "/readme.txt"})
+			case "theme":
+				if !s.enumerateThemes() {
+					continue
+				}
+				if seen["t:"+slug] {
+					continue
+				}
+				seen["t:"+slug] = true
+				jobs = append(jobs, job{kind: "theme", slug: slug,
+					path: "/wp-content/themes/" + slug + "/style.css"})
 			}
-			if seen["p:"+slug] {
-				continue
-			}
-			seen["p:"+slug] = true
-			jobs = append(jobs, job{kind: "plugin", slug: slug,
-				path: "/wp-content/plugins/" + slug + "/readme.txt"})
-		case "theme":
-			if !s.enumerateThemes() {
-				continue
-			}
-			if seen["t:"+slug] {
-				continue
-			}
-			seen["t:"+slug] = true
-			jobs = append(jobs, job{kind: "theme", slug: slug,
-				path: "/wp-content/themes/" + slug + "/style.css"})
 		}
 	}
 	return jobs
