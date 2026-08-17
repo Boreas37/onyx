@@ -76,6 +76,9 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 	if res.XMLRPC {
 		fmt.Printf("XML-RPC: enabled\n")
 	}
+	if res.AuthStatus != "" {
+		fmt.Printf("REST auth: %s\n", res.AuthStatus)
+	}
 	if len(res.Interesting) > 0 {
 		fmt.Printf("Interesting:\n")
 		for _, item := range res.Interesting {
@@ -96,6 +99,14 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 				name = fmt.Sprintf(" (%s)", u.Name)
 			}
 			fmt.Printf("  - %s%s%s\n", u.Slug, id, name)
+		}
+		fmt.Println()
+	}
+
+	if len(res.LoginBrutes) > 0 {
+		fmt.Printf("Valid credentials:\n")
+		for _, lb := range res.LoginBrutes {
+			fmt.Printf("  - %s:%s%s\n", lb.User, lb.Password, lb.URL)
 		}
 		fmt.Println()
 	}
