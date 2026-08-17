@@ -1,6 +1,9 @@
 package scanner
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -68,6 +73,11 @@ type Options struct {
 	PluginsDir          string        // plugins directory (default "wp-content/plugins")
 	ExcludeContentBased string        // regex; matching homepage HTML aborts the scan
 	Scope               string        // regex; a non-matching target URL is out of scope
+	PluginsList         string        // file with plugin slugs (one per line, # comments)
+	ThemesList          string        // file with theme slugs (one per line, # comments)
+	MaxScanDuration     time.Duration // hard stop for the whole scan; 0 = unlimited
+	CacheTTL            time.Duration // HTTP response cache TTL; 0 = off
+	Findings            chan Finding  // when set, every finding is emitted live
 }
 
 // Scanner drives one scan against a single target.
@@ -94,6 +104,11 @@ type Scanner struct {
 
 	scopeRe   *regexp.Regexp // --scope target URL filter
 	excludeRe *regexp.Regexp // --exclude-content-based homepage filter
+
+	pluginsList []string        // explicit plugin slugs (--plugins-list)
+	themesList  []string        // explicit theme slugs (--themes-list)
+	ctx         context.Context // scan-wide context (--max-scan-duration)
+	cacheDir    string          // HTTP cache directory (--cache-ttl)
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -116,10 +131,52 @@ var dbExportDirs = []string{
 	"/db/", "/backup/", "/sql/", "/dump/", "/database/",
 }
 
+// timthumbPaths are the locations probed by the timthumb check.
+var timthumbPaths = []string{
+	"/wp-content/plugins/timthumb.php",
+	"/timthumb.php",
+}
+
+// timthumbFinder probes for an exposed TimThumb image-resizer copy: any of
+// timthumbPaths answering 200 with a body mentioning timthumb.
+func (s *Scanner) timthumbFinder() []string {
+	var found []string
+	for _, p := range timthumbPaths {
+		code, body, err := s.fetch(p)
+		if err != nil || code != http.StatusOK {
+			continue
+		}
+		if strings.Contains(strings.ToLower(string(body)), "timthumb") {
+			found = append(found, p)
+		}
+	}
+	return found
+}
+
 type rateLimiter struct {
 	mu       sync.Mutex
 	interval time.Duration
 	last     time.Time
+}
+
+// readSlugList loads a slug list file (one slug per line, # comments
+// allowed) for --plugins-list / --themes-list.
+func readSlugList(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, nil
 }
 
 // browserUAs is a small fixed set of realistic desktop browser User-Agent
@@ -207,8 +264,8 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 			if c == "" {
 				continue
 			}
-			if c != "cb" && c != "dbe" {
-				return nil, fmt.Errorf("invalid --checks value %q (use cb and/or dbe)", c)
+			if c != "cb" && c != "dbe" && c != "timthumb" {
+				return nil, fmt.Errorf("invalid --checks value %q (use cb, dbe and/or timthumb)", c)
 			}
 			checks[c] = true
 		}
@@ -289,6 +346,28 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		pluginsDir:  pluginsDir,
 		scopeRe:     scopeRe,
 		excludeRe:   excludeRe,
+	}
+	if opts.PluginsList != "" {
+		s.pluginsList, err = readSlugList(opts.PluginsList)
+		if err != nil {
+			return nil, fmt.Errorf("reading plugins list: %w", err)
+		}
+	}
+	if opts.ThemesList != "" {
+		s.themesList, err = readSlugList(opts.ThemesList)
+		if err != nil {
+			return nil, fmt.Errorf("reading themes list: %w", err)
+		}
+	}
+	if opts.CacheTTL > 0 {
+		s.cacheDir = os.Getenv("ONYX_CACHE_DIR")
+		if s.cacheDir == "" {
+			home, herr := os.UserHomeDir()
+			if herr != nil {
+				home = "."
+			}
+			s.cacheDir = filepath.Join(home, ".cache", "onyx", "http")
+		}
 	}
 	if opts.Stealth {
 		s.lim = &rateLimiter{interval: time.Second}
@@ -376,12 +455,23 @@ type Result struct {
 	ConfigBackups    []string   `json:"config_backups,omitempty"`
 	DBExports        []string   `json:"db_exports,omitempty"`
 	RateLimitHits    int        `json:"rate_limit_hits,omitempty"` // 429s seen
+	TimedOut         bool       `json:"timed_out,omitempty"`        // --max-scan-duration expired
 	Errors           []string   `json:"errors,omitempty"`
 }
 
 func (s *Scanner) fetch(path string) (int, []byte, error) {
 	s.lim.wait()
-	resp, err := s.client.Get(s.base + path)
+	u := s.base + path
+	if s.opts.CacheTTL > 0 {
+		if code, body, ok := s.cacheGet(u); ok {
+			return code, body, nil
+		}
+	}
+	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -417,6 +507,9 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 	s.rlMu.Unlock()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	if err == nil && resp.StatusCode == http.StatusOK && s.opts.CacheTTL > 0 {
+		s.cachePut(u, body)
+	}
 	return resp.StatusCode, body, err
 }
 
@@ -428,7 +521,11 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	resp, err := client.Get(s.base + path)
+	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, s.base+path, nil)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -437,12 +534,62 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	return resp.StatusCode, resp.Header, body, err
 }
 
+// requestCtx returns the scan-wide context (--max-scan-duration), or a
+// background context when no duration was configured.
+func (s *Scanner) requestCtx() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
+// scanDone reports whether the scan-wide context (--max-scan-duration)
+// has expired.
+func (s *Scanner) scanDone() bool {
+	return s.ctx != nil && s.ctx.Err() != nil
+}
+
+// cacheKey hashes a URL into a flat file name for the HTTP cache.
+func cacheKey(u string) string {
+	h := sha256.Sum256([]byte(u))
+	return hex.EncodeToString(h[:8])
+}
+
+// cacheGet serves u from the disk cache when a fresh (within TTL) 200
+// response is stored. ok is false on any miss or read error.
+func (s *Scanner) cacheGet(u string) (int, []byte, bool) {
+	path := filepath.Join(s.cacheDir, cacheKey(u))
+	fi, err := os.Stat(path)
+	if err != nil || time.Since(fi.ModTime()) > s.opts.CacheTTL {
+		return 0, nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return 0, nil, false
+	}
+	return http.StatusOK, data, true
+}
+
+// cachePut stores a 200 response body in the disk cache. Failures are
+// silent: the cache is an optimization, never a scan error.
+func (s *Scanner) cachePut(u string, body []byte) {
+	if err := os.MkdirAll(s.cacheDir, 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), body, 0o644)
+}
+
 // checkXMLRPC pings POST /xmlrpc.php with a system.listMethods call and
 // reports whether the server answered with a methodResponse payload.
 func (s *Scanner) checkXMLRPC() bool {
 	s.lim.wait()
 	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
-	resp, err := s.client.Post(s.base+"/xmlrpc.php", "text/xml", strings.NewReader(payload))
+	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodPost, s.base+"/xmlrpc.php", strings.NewReader(payload))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "text/xml")
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -789,17 +936,17 @@ func (s *Scanner) buildJobs() []job {
 		}
 	}
 
-	// Aggressive detection: brute-force the vuln-heavy slugs from the DB.
+	// Aggressive detection: brute-force the explicit slug lists when
+	// provided, otherwise the vuln-heavy slugs from the DB.
 	budget := s.maxRequests
 	if budget <= 0 {
 		budget = defaultTopSlugs
 	}
 	if aggressive {
-		for _, slug := range s.db.TopSlugs(budget) {
-			switch s.db.SlugType(slug) {
-			case "plugin":
+		if len(s.pluginsList) > 0 || len(s.themesList) > 0 {
+			for _, slug := range s.pluginsList {
 				if !s.enumeratePlugins() {
-					continue
+					break
 				}
 				if seen["p:"+slug] {
 					continue
@@ -807,9 +954,10 @@ func (s *Scanner) buildJobs() []job {
 				seen["p:"+slug] = true
 				jobs = append(jobs, job{kind: "plugin", slug: slug,
 					path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
-			case "theme":
+			}
+			for _, slug := range s.themesList {
 				if !s.enumerateThemes() {
-					continue
+					break
 				}
 				if seen["t:"+slug] {
 					continue
@@ -817,6 +965,31 @@ func (s *Scanner) buildJobs() []job {
 				seen["t:"+slug] = true
 				jobs = append(jobs, job{kind: "theme", slug: slug,
 					path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
+			}
+		} else {
+			for _, slug := range s.db.TopSlugs(budget) {
+				switch s.db.SlugType(slug) {
+				case "plugin":
+					if !s.enumeratePlugins() {
+						continue
+					}
+					if seen["p:"+slug] {
+						continue
+					}
+					seen["p:"+slug] = true
+					jobs = append(jobs, job{kind: "plugin", slug: slug,
+						path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
+				case "theme":
+					if !s.enumerateThemes() {
+						continue
+					}
+					if seen["t:"+slug] {
+						continue
+					}
+					seen["t:"+slug] = true
+					jobs = append(jobs, job{kind: "theme", slug: slug,
+						path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
+				}
 			}
 		}
 	}
@@ -899,9 +1072,22 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 
 // Scan runs the full workflow: WordPress detection, enumeration and matching.
 func (s *Scanner) Scan() (*Result, error) {
+	if s.opts.Findings != nil {
+		defer close(s.opts.Findings)
+	}
+
 	// --scope target URL validation happens before any request.
 	if s.scopeRe != nil && !s.scopeRe.MatchString(s.base) {
 		return nil, ErrOutOfScope
+	}
+
+	// --max-scan-duration: a scan-wide deadline. When it expires every
+	// in-flight request is canceled and the scan returns the partial
+	// results collected so far.
+	var cancel context.CancelFunc
+	if s.opts.MaxScanDuration > 0 {
+		s.ctx, cancel = context.WithTimeout(context.Background(), s.opts.MaxScanDuration)
+		defer cancel()
 	}
 
 	res := &Result{Target: s.base}
@@ -954,12 +1140,16 @@ func (s *Scanner) Scan() (*Result, error) {
 		}
 	}
 
-	// Optional file-based checks: config backups (cb) and DB exports (dbe).
+	// Optional file-based checks: config backups (cb), DB exports (dbe)
+	// and exposed TimThumb copies (timthumb).
 	if s.checks["cb"] {
 		res.ConfigBackups = s.configBackupFinder()
 	}
 	if s.checks["dbe"] {
 		res.DBExports = s.dbExportFinder()
+	}
+	if s.checks["timthumb"] && len(s.timthumbFinder()) > 0 {
+		res.Interesting = append(res.Interesting, "timthumb.php exposed")
 	}
 
 	var mu sync.Mutex
@@ -974,6 +1164,11 @@ func (s *Scanner) Scan() (*Result, error) {
 	addFindings := func(list []Finding) {
 		if len(list) == 0 {
 			return
+		}
+		if s.opts.Findings != nil {
+			for i := range list {
+				s.opts.Findings <- list[i]
+			}
 		}
 		mu.Lock()
 		res.Findings = append(res.Findings, list...)
@@ -1031,6 +1226,9 @@ func (s *Scanner) Scan() (*Result, error) {
 		sem := make(chan struct{}, s.opts.Threads)
 		var wg sync.WaitGroup
 		for _, j := range jobs {
+			if s.scanDone() {
+				break
+			}
 			j := j
 			wg.Add(1)
 			go func() {
@@ -1100,6 +1298,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	sort.Slice(res.Findings, func(i, j int) bool { return res.Findings[i].Slug < res.Findings[j].Slug })
 
 	res.RateLimitHits = s.rateLimitHits()
+	res.TimedOut = s.scanDone()
 	return res, nil
 }
 

@@ -82,6 +82,13 @@ type scanOptions struct {
 	excludeContentBased string
 	scope               string
 	noUpdateCheck       bool
+	pluginsList         string
+	themesList          string
+	maxScanDuration     time.Duration
+	maxScanDurationSpec string
+	cacheTTL            time.Duration
+	stream              bool
+	configPath          string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -96,11 +103,13 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.connectTimeout = 10
 	o.contentDir = "wp-content"
 	o.pluginsDir = "wp-content/plugins"
+	setFlags := make(map[string]bool)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--json":
 			o.format = "json"
+			setFlags["format"] = true
 		case a == "--api":
 			o.apiOnly = true
 		case a == "--stealth":
@@ -119,6 +128,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--detection-mode" && i+1 < len(args):
 			i++
 			o.detectionMode = strings.ToLower(args[i])
+			setFlags["detection-mode"] = true
 		case a == "--proxy" && i+1 < len(args):
 			i++
 			o.proxy = args[i]
@@ -152,15 +162,18 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--format" && i+1 < len(args):
 			i++
 			o.format = strings.ToLower(args[i])
+			setFlags["format"] = true
 		case a == "--min-severity" && i+1 < len(args):
 			i++
 			o.minSeverity = strings.ToLower(args[i])
+			setFlags["min-severity"] = true
 		case a == "--db" && i+1 < len(args):
 			i++
 			o.dbPath = args[i]
 		case a == "--threads" && i+1 < len(args):
 			i++
 			o.threads = atoi(args[i], 5)
+			setFlags["threads"] = true
 		case a == "--timeout" && i+1 < len(args):
 			i++
 			o.timeout = atoi(args[i], 10)
@@ -169,6 +182,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			rl, err := strconv.ParseFloat(args[i], 64)
 			if err == nil && rl > 0 {
 				o.rateLimit = rl
+				setFlags["rate-limit"] = true
 			}
 		case a == "--enumerate" && i+1 < len(args):
 			i++
@@ -179,13 +193,48 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--output" && i+1 < len(args):
 			i++
 			o.output = args[i]
+		case a == "--plugins-list" && i+1 < len(args):
+			i++
+			o.pluginsList = args[i]
+		case a == "--themes-list" && i+1 < len(args):
+			i++
+			o.themesList = args[i]
+		case a == "--max-scan-duration" && i+1 < len(args):
+			i++
+			d, err := time.ParseDuration(args[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "invalid --max-scan-duration %q (use Go duration format, e.g. 30s or 5m)\n", args[i])
+				os.Exit(2)
+			}
+			o.maxScanDuration = d
+			o.maxScanDurationSpec = args[i]
+		case a == "--cache-ttl" && i+1 < len(args):
+			i++
+			o.cacheTTL = time.Duration(atoi(args[i], 0)) * time.Hour
+		case a == "--stream":
+			o.stream = true
+		case a == "--config" && i+1 < len(args):
+			i++
+			o.configPath = args[i]
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
 		default:
 			if target == "" {
 				target = a
+				setFlags["url"] = true
 			}
+		}
+	}
+	// --stream alone implies --format jsonl.
+	if o.stream && !setFlags["format"] {
+		o.format = "jsonl"
+	}
+	// --config FILE: JSON defaults overridden by explicit CLI flags.
+	if o.configPath != "" {
+		if err := applyConfig(&o, &target, setFlags, o.configPath); err != nil {
+			fmt.Fprintln(os.Stderr, "error loading config:", err)
+			os.Exit(2)
 		}
 	}
 	if o.enumerate != "" {
@@ -203,6 +252,45 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		os.Exit(2)
 	}
 	return target, o
+}
+
+// applyConfig overlays the known keys of a JSON config file onto o. CLI
+// flags (tracked in setFlags) always win; unknown keys are ignored.
+func applyConfig(o *scanOptions, target *string, setFlags map[string]bool, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var cfg struct {
+		URL           string   `json:"url"`
+		Threads       *int     `json:"threads"`
+		RateLimit     *float64 `json:"rate_limit"`
+		DetectionMode *string  `json:"detection_mode"`
+		Format        *string  `json:"format"`
+		MinSeverity   *string  `json:"min_severity"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parsing %s: %w", path, err)
+	}
+	if !setFlags["url"] && cfg.URL != "" {
+		*target = cfg.URL
+	}
+	if !setFlags["threads"] && cfg.Threads != nil {
+		o.threads = *cfg.Threads
+	}
+	if !setFlags["rate-limit"] && cfg.RateLimit != nil {
+		o.rateLimit = *cfg.RateLimit
+	}
+	if !setFlags["detection-mode"] && cfg.DetectionMode != nil {
+		o.detectionMode = strings.ToLower(*cfg.DetectionMode)
+	}
+	if !setFlags["format"] && cfg.Format != nil {
+		o.format = strings.ToLower(*cfg.Format)
+	}
+	if !setFlags["min-severity"] && cfg.MinSeverity != nil {
+		o.minSeverity = strings.ToLower(*cfg.MinSeverity)
+	}
+	return nil
 }
 
 func atoi(s string, def int) int {
@@ -252,7 +340,7 @@ Scan flags:
   --detection-mode M detection: passive (homepage only), aggressive (DB only), mixed (default)
   --proxy URL        route requests through an http(s) proxy (socks5 unsupported)
   --no-xmlrpc        skip the XML-RPC (xmlrpc.php) ping check
-  --checks LIST      run extra checks: cb (config backups), dbe (db exports); combine with commas
+  --checks LIST      run extra checks: cb (config backups), dbe (db exports), timthumb; combine with commas
   --connect-timeout S  TCP connect timeout in seconds (default: 10)
   --request-timeout S  per-request timeout in seconds (default: 10; --timeout is an alias)
   --wp-content-dir PATH  wp-content directory (default: wp-content)
@@ -260,6 +348,12 @@ Scan flags:
   --exclude-content-based REGEX  abort the scan when homepage HTML matches REGEX (WAF/error page)
   --scope REGEX     only scan when the target URL matches REGEX
   --no-update-check suppress the stale-database warning
+  --plugins-list FILE  enumerate exactly the plugin slugs listed in FILE (one per line, # comments)
+  --themes-list FILE   enumerate exactly the theme slugs listed in FILE (one per line, # comments)
+  --max-scan-duration D  stop the scan after D (Go duration format, e.g. 30s or 5m)
+  --cache-ttl HOURS  cache HTTP responses on disk for HOURS (default: 0 = off; dir: ~/.cache/onyx/http or $ONYX_CACHE_DIR)
+  --stream           emit findings as JSON Lines the moment they are found (implies --format jsonl)
+  --config FILE      JSON config file; explicit CLI flags win over config values
 `, defaultDB)
 }
 
@@ -295,6 +389,22 @@ func runScan(target string, o scanOptions) int {
 		reqTimeout = o.timeout
 	}
 
+	// --stream: findings are emitted as JSON Lines the moment they are
+	// found (only meaningful with --format jsonl).
+	var findings chan scanner.Finding
+	var streamDone chan struct{}
+	if o.stream && o.format == "jsonl" {
+		findings = make(chan scanner.Finding)
+		streamDone = make(chan struct{})
+		go func() {
+			defer close(streamDone)
+			enc := json.NewEncoder(os.Stdout)
+			for f := range findings {
+				_ = enc.Encode(&f)
+			}
+		}()
+	}
+
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
 		Threads:             o.threads,
 		Timeout:             time.Duration(o.timeout) * time.Second,
@@ -315,6 +425,11 @@ func runScan(target string, o scanOptions) int {
 		PluginsDir:          o.pluginsDir,
 		ExcludeContentBased: o.excludeContentBased,
 		Scope:               o.scope,
+		PluginsList:         o.pluginsList,
+		ThemesList:          o.themesList,
+		MaxScanDuration:     o.maxScanDuration,
+		CacheTTL:            o.cacheTTL,
+		Findings:            findings,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -329,6 +444,16 @@ func runScan(target string, o scanOptions) int {
 	}
 
 	res, err := sc.Scan()
+	if streamDone != nil {
+		<-streamDone
+	}
+	if res != nil && res.TimedOut {
+		spec := o.maxScanDurationSpec
+		if spec == "" {
+			spec = o.maxScanDuration.String()
+		}
+		fmt.Fprintf(os.Stderr, "[WARN] scan timed out after %s — results may be incomplete\n", spec)
+	}
 	if err != nil && res == nil {
 		fmt.Fprintln(os.Stderr, "scan failed:", err)
 		return 2
@@ -351,7 +476,9 @@ func runScan(target string, o scanOptions) int {
 		out, _ := json.MarshalIndent(res, "", "  ")
 		fmt.Println(string(out))
 	case "jsonl":
-		report.PrintJSONL(res)
+		if !o.stream {
+			report.PrintJSONL(res)
+		}
 	case "sarif":
 		report.PrintSARIF("0.1.0", res)
 	default:
