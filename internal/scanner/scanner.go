@@ -49,8 +49,9 @@ const defaultMaxRequests = 500
 const maxAuthorChecks = 10
 
 // authorSlugRe matches the author archive path the /?author=N redirect
-// chain lands on.
-var authorSlugRe = regexp.MustCompile(`^/author/([^/]+)`)
+// chain lands on. The optional leading slash prefix also covers
+// subdirectory multisite installs (/blog/author/<slug>/).
+var authorSlugRe = regexp.MustCompile(`(?:^|/)author/([^/?#]+)`)
 
 // Options tunes the scan behaviour. Zero values fall back to defaults.
 type Options struct {
@@ -507,10 +508,17 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 	s.rlMu.Unlock()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
-	if err == nil && resp.StatusCode == http.StatusOK && s.opts.CacheTTL > 0 {
-		s.cachePut(u, body)
+	if err == nil && cacheableStatus(resp.StatusCode) && s.opts.CacheTTL > 0 {
+		s.cachePut(u, resp.StatusCode, body)
 	}
 	return resp.StatusCode, body, err
+}
+
+// cacheableStatus reports whether a response may be cached: successful and
+// deterministic client-error responses (200s and 4xx) are reused within the
+// TTL, while 5xx server errors are never cached because they are transient.
+func cacheableStatus(code int) bool {
+	return code >= http.StatusOK && code < 500 && code != http.StatusTooManyRequests
 }
 
 // fetchNoRedirect GETs path without following redirects so the raw 30x
@@ -555,8 +563,10 @@ func cacheKey(u string) string {
 	return hex.EncodeToString(h[:8])
 }
 
-// cacheGet serves u from the disk cache when a fresh (within TTL) 200
-// response is stored. ok is false on any miss or read error.
+// cacheGet serves u from the disk cache when a fresh (within TTL) response
+// is stored. The cached status code is returned alongside the body so
+// callers can treat negative (404/403) hits the same as fresh ones. ok is
+// false on any miss or read error.
 func (s *Scanner) cacheGet(u string) (int, []byte, bool) {
 	path := filepath.Join(s.cacheDir, cacheKey(u))
 	fi, err := os.Stat(path)
@@ -567,16 +577,29 @@ func (s *Scanner) cacheGet(u string) (int, []byte, bool) {
 	if err != nil || len(data) == 0 {
 		return 0, nil, false
 	}
-	return http.StatusOK, data, true
+	// First line is the status code ("HTTP 404"), the rest is the body.
+	i := strings.IndexByte(string(data), '\n')
+	if i < 0 {
+		return 0, nil, false
+	}
+	var code int
+	if _, err := fmt.Sscanf(string(data[:i]), "HTTP %d", &code); err != nil {
+		return 0, nil, false
+	}
+	return code, data[i+1:], true
 }
 
-// cachePut stores a 200 response body in the disk cache. Failures are
-// silent: the cache is an optimization, never a scan error.
-func (s *Scanner) cachePut(u string, body []byte) {
+// cachePut stores a response (status code + body) in the disk cache. The
+// body may be empty for negative responses. Failures are silent: the cache
+// is an optimization, never a scan error.
+func (s *Scanner) cachePut(u string, code int, body []byte) {
 	if err := os.MkdirAll(s.cacheDir, 0o755); err != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), body, 0o644)
+	data := make([]byte, 0, len(body)+16)
+	data = append(data, fmt.Sprintf("HTTP %d\n", code)...)
+	data = append(data, body...)
+	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), data, 0o644)
 }
 
 // checkXMLRPC pings POST /xmlrpc.php with a system.listMethods call and
@@ -707,7 +730,21 @@ func (s *Scanner) usersFromAPI() ([]User, []string) {
 		Name string `json:"name"`
 		Slug string `json:"slug"`
 	}
-	if err := json.Unmarshal(body, &items); err != nil {
+	// WordPress can prepend PHP Deprecated/Warning notices to the JSON
+	// payload; skip everything before the first '[' or '{' so the JSON
+	// decoder never sees the noise.
+	start := -1
+	for i, b := range body {
+		if b == '[' || b == '{' {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		errs = append(errs, "wp-json/wp/v2/users returned unparseable data")
+		return nil, errs
+	}
+	if err := json.Unmarshal(body[start:], &items); err != nil {
 		errs = append(errs, "wp-json/wp/v2/users returned unparseable data")
 		return nil, errs
 	}
@@ -722,34 +759,52 @@ func (s *Scanner) usersFromAPI() ([]User, []string) {
 }
 
 // usersFromAuthors walks /?author=1..N following the redirect chain and
-// extracting the username from /author/<slug>/ landing pages.
+// extracting the username from /author/<slug>/ landing pages. When the
+// server answers 200 instead of redirecting (WP 7.x behaviour), the slug is
+// extracted from the response body itself.
 func (s *Scanner) usersFromAuthors(maxN int) ([]User, []string) {
 	var out []User
 	var errs []string
 	for n := 1; n <= maxN; n++ {
-		loc, err := s.authorLocation(n)
+		loc, body, err := s.authorLocation(n)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("?author=%d: %v", n, err))
 			continue
 		}
 		if slug := authorSlugFromLocation(loc); slug != "" {
 			out = append(out, User{ID: n, Slug: slug})
+			continue
+		}
+		if slug := authorSlugFromBody(body); slug != "" {
+			out = append(out, User{ID: n, Slug: slug})
 		}
 	}
 	return out, nil
 }
 
-// authorLocation returns the Location header of the /?author=N redirect.
-func (s *Scanner) authorLocation(n int) (string, error) {
-	code, hdr, _, err := s.fetchNoRedirect(fmt.Sprintf("/?author=%d", n))
+// authorLocation returns the Location header of the /?author=N redirect,
+// plus the response body when no redirect happens (a 200 author archive
+// page that still carries the author slug, e.g. in a canonical link).
+func (s *Scanner) authorLocation(n int) (string, []byte, error) {
+	code, hdr, body, err := s.fetchNoRedirect(fmt.Sprintf("/?author=%d", n))
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	switch code {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-		return hdr.Get("Location"), nil
+		return hdr.Get("Location"), nil, nil
 	}
-	return "", nil
+	return "", body, nil
+}
+
+// authorSlugFromBody extracts the username from a 200 ?author=N response
+// body: either a <link rel="canonical" href=".../author/<slug>/"> reference
+// or any /author/<slug>/ path mentioned in the page.
+func authorSlugFromBody(body []byte) string {
+	if m := authorSlugRe.FindStringSubmatch(string(body)); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // authorSlugFromLocation extracts the username from any /author/<slug>/
@@ -807,11 +862,13 @@ func normalizeUsers(lists ...[]User) []User {
 
 // detectWP checks the homepage, wp-login.php and the REST API root for
 // WordPress fingerprints. It returns the detected core version (if any) and
-// the list of evidence strings.
-func (s *Scanner) detectWP() (coreVersion string, evidence []string) {
+// the list of evidence strings. A homepage fetch failure is returned as a
+// fatal error — an unreachable target is a hard failure, not WordPress
+// evidence. wp-login/wp-json fetch errors are secondary and stay silent.
+func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr error) {
 	code, body, err := s.fetch("/")
 	if err != nil {
-		return "", []string{"homepage fetch failed: " + err.Error()}
+		return "", nil, err
 	}
 	if code == 200 {
 		html := string(body)
@@ -839,7 +896,7 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string) {
 			evidence = append(evidence, "wp-json REST API root responded")
 		}
 	}
-	return coreVersion, evidence
+	return coreVersion, evidence, nil
 }
 
 // apiPlugins queries the authenticated plugin listing endpoint. Unauthenticated
@@ -1096,7 +1153,14 @@ func (s *Scanner) Scan() (*Result, error) {
 		defer pr.Finish()
 	}
 
-	coreVersion, evidence := s.detectWP()
+	coreVersion, evidence, fatalErr := s.detectWP()
+
+	// An unreachable homepage is a hard failure: connection refused, proxy
+	// failure, timeout or DNS error means the target cannot be scanned at
+	// all — never "not WordPress".
+	if fatalErr != nil {
+		return nil, fmt.Errorf("cannot reach target: %w", fatalErr)
+	}
 
 	// --exclude-content-based: a matching homepage means a WAF or error
 	// page, so the scan stops right away.

@@ -317,6 +317,24 @@ func TestRunScanNonWordPressExitCode(t *testing.T) {
 	}
 }
 
+// TestRunScanFatalFetchExitCode verifies a fetch failure (dead proxy, no
+// listener) exits 2 with a "cannot reach target" error instead of a false
+// "not WordPress" result.
+func TestRunScanFatalFetchExitCode(t *testing.T) {
+	out := captureStderr(t, func() {
+		if code := runScan("http://example.test", scanOptions{
+			dbPath: emptyDB(t),
+			proxy:  "http://127.0.0.1:1",
+			silent: true,
+		}); code != 2 {
+			t.Errorf("dead-proxy exit code = %d, want 2", code)
+		}
+	})
+	if !strings.Contains(out, "cannot reach target") {
+		t.Errorf("stderr = %q, want contains %q", out, "cannot reach target")
+	}
+}
+
 func TestRunScanFindingsExitCode(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
