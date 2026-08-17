@@ -72,6 +72,9 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 	if res.WordPressVersion != "" {
 		fmt.Printf("WordPress core: %s\n", res.WordPressVersion)
 	}
+	if res.XMLRPC {
+		fmt.Printf("XML-RPC: enabled\n")
+	}
 
 	if len(res.Users) > 0 {
 		fmt.Printf("Users:\n")

@@ -1,16 +1,20 @@
 package scanner
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
 	"github.com/Boreas37/onyx/internal/version"
@@ -708,5 +712,418 @@ func TestDetectionModes(t *testing.T) {
 func TestNewScannerRejectsUnknownDetectionMode(t *testing.T) {
 	if _, err := NewScanner(nil, "http://example.test", Options{DetectionMode: "loud"}); err == nil {
 		t.Fatal("expected error for invalid detection mode")
+	}
+}
+
+// TestProxyTransport verifies requests are routed through the configured
+// HTTP proxy and that non-http(s) schemes are rejected.
+func TestProxyTransport(t *testing.T) {
+	var mu sync.Mutex
+	var hits int
+	var sawAbsolute, sawHost string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		if r.URL.IsAbs() {
+			sawAbsolute = r.URL.String()
+		}
+		sawHost = r.Host
+		mu.Unlock()
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer proxy.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, "http://example.test", Options{Proxy: proxy.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !res.IsWordPress {
+		t.Fatal("expected WordPress detection through the proxy")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if hits == 0 {
+		t.Fatal("no requests reached the proxy")
+	}
+	if sawAbsolute == "" {
+		t.Error("proxy did not receive absolute-URI requests")
+	}
+	if sawHost != "example.test" {
+		t.Errorf("proxy Host = %q, want example.test", sawHost)
+	}
+}
+
+func TestProxyRejectsSocks5(t *testing.T) {
+	_, err := NewScanner(nil, "http://example.test", Options{Proxy: "socks5://127.0.0.1:1080"})
+	if err == nil {
+		t.Fatal("expected error for socks5 proxy")
+	}
+	if !strings.Contains(err.Error(), "unsupported") {
+		t.Errorf("error = %q, want unsupported proxy scheme", err)
+	}
+}
+
+func TestProxyRejectsBogusURL(t *testing.T) {
+	if _, err := NewScanner(nil, "http://example.test", Options{Proxy: "://"}); err == nil {
+		t.Fatal("expected error for invalid proxy URL")
+	}
+}
+
+// xmlrpcServer serves a WordPress-ish site whose xmlrpc.php answers a
+// system.listMethods ping.
+func xmlrpcServer(t *testing.T, xmlrpcStatus int) (*httptest.Server, *xmlrpcLog) {
+	t.Helper()
+	log := &xmlrpcLog{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake"}`))
+	})
+	mux.HandleFunc("/xmlrpc.php", func(w http.ResponseWriter, r *http.Request) {
+		log.mu.Lock()
+		log.method = r.Method
+		log.contentType = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		log.body = string(b)
+		log.mu.Unlock()
+		w.Header().Set("Content-Type", "text/xml")
+		w.WriteHeader(xmlrpcStatus)
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><string>system.listMethods</string></value></data></array></value></param></params></methodResponse>`))
+	})
+	return httptest.NewServer(mux), log
+}
+
+type xmlrpcLog struct {
+	mu          sync.Mutex
+	method      string
+	contentType string
+	body        string
+}
+
+func TestXMLRPCDetection(t *testing.T) {
+	srv, log := xmlrpcServer(t, http.StatusOK)
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !res.XMLRPC {
+		t.Fatal("expected XMLRPC=true for a responding xmlrpc.php")
+	}
+	log.mu.Lock()
+	defer log.mu.Unlock()
+	if log.method != http.MethodPost {
+		t.Errorf("xmlrpc method = %q, want POST", log.method)
+	}
+	if log.contentType != "text/xml" {
+		t.Errorf("xmlrpc Content-Type = %q, want text/xml", log.contentType)
+	}
+	if !strings.Contains(log.body, "system.listMethods") {
+		t.Errorf("xmlrpc body = %q, missing system.listMethods", log.body)
+	}
+}
+
+func TestXMLRPCSkippedWithNoXMLRPC(t *testing.T) {
+	srv, _ := xmlrpcServer(t, http.StatusOK)
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{NoXMLRPC: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.XMLRPC {
+		t.Error("expected XMLRPC=false with --no-xmlrpc")
+	}
+}
+
+func TestXMLRPCNotEnabledOnUnavailableEndpoint(t *testing.T) {
+	srv, _ := xmlrpcServer(t, http.StatusNotFound)
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.XMLRPC {
+		t.Error("expected XMLRPC=false when xmlrpc.php 404s")
+	}
+}
+
+// backupServer serves a wp-config backup and a too-small decoy.
+func backupServer() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake"}`))
+	})
+	mux.HandleFunc("/wp-config.php.bak", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("define('DB_PASSWORD', 'x');\n", 10)))
+	})
+	mux.HandleFunc("/wp-config.php.old", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("tiny"))
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestConfigBackupFinder(t *testing.T) {
+	srv := backupServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{Checks: "cb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.ConfigBackups) != 1 || res.ConfigBackups[0] != "/wp-config.php.bak" {
+		t.Fatalf("ConfigBackups = %+v, want [/wp-config.php.bak]", res.ConfigBackups)
+	}
+}
+
+func TestConfigBackupFinderNotRunWithoutChecks(t *testing.T) {
+	srv := backupServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.ConfigBackups) != 0 {
+		t.Errorf("ConfigBackups = %+v, want empty without --checks", res.ConfigBackups)
+	}
+}
+
+// dbExportServer serves SQL dumps at root and in a subdirectory, plus a
+// non-SQL decoy.
+func dbExportServer() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake"}`))
+	})
+	mux.HandleFunc("/dump.sql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("DROP TABLE IF EXISTS wp_options;\nCREATE TABLE wp_options (id int);\n"))
+	})
+	mux.HandleFunc("/db/backup.sql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("INSERT INTO wp_posts (ID, post_title) VALUES (1, 'x');\n"))
+	})
+	mux.HandleFunc("/backup.sql", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<html><body>definitely not a dump</body></html>"))
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestDBExportFinder(t *testing.T) {
+	srv := dbExportServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{Checks: "dbe"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	want := []string{"/dump.sql", "/db/backup.sql"}
+	if len(res.DBExports) != len(want) {
+		t.Fatalf("DBExports = %+v, want %+v", res.DBExports, want)
+	}
+	for i := range want {
+		if res.DBExports[i] != want[i] {
+			t.Errorf("DBExports[%d] = %q, want %q", i, res.DBExports[i], want[i])
+		}
+	}
+}
+
+func TestNewScannerRejectsUnknownCheck(t *testing.T) {
+	if _, err := NewScanner(nil, "http://example.test", Options{Checks: "nope"}); err == nil {
+		t.Fatal("expected error for unknown check")
+	}
+}
+
+func TestSplitConnectAndRequestTimeouts(t *testing.T) {
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, "http://example.test", Options{
+		ConnectTimeout: 250 * time.Millisecond,
+		RequestTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.client.Timeout != 2*time.Second {
+		t.Errorf("client.Timeout = %v, want 2s", sc.client.Timeout)
+	}
+	tr, ok := sc.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", sc.client.Transport)
+	}
+	if tr.DialContext == nil {
+		t.Fatal("DialContext not set on transport")
+	}
+	// Dialing TEST-NET-1 (reserved, unroutable) must fail quickly; the
+	// 250ms dialer timeout bounds it even where the network blackholes it.
+	start := time.Now()
+	conn, err := tr.DialContext(context.Background(), "tcp", "192.0.2.1:9")
+	elapsed := time.Since(start)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil {
+		t.Fatal("expected dial to TEST-NET-1 to fail")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("dial took %v, connect timeout not honored", elapsed)
+	}
+}
+
+func TestTimeoutDefaultsAndAlias(t *testing.T) {
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, "http://example.test", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.client.Timeout != 10*time.Second {
+		t.Errorf("default client.Timeout = %v, want 10s", sc.client.Timeout)
+	}
+	sc2, err := NewScanner(d, "http://example.test", Options{Timeout: 7 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc2.client.Timeout != 7*time.Second {
+		t.Errorf("client.Timeout with Timeout alias = %v, want 7s", sc2.client.Timeout)
+	}
+	if _, ok := sc2.client.Transport.(*http.Transport); !ok {
+		t.Errorf("transport = %T, want *http.Transport (no UA wrapping)", sc2.client.Transport)
+	}
+}
+
+// customDirServer only serves components under custom directory names.
+func customDirServer() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><img src="/custom-content/themes/twentytwentyfour/style.css" /></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake"}`))
+	})
+	mux.HandleFunc("/custom-plugins/elementor/readme.txt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("=== Elementor ===\nStable tag: 3.24.0\n"))
+	})
+	mux.HandleFunc("/custom-content/themes/twentytwentyfour/style.css", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("/*\nTheme Name: Twenty Twenty-Four\nVersion: 1.1\n*/\nbody{margin:0}\n"))
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestCustomContentAndPluginsDirs(t *testing.T) {
+	srv := customDirServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{
+		ContentDir: "custom-content",
+		PluginsDir: "custom-plugins",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	var foundPlugin, foundTheme bool
+	for _, det := range res.Detected {
+		switch det.Slug {
+		case "elementor":
+			foundPlugin = true
+			if det.Version != "3.24.0" {
+				t.Errorf("elementor version = %q, want 3.24.0", det.Version)
+			}
+		case "twentytwentyfour":
+			foundTheme = true
+			if det.Version != "1.1" {
+				t.Errorf("theme version = %q, want 1.1", det.Version)
+			}
+		}
+	}
+	if !foundPlugin {
+		t.Errorf("expected elementor via custom plugins dir, got %+v", res.Detected)
+	}
+	if !foundTheme {
+		t.Errorf("expected twentytwentyfour via custom content dir, got %+v", res.Detected)
+	}
+}
+
+func TestExtractPassiveSlugsIn(t *testing.T) {
+	html := `<img src="https://example.com/my-content/themes/twentytwentyfour/style.css" />
+<script src="/my-content/plugins/elementor/readme.txt"></script>`
+	plugins, themes := ExtractPassiveSlugsIn(html, "my-content")
+	if len(plugins) != 1 || plugins[0] != "elementor" {
+		t.Errorf("plugins = %+v, want [elementor]", plugins)
+	}
+	if len(themes) != 1 || themes[0] != "twentytwentyfour" {
+		t.Errorf("themes = %+v, want [twentytwentyfour]", themes)
+	}
+	if p, _ := ExtractPassiveSlugsIn(html, "wp-content"); len(p) != 0 {
+		t.Errorf("default dir must not match custom dir slugs, got %+v", p)
 	}
 }

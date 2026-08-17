@@ -59,6 +59,22 @@ func captureStdout(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
+func TestPrintTableShowsXMLRPCWhenEnabled(t *testing.T) {
+	res := sampleResult()
+	res.XMLRPC = true
+	out := captureStdout(t, func() { PrintTable(res, false, "") })
+	if !strings.Contains(out, "XML-RPC: enabled") {
+		t.Errorf("table output missing XML-RPC line:\n%s", out)
+	}
+}
+
+func TestPrintTableOmitsXMLRPCWhenDisabled(t *testing.T) {
+	out := captureStdout(t, func() { PrintTable(sampleResult(), false, "") })
+	if strings.Contains(out, "XML-RPC") {
+		t.Errorf("table output should not mention XML-RPC when disabled:\n%s", out)
+	}
+}
+
 func TestPrintJSONLWritesOneLinePerFinding(t *testing.T) {
 	out := captureStdout(t, func() { PrintJSONL(sampleResult()) })
 

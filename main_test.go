@@ -58,6 +58,72 @@ func TestJSONFlagAliasesFormatJSON(t *testing.T) {
 	}
 }
 
+func TestParseScanArgsPart2Flags(t *testing.T) {
+	target, o := parseScanArgs([]string{
+		"http://example.test",
+		"--proxy", "http://127.0.0.1:8080",
+		"--no-xmlrpc",
+		"--check", "CB,dbe",
+		"--connect-timeout", "5",
+		"--request-timeout", "30",
+		"--wp-content-dir", "custom-content",
+		"--wp-plugins-dir", "custom-plugins",
+	})
+	if target != "http://example.test" {
+		t.Errorf("target = %q", target)
+	}
+	if o.proxy != "http://127.0.0.1:8080" {
+		t.Errorf("proxy = %q", o.proxy)
+	}
+	if !o.noXMLRPC {
+		t.Error("noXMLRPC = false, want true")
+	}
+	if o.checks != "cb,dbe" {
+		t.Errorf("checks = %q, want cb,dbe", o.checks)
+	}
+	if o.connectTimeout != 5 {
+		t.Errorf("connectTimeout = %d, want 5", o.connectTimeout)
+	}
+	if o.requestTimeout != 30 {
+		t.Errorf("requestTimeout = %d, want 30", o.requestTimeout)
+	}
+	if o.contentDir != "custom-content" {
+		t.Errorf("contentDir = %q, want custom-content", o.contentDir)
+	}
+	if o.pluginsDir != "custom-plugins" {
+		t.Errorf("pluginsDir = %q, want custom-plugins", o.pluginsDir)
+	}
+}
+
+func TestParseScanArgsPart2Defaults(t *testing.T) {
+	_, o := parseScanArgs([]string{"http://example.test"})
+	if o.connectTimeout != 10 {
+		t.Errorf("default connectTimeout = %d, want 10", o.connectTimeout)
+	}
+	if o.requestTimeout != 0 {
+		t.Errorf("default requestTimeout = %d, want 0 (falls back to --timeout)", o.requestTimeout)
+	}
+	if o.contentDir != "wp-content" {
+		t.Errorf("default contentDir = %q, want wp-content", o.contentDir)
+	}
+	if o.pluginsDir != "wp-content/plugins" {
+		t.Errorf("default pluginsDir = %q, want wp-content/plugins", o.pluginsDir)
+	}
+	if o.checks != "" || o.proxy != "" {
+		t.Errorf("defaults: checks=%q proxy=%q, want empty", o.checks, o.proxy)
+	}
+	if o.noXMLRPC {
+		t.Error("default noXMLRPC = true, want false")
+	}
+}
+
+func TestTimeoutFlagAliasesRequestTimeout(t *testing.T) {
+	_, o := parseScanArgs([]string{"--timeout", "20", "http://example.test"})
+	if o.timeout != 20 || o.requestTimeout != 0 {
+		t.Errorf("--timeout: timeout=%d requestTimeout=%d, want 20/0", o.timeout, o.requestTimeout)
+	}
+}
+
 func TestScanExitCodes(t *testing.T) {
 	someRes := &scanner.Result{IsWordPress: true}
 	findings := &scanner.Result{Findings: []scanner.Finding{{Slug: "x"}}}

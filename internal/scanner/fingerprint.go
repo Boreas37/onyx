@@ -55,12 +55,23 @@ func ExtractWordPressVersion(html string) (version string, found bool) {
 // wp-content/themes/<slug>/ counts as evidence the component is installed.
 // Returns deduplicated, sorted plugin slugs and theme slugs.
 func ExtractPassiveSlugs(html string) (plugins, themes []string) {
+	return ExtractPassiveSlugsIn(html, "wp-content")
+}
+
+// ExtractPassiveSlugsIn is ExtractPassiveSlugs with a custom wp-content
+// directory name: references to <contentDir>/plugins/<slug>/ or
+// <contentDir>/themes/<slug>/ count as evidence the component is installed.
+// Returns deduplicated, sorted plugin slugs and theme slugs.
+func ExtractPassiveSlugsIn(html, contentDir string) (plugins, themes []string) {
+	dir := regexp.QuoteMeta(contentDir)
+	pluginRe := regexp.MustCompile(`(?i)` + dir + `/plugins/([a-z0-9_-]+)/`)
+	themeRe := regexp.MustCompile(`(?i)` + dir + `/themes/([a-z0-9_-]+)/`)
 	seenP := make(map[string]bool)
 	seenT := make(map[string]bool)
-	for _, m := range passivePluginRe.FindAllStringSubmatch(html, -1) {
+	for _, m := range pluginRe.FindAllStringSubmatch(html, -1) {
 		seenP[m[1]] = true
 	}
-	for _, m := range passiveThemeRe.FindAllStringSubmatch(html, -1) {
+	for _, m := range themeRe.FindAllStringSubmatch(html, -1) {
 		seenT[m[1]] = true
 	}
 	for s := range seenP {
