@@ -337,7 +337,11 @@ func fakeWPServer(t *testing.T, usersJSON string, usersStatus int, author map[in
 		_, _ = w.Write([]byte("/*\nTheme Name: Twenty Twenty-Four\nVersion: 1.1\n*/\nbody{margin:0}\n"))
 	})
 	mux.HandleFunc("/wp-content/", func(w http.ResponseWriter, r *http.Request) {
-		c.content.Add(1)
+		// Count only enumeration-shaped requests (readme.txt/style.css);
+		// the always-on interesting finders also hit /wp-content/.
+		if strings.HasSuffix(r.URL.Path, "readme.txt") || strings.HasSuffix(r.URL.Path, "style.css") {
+			c.content.Add(1)
+		}
 		http.NotFound(w, r)
 	})
 	return httptest.NewServer(mux), c
@@ -1125,5 +1129,244 @@ func TestExtractPassiveSlugsIn(t *testing.T) {
 	}
 	if p, _ := ExtractPassiveSlugsIn(html, "wp-content"); len(p) != 0 {
 		t.Errorf("default dir must not match custom dir slugs, got %+v", p)
+	}
+}
+
+// interestingServer serves a WordPress-ish site where every always-on
+// interesting finder hits.
+func interestingServer() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake"}`))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("User-agent: *\nDisallow: /wp-admin/\n"))
+	})
+	mux.HandleFunc("/readme.html", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<h1>WordPress 6.4.2 — readme</h1>"))
+	})
+	mux.HandleFunc("/wp-content/debug.log", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("PHP Fatal error: out of memory"))
+	})
+	mux.HandleFunc("/xmlrpc.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("XML-RPC server accepts POST requests only."))
+	})
+	mux.HandleFunc("/wp-content/uploads/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html><head><title>Index of /wp-content/uploads/</title></head><body><a href="../">Parent Directory</a></body></html>`))
+	})
+	mux.HandleFunc("/wp-config.php.bak", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("define('DB_PASSWORD', 'secret');"))
+	})
+	mux.HandleFunc("/wp-includes/version.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("$wp_version = '6.4.2';"))
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestInterestingFinders(t *testing.T) {
+	srv := interestingServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	want := []string{
+		"robots.txt with disallow rules",
+		"WordPress readme.html exposed",
+		"debug.log exposed",
+		"xmlrpc.php exposed",
+		"uploads directory listing",
+		"wp-config.php.bak exposed",
+		"wp-includes/version.php exposed",
+	}
+	if len(res.Interesting) != len(want) {
+		t.Fatalf("Interesting = %+v, want %+v", res.Interesting, want)
+	}
+	for i := range want {
+		if res.Interesting[i] != want[i] {
+			t.Errorf("Interesting[%d] = %q, want %q", i, res.Interesting[i], want[i])
+		}
+	}
+}
+
+func TestInterestingFindersEmptyWhenNothingExposed(t *testing.T) {
+	srv := fakeWordPress()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.Interesting) != 0 {
+		t.Errorf("Interesting = %+v, want empty (everything 404s)", res.Interesting)
+	}
+}
+
+// mediaServer serves a homepage that references the uploads directory.
+func mediaServer() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><img src="/wp-content/uploads/2025/06/photo.jpg" /></body></html>`))
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestMediaEnumerationPresent(t *testing.T) {
+	srv := mediaServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{Enumerate: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	found := false
+	for _, item := range res.Interesting {
+		if item == "media uploads present" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Interesting = %+v, want media uploads present", res.Interesting)
+	}
+}
+
+func TestMediaEnumerationOffByDefault(t *testing.T) {
+	srv := mediaServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	for _, item := range res.Interesting {
+		if item == "media uploads present" {
+			t.Errorf("media uploads must not be flagged without --enumerate m")
+		}
+	}
+}
+
+func TestNewScannerAcceptsMediaEnumeration(t *testing.T) {
+	if _, err := NewScanner(nil, "http://example.test", Options{Enumerate: "m"}); err != nil {
+		t.Fatalf("--enumerate m should be valid: %v", err)
+	}
+}
+
+// blockedServer serves a homepage that looks like a WAF block page.
+func blockedServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><h1>Access Denied</h1><p>Your request was blocked by Cloudflare.</p></body></html>`))
+	}))
+}
+
+func TestExcludeContentBasedStopsScan(t *testing.T) {
+	srv := blockedServer()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{ExcludeContentBased: `Access Denied`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != ErrBlocked {
+		t.Fatalf("err = %v, want ErrBlocked", err)
+	}
+	if res != nil {
+		t.Error("expected nil result when blocked by --exclude-content-based")
+	}
+}
+
+func TestExcludeContentBasedNoMatchProceeds(t *testing.T) {
+	srv := fakeWordPress()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{ExcludeContentBased: `Access Denied`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !res.IsWordPress {
+		t.Error("expected the scan to proceed when the regex does not match")
+	}
+}
+
+func TestScopeMismatchStopsScan(t *testing.T) {
+	srv := fakeWordPress()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{Scope: `^https://target\.example/`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != ErrOutOfScope {
+		t.Fatalf("err = %v, want ErrOutOfScope", err)
+	}
+	if res != nil {
+		t.Error("expected nil result when the target is out of scope")
+	}
+}
+
+func TestScopeMatchProceeds(t *testing.T) {
+	srv := fakeWordPress()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{Scope: `^http://127\.0\.0\.1:`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if !res.IsWordPress {
+		t.Error("expected the scan to proceed when the scope matches")
+	}
+}
+
+func TestNewScannerRejectsBadRegexes(t *testing.T) {
+	if _, err := NewScanner(nil, "http://example.test", Options{Scope: "("}); err == nil {
+		t.Fatal("expected error for invalid --scope regex")
+	}
+	if _, err := NewScanner(nil, "http://example.test", Options{ExcludeContentBased: "["}); err == nil {
+		t.Fatal("expected error for invalid --exclude-content-based regex")
 	}
 }

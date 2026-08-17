@@ -75,6 +75,13 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 	if res.XMLRPC {
 		fmt.Printf("XML-RPC: enabled\n")
 	}
+	if len(res.Interesting) > 0 {
+		fmt.Printf("Interesting:\n")
+		for _, item := range res.Interesting {
+			fmt.Printf("  - %s\n", item)
+		}
+		fmt.Println()
+	}
 
 	if len(res.Users) > 0 {
 		fmt.Printf("Users:\n")

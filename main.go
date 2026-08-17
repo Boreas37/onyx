@@ -55,30 +55,33 @@ func main() {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath         string
-	threads        int
-	timeout        int
-	format         string
-	apiOnly        bool
-	stealth        bool
-	rateLimit      float64
-	verbose        bool
-	minSeverity    string
-	enumerate      string
-	maxReq         int
-	output         string
-	silent         bool
-	progress       bool
-	userAgent      string
-	randomUA       bool
-	detectionMode  string
-	proxy          string
-	noXMLRPC       bool
-	checks         string
-	connectTimeout int
-	requestTimeout int
-	contentDir     string
-	pluginsDir     string
+	dbPath              string
+	threads             int
+	timeout             int
+	format              string
+	apiOnly             bool
+	stealth             bool
+	rateLimit           float64
+	verbose             bool
+	minSeverity         string
+	enumerate           string
+	maxReq              int
+	output              string
+	silent              bool
+	progress            bool
+	userAgent           string
+	randomUA            bool
+	detectionMode       string
+	proxy               string
+	noXMLRPC            bool
+	checks              string
+	connectTimeout      int
+	requestTimeout      int
+	contentDir          string
+	pluginsDir          string
+	excludeContentBased string
+	scope               string
+	noUpdateCheck       bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -138,6 +141,14 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--wp-plugins-dir" && i+1 < len(args):
 			i++
 			o.pluginsDir = args[i]
+		case a == "--exclude-content-based" && i+1 < len(args):
+			i++
+			o.excludeContentBased = args[i]
+		case a == "--scope" && i+1 < len(args):
+			i++
+			o.scope = args[i]
+		case a == "--no-update-check":
+			o.noUpdateCheck = true
 		case a == "--format" && i+1 < len(args):
 			i++
 			o.format = strings.ToLower(args[i])
@@ -179,8 +190,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	}
 	if o.enumerate != "" {
 		for _, c := range o.enumerate {
-			if !strings.ContainsRune("ptu", c) {
-				fmt.Fprintf(os.Stderr, "invalid --enumerate value %q (use p, t and/or u)\n", o.enumerate)
+			if !strings.ContainsRune("ptum", c) {
+				fmt.Fprintf(os.Stderr, "invalid --enumerate value %q (use p, t, u and/or m)\n", o.enumerate)
 				os.Exit(2)
 			}
 		}
@@ -202,6 +213,16 @@ func atoi(s string, def int) int {
 	return n
 }
 
+// staleDays returns how many whole days old the file at path is, or -1 when
+// its age cannot be determined (e.g. missing file).
+func staleDays(path string) int {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return -1
+	}
+	return int(time.Since(fi.ModTime()).Hours() / 24)
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `onyx — local-first WordPress vulnerability scanner
 
@@ -221,7 +242,7 @@ Scan flags:
   --rate-limit N     max requests per second (overrides --stealth)
   --verbose          full one-line-per-finding output (default: compact)
   --min-severity S   only show findings >= severity (critical|high|medium|low)
-  --enumerate M      enumerate p (plugins), t (themes), u (users); combine (default: pt)
+  --enumerate M      enumerate p (plugins), t (themes), u (users), m (media); combine (default: pt)
   --max-requests N   cap on brute-force enumeration requests (default: 500)
   --output FILE      write JSON results to FILE (table still prints to stdout)
   --silent           suppress progress output
@@ -236,6 +257,9 @@ Scan flags:
   --request-timeout S  per-request timeout in seconds (default: 10; --timeout is an alias)
   --wp-content-dir PATH  wp-content directory (default: wp-content)
   --wp-plugins-dir PATH  plugins directory (default: wp-content/plugins)
+  --exclude-content-based REGEX  abort the scan when homepage HTML matches REGEX (WAF/error page)
+  --scope REGEX     only scan when the target URL matches REGEX
+  --no-update-check suppress the stale-database warning
 `, defaultDB)
 }
 
@@ -254,6 +278,13 @@ func runScan(target string, o scanOptions) int {
 		return 2
 	}
 
+	// Warn (informational only) when the local database is over 14 days old.
+	if !o.noUpdateCheck {
+		if days := staleDays(o.dbPath); days > 14 {
+			fmt.Fprintf(os.Stderr, "[WARN] database is %d days old — run 'onyx update' for fresh data\n", days)
+		}
+	}
+
 	if o.format == "table" {
 		report.PrintBanner("0.1.0", database.Count())
 	}
@@ -265,23 +296,25 @@ func runScan(target string, o scanOptions) int {
 	}
 
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
-		Threads:        o.threads,
-		Timeout:        time.Duration(o.timeout) * time.Second,
-		ConnectTimeout: time.Duration(o.connectTimeout) * time.Second,
-		RequestTimeout: time.Duration(reqTimeout) * time.Second,
-		APIOnly:        o.apiOnly,
-		Stealth:        o.stealth,
-		RateLimit:      o.rateLimit,
-		MaxRequests:    o.maxReq,
-		Enumerate:      o.enumerate,
-		UserAgent:      o.userAgent,
-		RandomUA:       o.randomUA,
-		DetectionMode:  o.detectionMode,
-		Proxy:          o.proxy,
-		NoXMLRPC:       o.noXMLRPC,
-		Checks:         o.checks,
-		ContentDir:     o.contentDir,
-		PluginsDir:     o.pluginsDir,
+		Threads:             o.threads,
+		Timeout:             time.Duration(o.timeout) * time.Second,
+		ConnectTimeout:      time.Duration(o.connectTimeout) * time.Second,
+		RequestTimeout:      time.Duration(reqTimeout) * time.Second,
+		APIOnly:             o.apiOnly,
+		Stealth:             o.stealth,
+		RateLimit:           o.rateLimit,
+		MaxRequests:         o.maxReq,
+		Enumerate:           o.enumerate,
+		UserAgent:           o.userAgent,
+		RandomUA:            o.randomUA,
+		DetectionMode:       o.detectionMode,
+		Proxy:               o.proxy,
+		NoXMLRPC:            o.noXMLRPC,
+		Checks:              o.checks,
+		ContentDir:          o.contentDir,
+		PluginsDir:          o.pluginsDir,
+		ExcludeContentBased: o.excludeContentBased,
+		Scope:               o.scope,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
