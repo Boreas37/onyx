@@ -96,6 +96,13 @@ type scanOptions struct {
 	nucleiArgs          string
 	pocTrackerDir       string
 	noPocs              bool
+	passwordsFile       string
+	usernamesFile       string
+	user                string
+	xmlrpcBrute         string
+	mcMaxPasswords      int
+	wpAuth              string
+	noBrute             bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -233,6 +240,26 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.pocTrackerDir = args[i]
 		case a == "--no-pocs":
 			o.noPocs = true
+		case a == "--passwords" && i+1 < len(args):
+			i++
+			o.passwordsFile = args[i]
+		case a == "--usernames" && i+1 < len(args):
+			i++
+			o.usernamesFile = args[i]
+		case a == "--user" && i+1 < len(args):
+			i++
+			o.user = args[i]
+		case a == "--xmlrpc-brute" && i+1 < len(args):
+			i++
+			o.xmlrpcBrute = args[i]
+		case a == "--multicall-max-passwords" && i+1 < len(args):
+			i++
+			o.mcMaxPasswords = atoi(args[i], 3)
+		case a == "--wp-auth" && i+1 < len(args):
+			i++
+			o.wpAuth = args[i]
+		case a == "--no-brute":
+			o.noBrute = true
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -378,6 +405,13 @@ Scan flags:
   --nuclei-args ARGS extra arguments passed to nuclei (shell-free split, quotes supported)
   --poc-tracker-dir PATH  local clone of CVE-PoC-Tracker (default: ~/projects/cve-tracker or $POC_TRACKER_DIR)
   --no-pocs          skip PoC reference lookup (nuclei findings only)
+  --passwords FILE   wordlist of passwords (one per line) — enables the wp-login brute force (needs --usernames FILE or --enumerate u)
+  --usernames FILE   wordlist of usernames (one per line) for brute-force attacks
+  --user USER        single username for the XML-RPC multicall attack (--xmlrpc-brute)
+  --xmlrpc-brute FILE  XML-RPC multicall password attack (wp.getUsersBlogs; needs --usernames FILE or --user USER)
+  --multicall-max-passwords N  passwords per XML-RPC multicall request (default: 3)
+  --wp-auth USER:PASS  authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (wp-admin → Users → Profile → Application Passwords)
+  --no-brute         disable credential brute force (wp-login and XML-RPC)
   --config FILE      JSON config file; explicit CLI flags win over config values
 `, defaultDB)
 }
@@ -455,6 +489,13 @@ func runScan(target string, o scanOptions) int {
 		MaxScanDuration:     o.maxScanDuration,
 		CacheTTL:            o.cacheTTL,
 		Findings:            findings,
+		PasswordsFile:       o.passwordsFile,
+		UsernamesFile:       o.usernamesFile,
+		User:                o.user,
+		XMLRPCBrute:         o.xmlrpcBrute,
+		MCPerRequest:        o.mcMaxPasswords,
+		WPAuth:              o.wpAuth,
+		NoBrute:             o.noBrute,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

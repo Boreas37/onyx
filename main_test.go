@@ -161,6 +161,53 @@ func TestEnumerateMediaModeAllowed(t *testing.T) {
 	}
 }
 
+func TestParseScanArgsExploitFlags(t *testing.T) {
+	target, o := parseScanArgs([]string{
+		"http://example.test",
+		"--passwords", "pw.txt",
+		"--usernames", "users.txt",
+		"--user", "admin",
+		"--xmlrpc-brute", "xpw.txt",
+		"--multicall-max-passwords", "5",
+		"--wp-auth", "superadmin:password",
+		"--no-brute",
+	})
+	if target != "http://example.test" {
+		t.Errorf("target = %q", target)
+	}
+	if o.passwordsFile != "pw.txt" || o.usernamesFile != "users.txt" {
+		t.Errorf("wordlists = %q/%q, want pw.txt/users.txt", o.passwordsFile, o.usernamesFile)
+	}
+	if o.user != "admin" {
+		t.Errorf("user = %q, want admin", o.user)
+	}
+	if o.xmlrpcBrute != "xpw.txt" {
+		t.Errorf("xmlrpcBrute = %q, want xpw.txt", o.xmlrpcBrute)
+	}
+	if o.mcMaxPasswords != 5 {
+		t.Errorf("mcMaxPasswords = %d, want 5", o.mcMaxPasswords)
+	}
+	if o.wpAuth != "superadmin:password" {
+		t.Errorf("wpAuth = %q, want superadmin:password", o.wpAuth)
+	}
+	if !o.noBrute {
+		t.Error("noBrute = false, want true")
+	}
+}
+
+func TestParseScanArgsExploitFlagDefaults(t *testing.T) {
+	_, o := parseScanArgs([]string{"http://example.test"})
+	if o.passwordsFile != "" || o.usernamesFile != "" || o.user != "" || o.xmlrpcBrute != "" || o.wpAuth != "" {
+		t.Errorf("defaults must be empty: %+v", o)
+	}
+	if o.noBrute {
+		t.Error("default noBrute = true, want false")
+	}
+	if o.mcMaxPasswords != 0 {
+		t.Errorf("default mcMaxPasswords = %d, want 0 (scanner falls back to 3)", o.mcMaxPasswords)
+	}
+}
+
 // staticSite serves a non-WordPress page (scan exits 0, quick to run).
 func staticSite() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

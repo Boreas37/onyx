@@ -75,6 +75,29 @@ func TestPrintTableOmitsXMLRPCWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestPrintTableShowsValidCredentials(t *testing.T) {
+	res := sampleResult()
+	res.LoginBrutes = []scanner.LoginBrute{
+		{User: "admin", Password: "hunter2", URL: "https://example.test/wp-login.php"},
+	}
+	out := captureStdout(t, func() { PrintTable(res, false, "") })
+	if !strings.Contains(out, "Valid credentials:") {
+		t.Errorf("table output missing Valid credentials section:\n%s", out)
+	}
+	if !strings.Contains(out, "admin:hunter2") {
+		t.Errorf("table output missing credential pair:\n%s", out)
+	}
+}
+
+func TestPrintTableShowsAuthStatus(t *testing.T) {
+	res := sampleResult()
+	res.AuthStatus = "authenticated"
+	out := captureStdout(t, func() { PrintTable(res, false, "") })
+	if !strings.Contains(out, "REST auth: authenticated") {
+		t.Errorf("table output missing auth status:\n%s", out)
+	}
+}
+
 func TestPrintJSONLWritesOneLinePerFinding(t *testing.T) {
 	out := captureStdout(t, func() { PrintJSONL(sampleResult()) })
 

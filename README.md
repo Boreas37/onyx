@@ -63,9 +63,41 @@ onyx scan https://example.com
 | `--nuclei` | Verify findings against projectdiscovery templates (needs the nuclei binary) |
 | `--output FILE` | Also write JSON results to `FILE` (table still prints to stdout) |
 | `--config FILE` | Load defaults from a JSON config file (CLI flags win) |
+| `--passwords FILE` | Wordlist of passwords (one per line) — enables the wp-login brute force (needs `--usernames FILE` or `--enumerate u`) |
+| `--usernames FILE` | Wordlist of usernames (one per line) for brute-force attacks |
+| `--user USER` | Single username for the XML-RPC multicall attack (`--xmlrpc-brute`) |
+| `--xmlrpc-brute FILE` | XML-RPC multicall password attack (`wp.getUsersBlogs`; needs `--usernames FILE` or `--user USER`) |
+| `--multicall-max-passwords N` | Passwords per XML-RPC multicall request (default 3) |
+| `--wp-auth USER:PASS` | Authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (create one in wp-admin → Users → Profile → Application Passwords) |
+| `--no-brute` | Disable credential brute force (wp-login and XML-RPC) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
+
+### Exploit-oriented checks
+
+Beyond read-only version detection, `onyx` can actively verify credentials —
+only against targets you own:
+
+- **wp-login brute force** — `--passwords FILE` together with `--usernames
+  FILE` (or the users found via `--enumerate u`) tries every pair against
+  `/wp-login.php`. A 302 redirect to `wp-admin` marks a valid credential.
+  Paced at 1 request/second unless `--rate-limit` is set; disable with
+  `--no-brute`.
+- **XML-RPC multicall attack** — `--xmlrpc-brute FILE` tries the password
+  list against `xmlrpc.php` using `system.multicall` `wp.getUsersBlogs`
+  calls, 3 passwords per request (`--multicall-max-passwords N`), which
+  keeps the request count low. Needs `--usernames FILE` or a single
+  `--user USER`, and only runs when the xmlrpc.php ping check succeeded.
+- **Authenticated REST inventory** — `--wp-auth USER:PASS` lists the
+  installed plugins and themes through `/wp-json/wp/v2/{plugins,themes}`
+  over HTTP Basic auth and feeds them straight into the database matching.
+  Passwords contain a colon, so use a WordPress Application Password
+  (create one in wp-admin → Users → Profile → Application Passwords). Invalid
+  credentials print a `[WARN]` and the scan continues.
+
+Valid credentials show up under `login_brutes` in the JSON output and a
+"Valid credentials:" section in the table.
 
 ### Nuclei verification pipeline
 
@@ -146,9 +178,6 @@ See its README for the license terms.
 
 Continuous development — next up, in rough order:
 
-- **Exploit-oriented checks**: wp-login brute force (`--passwords` /
-  `--usernames`), XML-RPC multicall password attack, authenticated REST
-  inventory via application passwords (`--wp-auth`).
 - **WAF and evasion hardening**: SOCKS5 proxy support, TLS fingerprint
   rotation, per-host rate limiting, `--proxy-target-only` style scoping.
 - **Data layer**: scanner-feed support (broader, noisier detections),

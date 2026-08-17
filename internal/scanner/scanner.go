@@ -81,6 +81,14 @@ type Options struct {
 	MaxScanDuration     time.Duration // hard stop for the whole scan; 0 = unlimited
 	CacheTTL            time.Duration // HTTP response cache TTL; 0 = off
 	Findings            chan Finding  // when set, every finding is emitted live
+
+	PasswordsFile string // --passwords FILE: wordlist for the wp-login brute force (one per line)
+	UsernamesFile string // --usernames FILE: wordlist for brute-force attacks (one per line)
+	User          string // --user USER: single username for the XML-RPC multicall attack
+	XMLRPCBrute   string // --xmlrpc-brute FILE: wordlist for the XML-RPC multicall attack
+	MCPerRequest  int    // --multicall-max-passwords N: passwords per multicall request (default 3)
+	WPAuth        string // --wp-auth USER:PASS: Basic auth for the REST inventory
+	NoBrute       bool   // --no-brute: disable credential brute force (login + XML-RPC)
 }
 
 // Scanner drives one scan against a single target.
@@ -112,6 +120,17 @@ type Scanner struct {
 	themesList  []string        // explicit theme slugs (--themes-list)
 	ctx         context.Context // scan-wide context (--max-scan-duration)
 	cacheDir    string          // HTTP cache directory (--cache-ttl)
+
+	passwords       []string // --passwords wordlist (wp-login brute)
+	xmlrpcPasswords []string // --xmlrpc-brute wordlist
+	usernames       []string // --usernames wordlist
+	singleUser      string   // --user USER
+	wpUser          string   // --wp-auth USER:PASS credentials
+	wpPass          string
+	mcPerReq        int          // passwords per XML-RPC multicall request
+	bruteLim        *rateLimiter // brute-force throttle (1 req/s unless --rate-limit)
+	loginBrute      bool         // wp-login brute force requested
+	xmlrpcBrute     bool         // XML-RPC multicall attack requested
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -174,6 +193,24 @@ func readSlugList(path string) ([]string, error) {
 		if i := strings.IndexByte(line, '#'); i >= 0 {
 			line = line[:i]
 		}
+		if line = strings.TrimSpace(line); line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+// readList loads a plain wordlist file (one entry per line; blank lines are
+// skipped). Used for --passwords / --usernames / --xmlrpc-brute files, where
+// comment stripping would corrupt entries.
+func readList(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
 		if line = strings.TrimSpace(line); line == "" {
 			continue
 		}
@@ -362,6 +399,72 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 			return nil, fmt.Errorf("reading themes list: %w", err)
 		}
 	}
+
+	// Wordlists and credentials for the exploit-oriented checks. Both
+	// brute-force attacks share the --usernames wordlist (the XML-RPC
+	// attack also accepts a single --user USER).
+	if opts.UsernamesFile != "" {
+		s.usernames, err = readList(opts.UsernamesFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading usernames list: %w", err)
+		}
+		if len(s.usernames) == 0 {
+			return nil, fmt.Errorf("usernames list %s is empty", opts.UsernamesFile)
+		}
+	}
+	if opts.User != "" {
+		s.singleUser = opts.User
+	}
+	if opts.WPAuth != "" {
+		i := strings.IndexByte(opts.WPAuth, ':')
+		if i <= 0 || i == len(opts.WPAuth)-1 {
+			return nil, fmt.Errorf("invalid --wp-auth %q (must be USER:PASS)", opts.WPAuth)
+		}
+		s.wpUser, s.wpPass = opts.WPAuth[:i], opts.WPAuth[i+1:]
+	}
+	s.mcPerReq = opts.MCPerRequest
+	if s.mcPerReq == 0 {
+		s.mcPerReq = 3
+	}
+	if s.mcPerReq < 0 {
+		return nil, fmt.Errorf("invalid --multicall-max-passwords %d", opts.MCPerRequest)
+	}
+	if !opts.NoBrute {
+		if opts.PasswordsFile != "" {
+			list, lerr := readList(opts.PasswordsFile)
+			if lerr != nil {
+				return nil, fmt.Errorf("reading passwords list: %w", lerr)
+			}
+			if len(list) == 0 {
+				return nil, fmt.Errorf("passwords list %s is empty", opts.PasswordsFile)
+			}
+			if len(s.usernames) == 0 && !strings.Contains(enum, "u") {
+				return nil, fmt.Errorf("--passwords requires --usernames FILE or --enumerate u")
+			}
+			s.loginBrute = true
+			s.passwords = list
+		}
+		if opts.XMLRPCBrute != "" {
+			list, lerr := readList(opts.XMLRPCBrute)
+			if lerr != nil {
+				return nil, fmt.Errorf("reading XML-RPC passwords list: %w", lerr)
+			}
+			if len(list) == 0 {
+				return nil, fmt.Errorf("passwords list %s is empty", opts.XMLRPCBrute)
+			}
+			if len(s.usernames) == 0 && s.singleUser == "" {
+				return nil, fmt.Errorf("--xmlrpc-brute requires --usernames FILE or --user USER")
+			}
+			s.xmlrpcBrute = true
+			s.xmlrpcPasswords = list
+		}
+	}
+	if s.loginBrute || s.xmlrpcBrute {
+		s.bruteLim = &rateLimiter{interval: time.Second}
+		if opts.RateLimit > 0 {
+			s.bruteLim.interval = time.Duration(float64(time.Second) / opts.RateLimit)
+		}
+	}
 	if opts.CacheTTL > 0 {
 		s.cacheDir = os.Getenv("ONYX_CACHE_DIR")
 		if s.cacheDir == "" {
@@ -444,6 +547,14 @@ type User struct {
 	Name string `json:"name"`
 }
 
+// LoginBrute is a credential pair that successfully authenticated against
+// the target, either through wp-login.php or the XML-RPC endpoint.
+type LoginBrute struct {
+	User     string `json:"user"`
+	Password string `json:"password"`
+	URL      string `json:"url"`
+}
+
 // Result is the output of a scan.
 type Result struct {
 	Target           string                `json:"target"`
@@ -462,6 +573,8 @@ type Result struct {
 	RateLimitHits    int                   `json:"rate_limit_hits,omitempty"` // 429s seen
 	TimedOut         bool                  `json:"timed_out,omitempty"`       // --max-scan-duration expired
 	Errors           []string              `json:"errors,omitempty"`
+	LoginBrutes      []LoginBrute          `json:"login_brutes,omitempty"` // valid credentials found by brute force
+	AuthStatus       string                `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
 }
 
 func (s *Scanner) fetch(path string) (int, []byte, error) {
@@ -1247,8 +1360,32 @@ func (s *Scanner) Scan() (*Result, error) {
 		}
 	}
 
-	// REST API plugin listing is always attempted when plugins are enabled.
-	if s.enumeratePlugins() {
+	// Authenticated REST inventory (--wp-auth USER:PASS): pull the
+	// installed plugins and themes from the authenticated wp-json
+	// endpoints over HTTP Basic auth. Rejected credentials (401) are a
+	// WARN, never an error — the scan continues.
+	if s.wpUser != "" {
+		authDetected, authFindings, authStatus := s.authInventory()
+		if authStatus == "failed" {
+			res.AuthStatus = "failed"
+			if pr != nil {
+				pr.LogInf("[WARN] wp-auth failed — invalid credentials")
+			} else {
+				fmt.Fprintln(os.Stderr, "[WARN] wp-auth failed — invalid credentials")
+			}
+		} else if authStatus == "authenticated" {
+			res.AuthStatus = "authenticated"
+			if pr != nil {
+				pr.LogInf("wp-auth: %d plugin(s)/theme(s) detected", len(authDetected))
+			}
+		}
+		addDetected(authDetected)
+		addFindings(authFindings)
+	}
+
+	// REST API plugin listing is always attempted when plugins are enabled
+	// (skipped when --wp-auth already queried it with credentials).
+	if s.enumeratePlugins() && s.wpUser == "" {
 		apiDetected, apiErrs := s.apiPlugins()
 		addDetected(apiDetected)
 		res.Errors = append(res.Errors, apiErrs...)
@@ -1348,6 +1485,40 @@ func (s *Scanner) Scan() (*Result, error) {
 		}
 	}
 
+	// Credential brute force: wp-login (--passwords) and the XML-RPC
+	// multicall attack (--xmlrpc-brute). Both are loud by nature, so they
+	// are paced by their own throttle (1 req/s unless --rate-limit is
+	// set). XML-RPC only runs when xmlrpc.php answered the ping check.
+	if s.loginBrute {
+		creds := unique(append(append([]string{}, s.usernames...), userSlugs(res.Users)...))
+		if len(creds) > 0 {
+			if pr != nil {
+				pr.LogInf("wp-login brute: %d user(s) x %d password(s)", len(creds), len(s.passwords))
+			}
+			res.LoginBrutes = append(res.LoginBrutes, s.loginBruteForce(creds, s.passwords)...)
+			if pr != nil && len(res.LoginBrutes) > 0 {
+				pr.LogInf("wp-login brute: %d valid credential(s)", len(res.LoginBrutes))
+			}
+		}
+	}
+	if s.xmlrpcBrute {
+		if !res.XMLRPC {
+			if pr != nil {
+				pr.LogInf("xmlrpc brute: xmlrpc.php not detected — skipping")
+			}
+		} else {
+			creds := unique(append(append([]string{}, s.usernames...), s.singleUser))
+			if pr != nil {
+				pr.LogInf("xmlrpc brute: multicall %d user(s) x %d password(s)", len(creds), len(s.xmlrpcPasswords))
+			}
+			brutes := s.xmlrpcBruteForce(creds, s.xmlrpcPasswords)
+			if pr != nil && len(brutes) > 0 {
+				pr.LogInf("xmlrpc brute: %d valid credential(s)", len(brutes))
+			}
+			res.LoginBrutes = append(res.LoginBrutes, brutes...)
+		}
+	}
+
 	// Deduplicate detected components, keeping the first (version-known) entry.
 	bySlug := make(map[string]Detected, len(res.Detected))
 	for _, d := range res.Detected {
@@ -1388,4 +1559,13 @@ func countKinds(jobs []job) (plugins, themes int) {
 		}
 	}
 	return
+}
+
+// userSlugs extracts the slugs of the given users for brute-force tries.
+func userSlugs(users []User) []string {
+	out := make([]string, 0, len(users))
+	for _, u := range users {
+		out = append(out, u.Slug)
+	}
+	return out
 }
