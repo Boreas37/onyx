@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
@@ -94,6 +95,7 @@ type Options struct {
 	MCPerRequest  int    // --multicall-max-passwords N: passwords per multicall request (default 3)
 	WPAuth        string // --wp-auth USER:PASS: Basic auth for the REST inventory
 	NoBrute       bool   // --no-brute: disable credential brute force (login + XML-RPC)
+	NoSummary     bool   // --no-summary: skip gathering scan summary statistics
 }
 
 // Scanner drives one scan against a single target.
@@ -140,6 +142,7 @@ type Scanner struct {
 	bruteLim        *rateLimiter // brute-force throttle (1 req/s unless --rate-limit)
 	loginBrute      bool         // wp-login brute force requested
 	xmlrpcBrute     bool         // XML-RPC multicall attack requested
+	requests        atomic.Int64 // total HTTP requests issued through fetch()
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -718,6 +721,21 @@ type LoginBrute struct {
 	URL      string `json:"url"`
 }
 
+// Summary holds scan-wide statistics, computed at the end of Scan() (skipped
+// with --no-summary). Severity counts come from the findings.
+type Summary struct {
+	DurationMS  int64 `json:"duration_ms"`
+	Requests    int   `json:"requests"`
+	RateLimited int   `json:"rate_limited"`
+	Detected    int   `json:"detected"`
+	Findings    int   `json:"findings"`
+	Critical    int   `json:"critical"`
+	High        int   `json:"high"`
+	Medium      int   `json:"medium"`
+	Low         int   `json:"low"`
+	Users       int   `json:"users"`
+}
+
 // Result is the output of a scan.
 type Result struct {
 	Target           string                `json:"target"`
@@ -738,6 +756,7 @@ type Result struct {
 	Errors           []string              `json:"errors,omitempty"`
 	LoginBrutes      []LoginBrute          `json:"login_brutes,omitempty"` // valid credentials found by brute force
 	AuthStatus       string                `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
+	Summary          *Summary              `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
 }
 
 func (s *Scanner) fetch(path string) (int, []byte, error) {
@@ -753,6 +772,7 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 	if err != nil {
 		return 0, nil, err
 	}
+	s.requests.Add(1)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -1433,6 +1453,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	}
 
 	res := &Result{Target: s.base}
+	scanStart := time.Now()
 	pr := s.progress
 	if pr != nil {
 		defer pr.Finish()
@@ -1457,6 +1478,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	res.IsWordPress = coreVersion != "" || len(evidence) > 0
 	if !res.IsWordPress {
 		res.Errors = append(res.Errors, ErrNotWordPress.Error())
+		s.buildSummary(res, scanStart)
 		if pr != nil {
 			pr.LogInf("target %s does not appear to be WordPress", s.base)
 		}
@@ -1706,7 +1728,54 @@ func (s *Scanner) Scan() (*Result, error) {
 
 	res.RateLimitHits = s.rateLimitHits()
 	res.TimedOut = s.scanDone()
+	s.buildSummary(res, scanStart)
 	return res, nil
+}
+
+// buildSummary fills res.Summary with scan-wide statistics gathered from
+// the counters and the final result (skipped entirely with --no-summary).
+func (s *Scanner) buildSummary(res *Result, scanStart time.Time) {
+	if s.opts.NoSummary {
+		return
+	}
+	critical, high, medium, low, total := severityCounts(res.Findings)
+	res.Summary = &Summary{
+		DurationMS:  time.Since(scanStart).Milliseconds(),
+		Requests:    s.requestCount(),
+		RateLimited: res.RateLimitHits,
+		Detected:    len(res.Detected),
+		Findings:    total,
+		Critical:    critical,
+		High:        high,
+		Medium:      medium,
+		Low:         low,
+		Users:       len(res.Users),
+	}
+}
+
+// severityCounts tallies the vulnerabilities of the findings by rating.
+func severityCounts(findings []Finding) (critical, high, medium, low, total int) {
+	for i := range findings {
+		for _, v := range findings[i].Vulnerabilities {
+			total++
+			switch strings.ToLower(v.Rating) {
+			case "critical":
+				critical++
+			case "high":
+				high++
+			case "medium":
+				medium++
+			case "low":
+				low++
+			}
+		}
+	}
+	return
+}
+
+// requestCount returns the number of HTTP requests issued through fetch().
+func (s *Scanner) requestCount() int {
+	return int(s.requests.Load())
 }
 
 // rateLimitHits returns the number of 429 responses seen during the scan.

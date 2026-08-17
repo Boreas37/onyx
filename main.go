@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
@@ -124,6 +125,7 @@ type scanOptions struct {
 	mcMaxPasswords      int
 	wpAuth              string
 	noBrute             bool
+	noSummary           bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -297,6 +299,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.wpAuth = args[i]
 		case a == "--no-brute":
 			o.noBrute = true
+		case a == "--no-summary":
+			o.noSummary = true
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -330,9 +334,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		}
 	}
 	switch o.format {
-	case "table", "json", "jsonl", "sarif":
+	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv":
 	default:
-		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, json, jsonl or sarif)\n", o.format)
+		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif or csv)\n", o.format)
 		os.Exit(2)
 	}
 	return target, o
@@ -429,7 +433,7 @@ Scan flags:
   --db PATH          database file (default: %s)
   --threads N        concurrent requests (default: 5)
   --timeout S        per-request timeout in seconds (default: 10)
-  --format F         output format: table, json, jsonl, sarif (default: table)
+  --format F         output format: table, cli-no-colour, json, jsonl, sarif, csv (default: table)
   --json             print results as JSON (same as --format json)
   --api              only query the REST API, skip brute-force enumeration
   --stealth          one request per second
@@ -438,7 +442,8 @@ Scan flags:
   --min-severity S   only show findings >= severity (critical|high|medium|low)
   --enumerate M      enumerate p (plugins), t (themes), u (users), m (media); combine (default: pt)
   --max-requests N   cap on brute-force enumeration requests (default: 500)
-  --output FILE      write JSON results to FILE (table still prints to stdout)
+  --output FILE      write JSON results to FILE (CSV with --format csv; table still prints to stdout)
+  --no-summary       omit the scan summary section (stats are in the JSON "summary" field otherwise)
   --silent           suppress progress output
   --progress         show live progress bar while scanning (off by default)
   --user-agent UA    send a custom User-Agent string on every request
@@ -513,7 +518,7 @@ func runScan(target string, o scanOptions) int {
 		}
 	}
 
-	if o.format == "table" {
+	if o.format == "table" || o.format == "cli-no-colour" {
 		report.PrintBanner("0.2.0", database.Count())
 	}
 
@@ -575,6 +580,7 @@ func runScan(target string, o scanOptions) int {
 		MCPerRequest:        o.mcMaxPasswords,
 		WPAuth:              o.wpAuth,
 		NoBrute:             o.noBrute,
+		NoSummary:           o.noSummary,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -619,7 +625,7 @@ func runScan(target string, o scanOptions) int {
 	}
 
 	if o.output != "" {
-		if werr := writeScanOutput(o.output, res); werr != nil {
+		if werr := writeScanOutput(o.output, res, o.format); werr != nil {
 			fmt.Fprintln(os.Stderr, "error writing output:", werr)
 		} else if pr := sc.Progress(); pr != nil {
 			pr.LogInf("results written to %s", o.output)
@@ -636,8 +642,19 @@ func runScan(target string, o scanOptions) int {
 		}
 	case "sarif":
 		report.PrintSARIF("0.2.0", res)
+	case "csv":
+		report.PrintCSV(res)
+	case "cli-no-colour":
+		report.NoColor = true
+		report.PrintTable(res, o.verbose, o.minSeverity)
+		if !o.noSummary {
+			report.PrintSummary(res)
+		}
 	default:
 		report.PrintTable(res, o.verbose, o.minSeverity)
+		if !o.noSummary {
+			report.PrintSummary(res)
+		}
 	}
 	return scanExitCode(res, err)
 }
@@ -823,14 +840,24 @@ func expandHome(p string) string {
 	return p
 }
 
-// writeScanOutput serializes res as indented JSON to path, creating the
-// parent directory if needed.
-func writeScanOutput(path string, res *scanner.Result) error {
-	out, err := json.MarshalIndent(res, "", "  ")
-	if err != nil {
-		return err
+// writeScanOutput serializes res to path in the requested format: CSV for
+// --format csv, indented JSON otherwise. The parent directory is created
+// if needed.
+func writeScanOutput(path string, res *scanner.Result, format string) error {
+	var out []byte
+	if format == "csv" {
+		var buf bytes.Buffer
+		if err := report.WriteCSV(&buf, res); err != nil {
+			return err
+		}
+		out = buf.Bytes()
+	} else {
+		j, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			return err
+		}
+		out = append(j, '\n')
 	}
-	out = append(out, '\n')
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

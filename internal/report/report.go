@@ -2,8 +2,10 @@
 package report
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -21,8 +23,12 @@ var useColor = func() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }()
 
+// NoColor forces plain output without ANSI codes even when stdout is a
+// terminal (used by --format cli-no-colour).
+var NoColor bool
+
 // severityColor wraps a severity label in ANSI color codes. Returns the
-// plain label when the output is not a terminal.
+// plain label when the output is not a terminal or NoColor is set.
 func severityColor(rating string) string {
 	plain := strings.ToLower(rating)
 	var code string
@@ -38,7 +44,7 @@ func severityColor(rating string) string {
 	default:
 		return rating
 	}
-	if !useColor {
+	if !useColor || NoColor {
 		return rating
 	}
 	return code + rating + "\x1b[0m"
@@ -220,6 +226,84 @@ func severityRank(rating string) int {
 	default:
 		return 0
 	}
+}
+
+// csvHeader is the CSV column order for --format csv output.
+var csvHeader = []string{
+	"slug", "type", "installed_version", "cve", "severity", "title", "affected_versions",
+}
+
+// WriteCSV writes res as CSV to w: one row per vulnerability with the
+// columns slug,type,installed_version,cve,severity,title,affected_versions.
+// Values containing commas (or quotes/newlines) are quoted by encoding/csv.
+func WriteCSV(w io.Writer, res *scanner.Result) error {
+	cw := csv.NewWriter(w)
+	if err := cw.Write(csvHeader); err != nil {
+		return err
+	}
+	for i := range res.Findings {
+		f := &res.Findings[i]
+		for _, v := range f.Vulnerabilities {
+			if err := cw.Write([]string{
+				f.Slug,
+				f.Type,
+				f.InstalledVersion,
+				v.CVE,
+				strings.ToLower(v.Rating),
+				v.Title,
+				strings.Join(v.AffectedLabels, "; "),
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+// PrintCSV writes res as CSV to stdout.
+func PrintCSV(res *scanner.Result) {
+	if err := WriteCSV(os.Stdout, res); err != nil {
+		fmt.Fprintln(os.Stderr, "csv output:", err)
+	}
+}
+
+// PrintSummary prints the scan summary section (table formats).
+func PrintSummary(res *scanner.Result) {
+	if res.Summary == nil {
+		return
+	}
+	s := res.Summary
+	line := func(label, value string) {
+		fmt.Printf("  %-12s %s\n", label+":", value)
+	}
+	requests := fmt.Sprintf("%d", s.Requests)
+	if s.RateLimited > 0 {
+		requests = fmt.Sprintf("%d (%d rate-limited)", s.Requests, s.RateLimited)
+	}
+	findings := fmt.Sprintf("%d vulnerabilities", s.Findings)
+	var sev []string
+	if s.Critical > 0 {
+		sev = append(sev, fmt.Sprintf("%d critical", s.Critical))
+	}
+	if s.High > 0 {
+		sev = append(sev, fmt.Sprintf("%d high", s.High))
+	}
+	if s.Medium > 0 {
+		sev = append(sev, fmt.Sprintf("%d medium", s.Medium))
+	}
+	if s.Low > 0 {
+		sev = append(sev, fmt.Sprintf("%d low", s.Low))
+	}
+	if len(sev) > 0 {
+		findings += " (" + strings.Join(sev, ", ") + ")"
+	}
+	fmt.Println("Scan summary:")
+	line("Duration", fmt.Sprintf("%.1fs", float64(s.DurationMS)/1000))
+	line("Requests", requests)
+	line("Detected", fmt.Sprintf("%d components", s.Detected))
+	line("Findings", findings)
+	line("Users found", fmt.Sprintf("%d", s.Users))
 }
 
 // PrintJSONL prints res as JSON Lines: one compact JSON object per finding.

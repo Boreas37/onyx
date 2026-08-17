@@ -28,6 +28,10 @@ func minimalFeed(t *testing.T) string {
 		"aaaaaaaa-0000-0000-0000-000000000001": map[string]any{
 			"id":    "aaaaaaaa-0000-0000-0000-000000000001",
 			"title": "Elementor < 3.25.0 - SQL Injection",
+			"cvss": map[string]any{
+				"score":  9.1,
+				"rating": "critical",
+			},
 			"software": []any{
 				map[string]any{
 					"type": "plugin", "name": "Elementor", "slug": "elementor",
@@ -43,6 +47,10 @@ func minimalFeed(t *testing.T) string {
 		"bbbbbbbb-0000-0000-0000-000000000002": map[string]any{
 			"id":    "bbbbbbbb-0000-0000-0000-000000000002",
 			"title": "Twenty Twenty-Four < 1.2 - Stored XSS",
+			"cvss": map[string]any{
+				"score":  7.1,
+				"rating": "high",
+			},
 			"software": []any{
 				map[string]any{
 					"type": "theme", "name": "Twenty Twenty-Four", "slug": "twentytwentyfour",
@@ -67,8 +75,8 @@ func minimalFeed(t *testing.T) string {
 	return path
 }
 
-// fakeWordPress serves a minimal WordPress-like site.
-func fakeWordPress() *httptest.Server {
+// fakeWordPressMux builds a minimal WordPress-like site handler.
+func fakeWordPressMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -117,7 +125,12 @@ Stable tag: 5.3.1
 — not yet present in the db, no vuln.
 `))
 	})
-	return httptest.NewServer(mux)
+	return mux
+}
+
+// fakeWordPress serves a minimal WordPress-like site.
+func fakeWordPress() *httptest.Server {
+	return httptest.NewServer(fakeWordPressMux())
 }
 
 func TestDetectWordPress(t *testing.T) {
@@ -1595,5 +1608,107 @@ func TestCacheNegativeResponses(t *testing.T) {
 	}
 	if code, _, ok := sc3.cacheGet(flaky.URL + "/"); ok {
 		t.Errorf("5xx response was cached: status %d must never be cached", code)
+	}
+}
+
+// TestScanSummaryCounters verifies the summary statistics built by Scan():
+// the requests counter matches the number of fetch() calls issued (every
+// GET the server saw), the severity counts match the findings, and the
+// derived fields mirror the result.
+func TestScanSummaryCounters(t *testing.T) {
+	mux := fakeWordPressMux()
+	var mu sync.Mutex
+	var gets int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			mu.Lock()
+			gets++
+			mu.Unlock()
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	d, err := db.Load(minimalFeed(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.Summary == nil {
+		t.Fatal("expected a summary, got nil")
+	}
+	mu.Lock()
+	wantReqs := gets
+	mu.Unlock()
+	if res.Summary.Requests != wantReqs {
+		t.Errorf("summary requests = %d, want %d (one per fetch call)", res.Summary.Requests, wantReqs)
+	}
+	if res.Summary.Detected != len(res.Detected) {
+		t.Errorf("summary detected = %d, want %d", res.Summary.Detected, len(res.Detected))
+	}
+	if res.Summary.Users != len(res.Users) {
+		t.Errorf("summary users = %d, want %d", res.Summary.Users, len(res.Users))
+	}
+	if res.Summary.RateLimited != res.RateLimitHits {
+		t.Errorf("summary rate_limited = %d, want %d", res.Summary.RateLimited, res.RateLimitHits)
+	}
+	if res.Summary.DurationMS < 0 {
+		t.Errorf("summary duration_ms = %d, want >= 0", res.Summary.DurationMS)
+	}
+
+	wantF, wantC, wantH, wantM, wantL := 0, 0, 0, 0, 0
+	for i := range res.Findings {
+		for _, v := range res.Findings[i].Vulnerabilities {
+			wantF++
+			switch strings.ToLower(v.Rating) {
+			case "critical":
+				wantC++
+			case "high":
+				wantH++
+			case "medium":
+				wantM++
+			case "low":
+				wantL++
+			}
+		}
+	}
+	if res.Summary.Findings != wantF {
+		t.Errorf("summary findings = %d, want %d", res.Summary.Findings, wantF)
+	}
+	if res.Summary.Critical != wantC || res.Summary.High != wantH ||
+		res.Summary.Medium != wantM || res.Summary.Low != wantL {
+		t.Errorf("summary severities = %d/%d/%d/%d, want %d/%d/%d/%d",
+			res.Summary.Critical, res.Summary.High, res.Summary.Medium, res.Summary.Low,
+			wantC, wantH, wantM, wantL)
+	}
+}
+
+// TestScanNoSummarySkipsSummary verifies --no-summary leaves res.Summary
+// nil so JSON output omits the summary field.
+func TestScanNoSummarySkipsSummary(t *testing.T) {
+	srv := fakeWordPress()
+	defer srv.Close()
+
+	d, err := db.Load(minimalFeed(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := NewScanner(d, srv.URL, Options{NoSummary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if res.Summary != nil {
+		t.Errorf("summary = %+v, want nil with NoSummary", res.Summary)
 	}
 }
