@@ -24,7 +24,8 @@ var ErrNotWordPress = errors.New("target does not appear to be a WordPress site"
 // maxBodySize caps response bodies (readme.txt / style.css are small).
 const maxBodySize = 1 << 20
 
-// defaultTopSlugs is how many vuln-heavy slugs to brute-force enumerate.
+// defaultTopSlugs is how many vuln-heavy slugs to brute-force enumerate
+// aggressively after passive detection from the homepage HTML.
 const defaultTopSlugs = 200
 
 // defaultMaxRequests caps the brute-force enumeration request budget.
@@ -58,6 +59,7 @@ type Scanner struct {
 	enum        string
 	maxRequests int
 	progress    *progress.Bar
+	homepage    string // raw homepage HTML for passive slug detection
 }
 
 type rateLimiter struct {
@@ -362,6 +364,7 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string) {
 	}
 	if code == 200 {
 		html := string(body)
+		s.homepage = html
 		if v, ok := ExtractWordPressVersion(html); ok {
 			coreVersion = v
 			evidence = append(evidence, "generator meta tag (WordPress "+v+")")
@@ -457,18 +460,54 @@ func (j job) label(version string) string {
 
 func (s *Scanner) buildJobs() []job {
 	var jobs []job
-	for _, slug := range s.db.TopSlugs(defaultTopSlugs) {
+	seen := make(map[string]bool)
+
+	// Passive detection: slugs referenced in the homepage HTML (WPScan-style).
+	if s.homepage != "" {
+		passiveP, passiveT := ExtractPassiveSlugs(s.homepage)
+		for _, slug := range passiveP {
+			if !s.enumeratePlugins() {
+				break
+			}
+			seen["p:"+slug] = true
+			jobs = append(jobs, job{kind: "plugin", slug: slug,
+				path: "/wp-content/plugins/" + slug + "/readme.txt"})
+		}
+		for _, slug := range passiveT {
+			if !s.enumerateThemes() {
+				break
+			}
+			seen["t:"+slug] = true
+			jobs = append(jobs, job{kind: "theme", slug: slug,
+				path: "/wp-content/themes/" + slug + "/style.css"})
+		}
+	}
+
+	// Aggressive detection: brute-force the vuln-heavy slugs from the DB.
+	budget := s.maxRequests
+	if budget <= 0 {
+		budget = defaultTopSlugs
+	}
+	for _, slug := range s.db.TopSlugs(budget) {
 		switch s.db.SlugType(slug) {
 		case "plugin":
 			if !s.enumeratePlugins() {
 				continue
 			}
+			if seen["p:"+slug] {
+				continue
+			}
+			seen["p:"+slug] = true
 			jobs = append(jobs, job{kind: "plugin", slug: slug,
 				path: "/wp-content/plugins/" + slug + "/readme.txt"})
 		case "theme":
 			if !s.enumerateThemes() {
 				continue
 			}
+			if seen["t:"+slug] {
+				continue
+			}
+			seen["t:"+slug] = true
 			jobs = append(jobs, job{kind: "theme", slug: slug,
 				path: "/wp-content/themes/" + slug + "/style.css"})
 		}
