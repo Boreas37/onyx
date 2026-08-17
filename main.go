@@ -46,7 +46,7 @@ func main() {
 			os.Exit(2)
 		}
 	case "version":
-		fmt.Println("onyx 0.1.0")
+		fmt.Println("onyx 0.2.0")
 	default:
 		usage()
 		os.Exit(2)
@@ -380,7 +380,7 @@ func runScan(target string, o scanOptions) int {
 	}
 
 	if o.format == "table" {
-		report.PrintBanner("0.1.0", database.Count())
+		report.PrintBanner("0.2.0", database.Count())
 	}
 
 	// --timeout stays as an alias for --request-timeout.
@@ -480,7 +480,7 @@ func runScan(target string, o scanOptions) int {
 			report.PrintJSONL(res)
 		}
 	case "sarif":
-		report.PrintSARIF("0.1.0", res)
+		report.PrintSARIF("0.2.0", res)
 	default:
 		report.PrintTable(res, o.verbose, o.minSeverity)
 	}
