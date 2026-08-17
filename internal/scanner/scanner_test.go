@@ -921,10 +921,28 @@ func TestProxyTransport(t *testing.T) {
 	}
 }
 
-func TestProxyRejectsSocks5(t *testing.T) {
-	_, err := NewScanner(nil, "http://example.test", Options{Proxy: "socks5://127.0.0.1:1080"})
+func TestProxyAcceptsSocks5(t *testing.T) {
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, "http://example.test", Options{Proxy: "socks5://127.0.0.1:1080"})
+	if err != nil {
+		t.Fatalf("socks5 proxy must be accepted: %v", err)
+	}
+	tr, ok := sc.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", sc.client.Transport)
+	}
+	if tr.Proxy != nil {
+		t.Error("socks5 must not use the http-proxy field (DialContext handles it)")
+	}
+	if tr.DialContext == nil {
+		t.Fatal("socks5 DialContext not set on transport")
+	}
+}
+
+func TestProxyRejectsUnknownScheme(t *testing.T) {
+	_, err := NewScanner(nil, "http://example.test", Options{Proxy: "ftp://127.0.0.1:21"})
 	if err == nil {
-		t.Fatal("expected error for socks5 proxy")
+		t.Fatal("expected error for unsupported proxy scheme")
 	}
 	if !strings.Contains(err.Error(), "unsupported") {
 		t.Errorf("error = %q, want unsupported proxy scheme", err)

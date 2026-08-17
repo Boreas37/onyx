@@ -75,6 +75,10 @@ type scanOptions struct {
 	randomUA            bool
 	detectionMode       string
 	proxy               string
+	proxyAuth           string
+	proxyTargetOnly     bool
+	tlsFingerprint      string
+	perHostRateLimit    float64
 	noXMLRPC            bool
 	checks              string
 	connectTimeout      int
@@ -146,6 +150,20 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--proxy" && i+1 < len(args):
 			i++
 			o.proxy = args[i]
+		case a == "--proxy-auth" && i+1 < len(args):
+			i++
+			o.proxyAuth = args[i]
+		case a == "--proxy-target-only":
+			o.proxyTargetOnly = true
+		case a == "--tls-fingerprint" && i+1 < len(args):
+			i++
+			o.tlsFingerprint = strings.ToLower(args[i])
+		case a == "--per-host-rate-limit" && i+1 < len(args):
+			i++
+			phl, err := strconv.ParseFloat(args[i], 64)
+			if err == nil && phl > 0 {
+				o.perHostRateLimit = phl
+			}
 		case a == "--no-xmlrpc":
 			o.noXMLRPC = true
 		case a == "--checks" || a == "--check":
@@ -385,7 +403,11 @@ Scan flags:
   --user-agent UA    send a custom User-Agent string on every request
   --random-user-agent  use a random browser User-Agent per request
   --detection-mode M detection: passive (homepage only), aggressive (DB only), mixed (default)
-  --proxy URL        route requests through an http(s) proxy (socks5 unsupported)
+  --proxy URL        route requests through an http(s) or socks5/socks5h proxy
+  --proxy-auth USER:PASS  authenticate to a SOCKS5 proxy (RFC 1929 username/password)
+  --proxy-target-only  use the proxy only for the scanned target host (other connections direct)
+  --tls-fingerprint MODE  TLSClientConfig variation: chrome, firefox or random (per-request rotation)
+  --per-host-rate-limit N  max requests per second per host (each host gets its own limiter)
   --no-xmlrpc        skip the XML-RPC (xmlrpc.php) ping check
   --checks LIST      run extra checks: cb (config backups), dbe (db exports), timthumb; combine with commas
   --connect-timeout S  TCP connect timeout in seconds (default: 10)
@@ -478,6 +500,10 @@ func runScan(target string, o scanOptions) int {
 		RandomUA:            o.randomUA,
 		DetectionMode:       o.detectionMode,
 		Proxy:               o.proxy,
+		ProxyAuth:           o.proxyAuth,
+		ProxyTargetOnly:     o.proxyTargetOnly,
+		TLSFingerprint:      o.tlsFingerprint,
+		PerHostRateLimit:    o.perHostRateLimit,
 		NoXMLRPC:            o.noXMLRPC,
 		Checks:              o.checks,
 		ContentDir:          o.contentDir,
