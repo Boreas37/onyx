@@ -63,11 +63,16 @@ Run `onyx` with no arguments for the full flag reference.
 
 1. Fetch the homepage, `/wp-login.php` and the REST API root. If nothing
    WordPress-ish comes back, it stops.
-2. Walk the most vuln-heavy plugin and theme slugs from the database, fetch
-   their `readme.txt` / `style.css`, and read the version out of it.
-3. Enumerate users (`--enumerate u`): read `/wp-json/wp/v2/users` when it is
+2. **Passive detection:** scan the homepage HTML for `wp-content/plugins/…`
+   and `wp-content/themes/…` references — anything the page mentions gets
+   checked, with no extra requests (same trick WPScan uses).
+3. **Aggressive enumeration:** walk the most vuln-heavy plugin and theme
+   slugs from the database (top 200 by default, raise with
+   `--max-requests`), fetch their `readme.txt` / `style.css`, and read the
+   version out of it.
+4. Enumerate users (`--enumerate u`): read `/wp-json/wp/v2/users` when it is
    open, then follow up to 10 `/?author=N` redirect chains to `/author/<slug>/`.
-4. Compare each installed version against the affected ranges in the
+5. Compare each installed version against the affected ranges in the
    database, and report anything that matches.
 
 Version detection is read-only — `onyx` never sends exploit payloads. If a
