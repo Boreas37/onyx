@@ -55,23 +55,30 @@ func main() {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath        string
-	threads       int
-	timeout       int
-	format        string
-	apiOnly       bool
-	stealth       bool
-	rateLimit     float64
-	verbose       bool
-	minSeverity   string
-	enumerate     string
-	maxReq        int
-	output        string
-	silent        bool
-	progress      bool
-	userAgent     string
-	randomUA      bool
-	detectionMode string
+	dbPath         string
+	threads        int
+	timeout        int
+	format         string
+	apiOnly        bool
+	stealth        bool
+	rateLimit      float64
+	verbose        bool
+	minSeverity    string
+	enumerate      string
+	maxReq         int
+	output         string
+	silent         bool
+	progress       bool
+	userAgent      string
+	randomUA       bool
+	detectionMode  string
+	proxy          string
+	noXMLRPC       bool
+	checks         string
+	connectTimeout int
+	requestTimeout int
+	contentDir     string
+	pluginsDir     string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -83,6 +90,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.timeout = 10
 	o.maxReq = 500
 	o.format = "table"
+	o.connectTimeout = 10
+	o.contentDir = "wp-content"
+	o.pluginsDir = "wp-content/plugins"
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -106,6 +116,28 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--detection-mode" && i+1 < len(args):
 			i++
 			o.detectionMode = strings.ToLower(args[i])
+		case a == "--proxy" && i+1 < len(args):
+			i++
+			o.proxy = args[i]
+		case a == "--no-xmlrpc":
+			o.noXMLRPC = true
+		case a == "--checks" || a == "--check":
+			if i+1 < len(args) {
+				i++
+				o.checks = strings.ToLower(args[i])
+			}
+		case a == "--connect-timeout" && i+1 < len(args):
+			i++
+			o.connectTimeout = atoi(args[i], 10)
+		case a == "--request-timeout" && i+1 < len(args):
+			i++
+			o.requestTimeout = atoi(args[i], 10)
+		case a == "--wp-content-dir" && i+1 < len(args):
+			i++
+			o.contentDir = args[i]
+		case a == "--wp-plugins-dir" && i+1 < len(args):
+			i++
+			o.pluginsDir = args[i]
 		case a == "--format" && i+1 < len(args):
 			i++
 			o.format = strings.ToLower(args[i])
@@ -197,6 +229,13 @@ Scan flags:
   --user-agent UA    send a custom User-Agent string on every request
   --random-user-agent  use a random browser User-Agent per request
   --detection-mode M detection: passive (homepage only), aggressive (DB only), mixed (default)
+  --proxy URL        route requests through an http(s) proxy (socks5 unsupported)
+  --no-xmlrpc        skip the XML-RPC (xmlrpc.php) ping check
+  --checks LIST      run extra checks: cb (config backups), dbe (db exports); combine with commas
+  --connect-timeout S  TCP connect timeout in seconds (default: 10)
+  --request-timeout S  per-request timeout in seconds (default: 10; --timeout is an alias)
+  --wp-content-dir PATH  wp-content directory (default: wp-content)
+  --wp-plugins-dir PATH  plugins directory (default: wp-content/plugins)
 `, defaultDB)
 }
 
@@ -219,17 +258,30 @@ func runScan(target string, o scanOptions) int {
 		report.PrintBanner("0.1.0", database.Count())
 	}
 
+	// --timeout stays as an alias for --request-timeout.
+	reqTimeout := o.requestTimeout
+	if reqTimeout == 0 {
+		reqTimeout = o.timeout
+	}
+
 	sc, err := scanner.NewScanner(database, target, scanner.Options{
-		Threads:       o.threads,
-		Timeout:       time.Duration(o.timeout) * time.Second,
-		APIOnly:       o.apiOnly,
-		Stealth:       o.stealth,
-		RateLimit:     o.rateLimit,
-		MaxRequests:   o.maxReq,
-		Enumerate:     o.enumerate,
-		UserAgent:     o.userAgent,
-		RandomUA:      o.randomUA,
-		DetectionMode: o.detectionMode,
+		Threads:        o.threads,
+		Timeout:        time.Duration(o.timeout) * time.Second,
+		ConnectTimeout: time.Duration(o.connectTimeout) * time.Second,
+		RequestTimeout: time.Duration(reqTimeout) * time.Second,
+		APIOnly:        o.apiOnly,
+		Stealth:        o.stealth,
+		RateLimit:      o.rateLimit,
+		MaxRequests:    o.maxReq,
+		Enumerate:      o.enumerate,
+		UserAgent:      o.userAgent,
+		RandomUA:       o.randomUA,
+		DetectionMode:  o.detectionMode,
+		Proxy:          o.proxy,
+		NoXMLRPC:       o.noXMLRPC,
+		Checks:         o.checks,
+		ContentDir:     o.contentDir,
+		PluginsDir:     o.pluginsDir,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

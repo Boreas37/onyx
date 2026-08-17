@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -41,16 +42,23 @@ var authorSlugRe = regexp.MustCompile(`^/author/([^/]+)`)
 
 // Options tunes the scan behaviour. Zero values fall back to defaults.
 type Options struct {
-	Threads       int           // concurrent HTTP requests (default 5)
-	Timeout       time.Duration // per-request timeout (default 10s)
-	Stealth       bool          // throttle to 1 request/second
-	RateLimit     float64       // max requests per second (0 = unlimited)
-	APIOnly       bool          // skip brute-force enumeration, only wp-json/plugins
-	MaxRequests   int           // cap on brute-force enumeration requests (default 500)
-	Enumerate     string        // what to enumerate: u/p/t, combinable (default "pt")
-	UserAgent     string        // custom User-Agent for all requests
-	RandomUA      bool          // pick a random browser User-Agent per request
-	DetectionMode string        // passive (homepage only), aggressive (DB only), mixed (default)
+	Threads        int           // concurrent HTTP requests (default 5)
+	Timeout        time.Duration // per-request timeout (default 10s, alias for RequestTimeout)
+	Stealth        bool          // throttle to 1 request/second
+	RateLimit      float64       // max requests per second (0 = unlimited)
+	APIOnly        bool          // skip brute-force enumeration, only wp-json/plugins
+	MaxRequests    int           // cap on brute-force enumeration requests (default 500)
+	Enumerate      string        // what to enumerate: u/p/t, combinable (default "pt")
+	UserAgent      string        // custom User-Agent for all requests
+	RandomUA       bool          // pick a random browser User-Agent per request
+	DetectionMode  string        // passive (homepage only), aggressive (DB only), mixed (default)
+	Proxy          string        // http:// or https:// proxy URL (socks5 unsupported)
+	NoXMLRPC       bool          // skip the XML-RPC (xmlrpc.php) ping check
+	Checks         string        // extra checks: cb (config backups), dbe (db exports), comma-separated
+	ConnectTimeout time.Duration // TCP dial timeout (default 10s)
+	RequestTimeout time.Duration // per-request timeout (default 10s)
+	ContentDir     string        // wp-content directory (default "wp-content")
+	PluginsDir     string        // plugins directory (default "wp-content/plugins")
 }
 
 // Scanner drives one scan against a single target.
@@ -70,6 +78,30 @@ type Scanner struct {
 	rateHits   int        // count of 429 responses seen
 	rlBackoff  time.Duration
 	maxBackoff time.Duration
+
+	checks     map[string]bool // extra checks requested via --checks (cb, dbe)
+	contentDir string
+	pluginsDir string
+}
+
+// configBackupFiles are the wp-config.php backup names probed by the cb
+// check at the site root.
+var configBackupFiles = []string{
+	"wp-config.php~", "wp-config.php.bak", "wp-config.bak", "wp-config.php.old",
+	"wp-config.php.save", "wp-config.php.swp", "wp-config.txt", "wp-config.php.txt",
+	".wp-config.php.swp", "wp-config.php.orig", "wp-config.php.dist", "wp-config.php.copy",
+}
+
+// dbExportFiles are the SQL dump names probed by the dbe check, at the root
+// and inside dbExportDirs.
+var dbExportFiles = []string{
+	"dump.sql", "backup.sql", "db.sql", "database.sql", "wp.sql",
+	"db_backup.sql", "site.sql", "wordpress.sql", "mysql.sql",
+}
+
+// dbExportDirs are the subdirectories where dbe also probes for SQL dumps.
+var dbExportDirs = []string{
+	"/db/", "/backup/", "/sql/", "/dump/", "/database/",
 }
 
 type rateLimiter struct {
@@ -142,6 +174,33 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 10 * time.Second
 	}
+	if opts.ConnectTimeout <= 0 {
+		opts.ConnectTimeout = 10 * time.Second
+	}
+	if opts.RequestTimeout <= 0 {
+		opts.RequestTimeout = opts.Timeout
+	}
+	contentDir := strings.Trim(opts.ContentDir, "/")
+	if contentDir == "" {
+		contentDir = "wp-content"
+	}
+	pluginsDir := strings.Trim(opts.PluginsDir, "/")
+	if pluginsDir == "" {
+		pluginsDir = "wp-content/plugins"
+	}
+	checks := make(map[string]bool)
+	if opts.Checks != "" {
+		for _, c := range strings.Split(opts.Checks, ",") {
+			c = strings.ToLower(strings.TrimSpace(c))
+			if c == "" {
+				continue
+			}
+			if c != "cb" && c != "dbe" {
+				return nil, fmt.Errorf("invalid --checks value %q (use cb and/or dbe)", c)
+			}
+			checks[c] = true
+		}
+	}
 	enum := strings.ToLower(strings.TrimSpace(opts.Enumerate))
 	if enum == "" {
 		enum = "pt"
@@ -163,13 +222,25 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	default:
 		return nil, fmt.Errorf("invalid --detection-mode %q (use passive, aggressive or mixed)", opts.DetectionMode)
 	}
+	tr := &http.Transport{
+		MaxIdleConns:        opts.Threads * 2,
+		MaxIdleConnsPerHost: opts.Threads,
+		IdleConnTimeout:     30 * time.Second,
+		DialContext:         (&net.Dialer{Timeout: opts.ConnectTimeout}).DialContext,
+	}
+	if opts.Proxy != "" {
+		proxyURL, err := url.Parse(opts.Proxy)
+		if err != nil || proxyURL.Host == "" {
+			return nil, fmt.Errorf("invalid proxy URL %q", opts.Proxy)
+		}
+		if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
+			return nil, fmt.Errorf("unsupported proxy scheme %q (only http and https are supported)", proxyURL.Scheme)
+		}
+		tr.Proxy = http.ProxyURL(proxyURL)
+	}
 	client := &http.Client{
-		Timeout: opts.Timeout,
-		Transport: &http.Transport{
-			MaxIdleConns:        opts.Threads * 2,
-			MaxIdleConnsPerHost: opts.Threads,
-			IdleConnTimeout:     30 * time.Second,
-		},
+		Timeout:   opts.RequestTimeout,
+		Transport: tr,
 	}
 	if opts.UserAgent != "" || opts.RandomUA {
 		client.Transport = &uaTransport{
@@ -186,6 +257,9 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		enum:        enum,
 		maxRequests: opts.MaxRequests,
 		mode:        mode,
+		checks:      checks,
+		contentDir:  contentDir,
+		pluginsDir:  pluginsDir,
 	}
 	if opts.Stealth {
 		s.lim = &rateLimiter{interval: time.Second}
@@ -265,6 +339,9 @@ type Result struct {
 	Detected         []Detected `json:"detected,omitempty"`
 	Findings         []Finding  `json:"findings,omitempty"`
 	Users            []User     `json:"users,omitempty"`
+	XMLRPC           bool       `json:"xmlrpc,omitempty"` // xmlrpc.php ping answered
+	ConfigBackups    []string   `json:"config_backups,omitempty"`
+	DBExports        []string   `json:"db_exports,omitempty"`
 	RateLimitHits    int        `json:"rate_limit_hits,omitempty"` // 429s seen
 	Errors           []string   `json:"errors,omitempty"`
 }
@@ -325,6 +402,68 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	return resp.StatusCode, resp.Header, body, err
+}
+
+// checkXMLRPC pings POST /xmlrpc.php with a system.listMethods call and
+// reports whether the server answered with a methodResponse payload.
+func (s *Scanner) checkXMLRPC() bool {
+	s.lim.wait()
+	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
+	resp, err := s.client.Post(s.base+"/xmlrpc.php", "text/xml", strings.NewReader(payload))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(body), "methodResponse")
+}
+
+// configBackupFinder probes every wp-config backup name at the site root.
+// A 200 response with more than 100 bytes of content counts as a hit.
+func (s *Scanner) configBackupFinder() []string {
+	var found []string
+	for _, f := range configBackupFiles {
+		code, body, err := s.fetch("/" + f)
+		if err != nil {
+			continue
+		}
+		if code == http.StatusOK && len(body) > 100 {
+			found = append(found, "/"+f)
+		}
+	}
+	return found
+}
+
+// dbExportFinder probes SQL dump names at the root and inside dbExportDirs.
+// A 200 response whose body looks like SQL (INSERT INTO / CREATE TABLE)
+// counts as a hit.
+func (s *Scanner) dbExportFinder() []string {
+	var found []string
+	try := func(path string) {
+		code, body, err := s.fetch(path)
+		if err != nil {
+			return
+		}
+		b := string(body)
+		if code == http.StatusOK && (strings.Contains(b, "INSERT INTO") || strings.Contains(b, "CREATE TABLE")) {
+			found = append(found, path)
+		}
+	}
+	for _, f := range dbExportFiles {
+		try("/" + f)
+	}
+	for _, dir := range dbExportDirs {
+		for _, f := range dbExportFiles {
+			try(dir + f)
+		}
+	}
+	return found
 }
 
 // usersFromAPI reads the (usually open) /wp-json/wp/v2/users listing and
@@ -558,14 +697,14 @@ func (s *Scanner) buildJobs() []job {
 
 	// Passive detection: slugs referenced in the homepage HTML (WPScan-style).
 	if passive && s.homepage != "" {
-		passiveP, passiveT := ExtractPassiveSlugs(s.homepage)
+		passiveP, passiveT := ExtractPassiveSlugsIn(s.homepage, s.contentDir)
 		for _, slug := range passiveP {
 			if !s.enumeratePlugins() {
 				break
 			}
 			seen["p:"+slug] = true
 			jobs = append(jobs, job{kind: "plugin", slug: slug,
-				path: "/wp-content/plugins/" + slug + "/readme.txt"})
+				path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
 		}
 		for _, slug := range passiveT {
 			if !s.enumerateThemes() {
@@ -573,7 +712,7 @@ func (s *Scanner) buildJobs() []job {
 			}
 			seen["t:"+slug] = true
 			jobs = append(jobs, job{kind: "theme", slug: slug,
-				path: "/wp-content/themes/" + slug + "/style.css"})
+				path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
 		}
 	}
 
@@ -594,7 +733,7 @@ func (s *Scanner) buildJobs() []job {
 				}
 				seen["p:"+slug] = true
 				jobs = append(jobs, job{kind: "plugin", slug: slug,
-					path: "/wp-content/plugins/" + slug + "/readme.txt"})
+					path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
 			case "theme":
 				if !s.enumerateThemes() {
 					continue
@@ -604,7 +743,7 @@ func (s *Scanner) buildJobs() []job {
 				}
 				seen["t:"+slug] = true
 				jobs = append(jobs, job{kind: "theme", slug: slug,
-					path: "/wp-content/themes/" + slug + "/style.css"})
+					path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
 			}
 		}
 	}
@@ -710,6 +849,22 @@ func (s *Scanner) Scan() (*Result, error) {
 			ver = " " + coreVersion
 		}
 		pr.LogInf("detected WordPress%s at %s", ver, s.base)
+	}
+
+	// XML-RPC ping check (skip with --no-xmlrpc).
+	if !s.opts.NoXMLRPC && s.checkXMLRPC() {
+		res.XMLRPC = true
+		if pr != nil {
+			pr.LogInf("XML-RPC is enabled (xmlrpc.php responded)")
+		}
+	}
+
+	// Optional file-based checks: config backups (cb) and DB exports (dbe).
+	if s.checks["cb"] {
+		res.ConfigBackups = s.configBackupFinder()
+	}
+	if s.checks["dbe"] {
+		res.DBExports = s.dbExportFinder()
 	}
 
 	var mu sync.Mutex
