@@ -596,3 +596,45 @@ func TestCollectPoCsSoftFails(t *testing.T) {
 		t.Errorf("stderr = %q, want no WARN for a CVE missing from the tracker", out)
 	}
 }
+
+func TestParseScanArgsWAFFlags(t *testing.T) {
+	target, o := parseScanArgs([]string{
+		"http://example.test",
+		"--proxy", "socks5://127.0.0.1:1080",
+		"--proxy-auth", "user:pass",
+		"--proxy-target-only",
+		"--tls-fingerprint", "Chrome",
+		"--per-host-rate-limit", "7.5",
+	})
+	if target != "http://example.test" {
+		t.Errorf("target = %q", target)
+	}
+	if o.proxy != "socks5://127.0.0.1:1080" {
+		t.Errorf("proxy = %q, want socks5://127.0.0.1:1080", o.proxy)
+	}
+	if o.proxyAuth != "user:pass" {
+		t.Errorf("proxyAuth = %q, want user:pass", o.proxyAuth)
+	}
+	if !o.proxyTargetOnly {
+		t.Error("proxyTargetOnly = false, want true")
+	}
+	if o.tlsFingerprint != "chrome" {
+		t.Errorf("tlsFingerprint = %q, want chrome (lowercased)", o.tlsFingerprint)
+	}
+	if o.perHostRateLimit != 7.5 {
+		t.Errorf("perHostRateLimit = %v, want 7.5", o.perHostRateLimit)
+	}
+
+	_, o = parseScanArgs([]string{"http://example.test"})
+	if o.proxyAuth != "" || o.tlsFingerprint != "" || o.perHostRateLimit != 0 || o.proxyTargetOnly {
+		t.Errorf("defaults must be empty/false/0: %+v", o)
+	}
+
+	// A non-numeric or non-positive per-host rate falls back to 0.
+	for _, bad := range []string{"abc", "0", "-3"} {
+		_, o = parseScanArgs([]string{"http://example.test", "--per-host-rate-limit", bad})
+		if o.perHostRateLimit != 0 {
+			t.Errorf("--per-host-rate-limit %q: got %v, want 0", bad, o.perHostRateLimit)
+		}
+	}
+}

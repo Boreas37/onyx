@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -67,7 +68,11 @@ type Options struct {
 	UserAgent           string        // custom User-Agent for all requests
 	RandomUA            bool          // pick a random browser User-Agent per request
 	DetectionMode       string        // passive (homepage only), aggressive (DB only), mixed (default)
-	Proxy               string        // http:// or https:// proxy URL (socks5 unsupported)
+	Proxy               string        // http://, https://, socks5:// or socks5h:// proxy URL
+	ProxyAuth           string        // --proxy-auth USER:PASS for SOCKS5 proxies (RFC 1929)
+	ProxyTargetOnly     bool          // --proxy-target-only: use the proxy only for target-host traffic
+	TLSFingerprint      string        // --tls-fingerprint: chrome | firefox | random (TLSClientConfig variations)
+	PerHostRateLimit    float64       // --per-host-rate-limit N: per-host requests per second (0 = off)
 	NoXMLRPC            bool          // skip the XML-RPC (xmlrpc.php) ping check
 	Checks              string        // extra checks: cb (config backups), dbe (db exports), comma-separated
 	ConnectTimeout      time.Duration // TCP dial timeout (default 10s)
@@ -108,6 +113,10 @@ type Scanner struct {
 	rateHits   int        // count of 429 responses seen
 	rlBackoff  time.Duration
 	maxBackoff time.Duration
+
+	perHostMu       sync.Mutex              // guards perHostLim
+	perHostLim      map[string]*rateLimiter // --per-host-rate-limit: one limiter per scheme://host:port
+	perHostInterval time.Duration
 
 	checks     map[string]bool // extra checks requested via --checks (cb, dbe)
 	contentDir string
@@ -270,6 +279,80 @@ func (r *rateLimiter) wait() {
 	}
 }
 
+// perHostWait throttles on the --per-host-rate-limit limiter for the host
+// of u, keyed by scheme://host:port. Every unique host gets its own lazily
+// created limiter, so one busy host never throttles another.
+func (s *Scanner) perHostWait(u string) {
+	if s.perHostLim == nil {
+		return
+	}
+	key := perHostKey(u)
+	s.perHostMu.Lock()
+	lim := s.perHostLim[key]
+	if lim == nil {
+		lim = &rateLimiter{interval: s.perHostInterval}
+		s.perHostLim[key] = lim
+	}
+	s.perHostMu.Unlock()
+	lim.wait()
+}
+
+// perHostKey maps a full URL onto its scheme://host[:port] limiter key.
+func perHostKey(u string) string {
+	pu, err := url.Parse(u)
+	if err != nil {
+		return u
+	}
+	return pu.Scheme + "://" + pu.Host
+}
+
+// targetAuthority returns the normalized "host:port" authority of the
+// scanned base URL (filling in the scheme-default port), used by
+// --proxy-target-only to pick proxy-worthy traffic.
+func targetAuthority(u *url.URL) string {
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// normalizeAuthority fills in the scheme-default port when host has none
+// (http URLs carry no explicit port on the default port).
+func normalizeAuthority(host, scheme string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	switch scheme {
+	case "http":
+		return net.JoinHostPort(host, "80")
+	case "https":
+		return net.JoinHostPort(host, "443")
+	}
+	return host
+}
+
+// sameAuthority reports whether addr ("host" or "host:port") refers to the
+// same host:port endpoint as want ("host:port"), ignoring case. Two
+// different services on the same hostname (different ports) are distinct.
+func sameAuthority(addr, want string) bool {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host, port = addr, ""
+	}
+	whost, wport, err := net.SplitHostPort(want)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(host, whost) && port == wport
+}
+
 // NewScanner builds a Scanner for base, using the given database and
 // options.
 func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
@@ -346,21 +429,97 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	default:
 		return nil, fmt.Errorf("invalid --detection-mode %q (use passive, aggressive or mixed)", opts.DetectionMode)
 	}
+	dialer := &net.Dialer{Timeout: opts.ConnectTimeout}
+	dialCtx := dialer.DialContext
 	tr := &http.Transport{
 		MaxIdleConns:        opts.Threads * 2,
 		MaxIdleConnsPerHost: opts.Threads,
 		IdleConnTimeout:     30 * time.Second,
-		DialContext:         (&net.Dialer{Timeout: opts.ConnectTimeout}).DialContext,
+		DialContext:         dialCtx,
 	}
+
+	// --tls-fingerprint: hand-rolled TLSClientConfig variations (chrome,
+	// firefox) or per-request rotation (random). Real JA3 fingerprints
+	// would need uTLS — these stdlib-only variations are intended against
+	// naive WAF TLS checks.
+	fingerprint := strings.ToLower(strings.TrimSpace(opts.TLSFingerprint))
+	switch fingerprint {
+	case "", "off":
+	case "chrome", "firefox", "random":
+	default:
+		return nil, fmt.Errorf("invalid --tls-fingerprint %q (use chrome, firefox or random)", opts.TLSFingerprint)
+	}
+
 	if opts.Proxy != "" {
 		proxyURL, err := url.Parse(opts.Proxy)
 		if err != nil || proxyURL.Host == "" {
 			return nil, fmt.Errorf("invalid proxy URL %q", opts.Proxy)
 		}
-		if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
-			return nil, fmt.Errorf("unsupported proxy scheme %q (only http and https are supported)", proxyURL.Scheme)
+		switch proxyURL.Scheme {
+		case "http", "https":
+			if opts.ProxyTargetOnly {
+				targetHost := targetAuthority(u)
+				tr.Proxy = func(req *http.Request) (*url.URL, error) {
+					if sameAuthority(normalizeAuthority(req.URL.Host, req.URL.Scheme), targetHost) {
+						return proxyURL, nil
+					}
+					return nil, nil
+				}
+			} else {
+				tr.Proxy = http.ProxyURL(proxyURL)
+			}
+		case "socks5", "socks5h":
+			sd := &socks5Dialer{
+				proxyAddr:    proxyURL.Host,
+				localResolve: proxyURL.Scheme == "socks5",
+				base:         dialer.DialContext,
+			}
+			if opts.ProxyAuth != "" {
+				i := strings.IndexByte(opts.ProxyAuth, ':')
+				if i <= 0 || i == len(opts.ProxyAuth)-1 {
+					return nil, fmt.Errorf("invalid --proxy-auth %q (must be USER:PASS)", opts.ProxyAuth)
+				}
+				sd.user, sd.pass = opts.ProxyAuth[:i], opts.ProxyAuth[i+1:]
+			}
+			targetHost := targetAuthority(u)
+			dialCtx = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if opts.ProxyTargetOnly && !sameAuthority(addr, targetHost) {
+					return dialer.DialContext(ctx, network, addr)
+				}
+				return sd.DialContext(ctx, network, addr)
+			}
+		default:
+			return nil, fmt.Errorf("unsupported proxy scheme %q (only http, https, socks5 and socks5h are supported)", proxyURL.Scheme)
 		}
-		tr.Proxy = http.ProxyURL(proxyURL)
+	}
+	tr.DialContext = dialCtx
+
+	switch fingerprint {
+	case "chrome", "firefox":
+		tr.TLSClientConfig = tlsFingerprintConfig(fingerprint)
+	case "random":
+		if tr.Proxy != nil {
+			// Go's http.Transport refuses a custom TLS dialer when
+			// dialing through an HTTP proxy, so fall back to one random
+			// combination for the whole scan.
+			tr.TLSClientConfig = randomTLSFingerprint()
+		} else {
+			// One fresh connection per request (keep-alives off), each
+			// handshaking with a randomly picked fingerprint.
+			tr.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dialCtx(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				tc := tls.Client(conn, randomTLSFingerprint())
+				if err := tc.HandshakeContext(ctx); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return tc, nil
+			}
+			tr.DisableKeepAlives = true
+		}
 	}
 	client := &http.Client{
 		Timeout:   opts.RequestTimeout,
@@ -481,6 +640,10 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	if opts.RateLimit > 0 {
 		s.lim = &rateLimiter{interval: time.Duration(float64(time.Second) / opts.RateLimit)}
 	}
+	if opts.PerHostRateLimit > 0 {
+		s.perHostLim = make(map[string]*rateLimiter)
+		s.perHostInterval = time.Duration(float64(time.Second) / opts.PerHostRateLimit)
+	}
 	s.maxBackoff = 30 * time.Second
 	return s, nil
 }
@@ -580,6 +743,7 @@ type Result struct {
 func (s *Scanner) fetch(path string) (int, []byte, error) {
 	s.lim.wait()
 	u := s.base + path
+	s.perHostWait(u)
 	if s.opts.CacheTTL > 0 {
 		if code, body, ok := s.cacheGet(u); ok {
 			return code, body, nil
@@ -642,11 +806,13 @@ func cacheableStatus(code int) bool {
 // Location header from the author-enumeration redirect chain can be read.
 func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error) {
 	s.lim.wait()
+	u := s.base + path
+	s.perHostWait(u)
 	client := *s.client
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, s.base+path, nil)
+	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -724,7 +890,9 @@ func (s *Scanner) cachePut(u string, code int, body []byte) {
 func (s *Scanner) checkXMLRPC() bool {
 	s.lim.wait()
 	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
-	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodPost, s.base+"/xmlrpc.php", strings.NewReader(payload))
+	u := s.base + "/xmlrpc.php"
+	s.perHostWait(u)
+	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodPost, u, strings.NewReader(payload))
 	if err != nil {
 		return false
 	}
