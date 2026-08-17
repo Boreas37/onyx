@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -940,5 +941,201 @@ func TestFeedTypeSidecarDefaults(t *testing.T) {
 	}
 	if got := dbFeedType(path); got != feedProduction {
 		t.Errorf("unknown sidecar content: dbFeedType = %q, want production", got)
+	}
+}
+
+func TestParseScanArgsOutputFlags(t *testing.T) {
+	target, o := parseScanArgs([]string{"http://example.test", "--format", "csv", "--no-summary"})
+	if target != "http://example.test" {
+		t.Errorf("target = %q", target)
+	}
+	if o.format != "csv" {
+		t.Errorf("format = %q, want csv", o.format)
+	}
+	if !o.noSummary {
+		t.Error("noSummary = false, want true")
+	}
+
+	_, o = parseScanArgs([]string{"http://example.test", "--format", "cli-no-colour"})
+	if o.format != "cli-no-colour" {
+		t.Errorf("format = %q, want cli-no-colour", o.format)
+	}
+
+	_, o = parseScanArgs([]string{"http://example.test"})
+	if o.noSummary {
+		t.Error("default noSummary = true, want false")
+	}
+}
+
+// elementorFeedDB writes a one-record feed (Elementor, critical) into
+// t.TempDir and returns its path.
+func elementorFeedDB(t *testing.T) string {
+	t.Helper()
+	feed := map[string]any{
+		"aaaaaaaa-0000-0000-0000-000000000001": map[string]any{
+			"id":    "aaaaaaaa-0000-0000-0000-000000000001",
+			"title": "Elementor < 3.25.0 - SQL Injection",
+			"cvss": map[string]any{
+				"score":  9.1,
+				"rating": "critical",
+			},
+			"software": []any{map[string]any{
+				"type": "plugin", "name": "Elementor", "slug": "elementor",
+				"affected_versions": map[string]any{
+					"1.0.0 - 3.24.9": map[string]any{
+						"from_version": "1.0.0", "from_inclusive": true,
+						"to_version": "3.24.9", "to_inclusive": true,
+					},
+				},
+			}},
+		},
+	}
+	path := filepath.Join(t.TempDir(), "feed.json")
+	data, _ := json.Marshal(feed)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// elementorSite serves a WordPress homepage plus a vulnerable readme.txt.
+func elementorSite() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><link rel="https://api.w.org/" href="/wp-json/" /></body></html>`))
+	})
+	mux.HandleFunc("/wp-content/plugins/elementor/readme.txt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("=== Elementor ===\nStable tag: 3.24.0\n"))
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestRunScanJSONSummary verifies the JSON output carries a correctly
+// populated "summary" object derived from the scan result.
+func TestRunScanJSONSummary(t *testing.T) {
+	srv := elementorSite()
+	defer srv.Close()
+
+	var doc struct {
+		Summary  *scanner.Summary   `json:"summary"`
+		Findings []scanner.Finding  `json:"findings"`
+		Detected []scanner.Detected `json:"detected"`
+		Users    []scanner.User     `json:"users"`
+	}
+	out := captureStdout(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: elementorFeedDB(t), silent: true, format: "json"}); code != 5 {
+			t.Errorf("exit code = %d, want 5", code)
+		}
+	})
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("json output is not valid JSON: %v\n%s", err, out)
+	}
+	if doc.Summary == nil {
+		t.Fatal("json output missing the summary field")
+	}
+	s := doc.Summary
+	if s.Findings != len(doc.Findings) {
+		t.Errorf("summary findings = %d, want %d", s.Findings, len(doc.Findings))
+	}
+	if s.Detected != len(doc.Detected) {
+		t.Errorf("summary detected = %d, want %d", s.Detected, len(doc.Detected))
+	}
+	if s.Users != len(doc.Users) {
+		t.Errorf("summary users = %d, want %d", s.Users, len(doc.Users))
+	}
+	if s.Requests < 1 {
+		t.Errorf("summary requests = %d, want >= 1", s.Requests)
+	}
+	if s.RateLimited != 0 {
+		t.Errorf("summary rate_limited = %d, want 0 (no 429s served)", s.RateLimited)
+	}
+	wantC, wantH, wantM, wantL := 0, 0, 0, 0
+	for _, f := range doc.Findings {
+		for _, v := range f.Vulnerabilities {
+			switch strings.ToLower(v.Rating) {
+			case "critical":
+				wantC++
+			case "high":
+				wantH++
+			case "medium":
+				wantM++
+			case "low":
+				wantL++
+			}
+		}
+	}
+	if s.Critical != wantC || s.High != wantH || s.Medium != wantM || s.Low != wantL {
+		t.Errorf("summary severities = %d/%d/%d/%d, want %d/%d/%d/%d",
+			s.Critical, s.High, s.Medium, s.Low, wantC, wantH, wantM, wantL)
+	}
+	if s.DurationMS < 0 {
+		t.Errorf("summary duration_ms = %d, want >= 0", s.DurationMS)
+	}
+}
+
+// TestRunScanJSONNoSummary verifies --no-summary removes the summary field
+// from the JSON output.
+func TestRunScanJSONNoSummary(t *testing.T) {
+	srv := elementorSite()
+	defer srv.Close()
+
+	out := captureStdout(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: elementorFeedDB(t), silent: true, format: "json", noSummary: true}); code != 5 {
+			t.Errorf("exit code = %d, want 5", code)
+		}
+	})
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("json output is not valid JSON: %v\n%s", err, out)
+	}
+	if _, ok := doc["summary"]; ok {
+		t.Errorf("json output must omit the summary field with --no-summary:\n%s", out)
+	}
+}
+
+// TestRunScanCSVOutput verifies --format csv prints the header + one row
+// per vulnerability (exit code 5 for a finding), and that --output writes
+// the same CSV to a file.
+func TestRunScanCSVOutput(t *testing.T) {
+	srv := elementorSite()
+	defer srv.Close()
+
+	out := captureStdout(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: elementorFeedDB(t), silent: true, format: "csv"}); code != 5 {
+			t.Errorf("exit code = %d, want 5", code)
+		}
+	})
+	recs, err := csv.NewReader(strings.NewReader(out)).ReadAll()
+	if err != nil {
+		t.Fatalf("csv output is not parseable: %v\n%s", err, out)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("expected header + 1 row, got %d: %v", len(recs), recs)
+	}
+	if got := strings.Join(recs[0], ","); got != "slug,type,installed_version,cve,severity,title,affected_versions" {
+		t.Errorf("csv header = %q", got)
+	}
+	if recs[1][0] != "elementor" || recs[1][4] != "critical" || recs[1][5] != "Elementor < 3.25.0 - SQL Injection" {
+		t.Errorf("csv row = %v, want the elementor finding", recs[1])
+	}
+
+	dst := filepath.Join(t.TempDir(), "results.csv")
+	captureStdout(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: elementorFeedDB(t), silent: true, format: "csv", output: dst}); code != 5 {
+			t.Errorf("exit code = %d, want 5", code)
+		}
+	})
+	file, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("reading --output file: %v", err)
+	}
+	if !strings.HasPrefix(string(file), "slug,type,installed_version,cve,severity,title,affected_versions\n") {
+		t.Errorf("--output csv file content = %q, want the CSV output", file)
 	}
 }

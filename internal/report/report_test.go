@@ -3,6 +3,7 @@ package report
 import (
 	"bufio"
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"os"
@@ -168,5 +169,140 @@ func TestPrintSARIFMinimalStructure(t *testing.T) {
 	}
 	if run.Results[1].Level != "warning" {
 		t.Errorf("result[1] level = %q, want warning", run.Results[1].Level)
+	}
+}
+
+// TestPrintCSVQuotesCommasAndRowsPerVulnerability verifies --format csv:
+// one row per vulnerability (not per finding), the header columns, and
+// encoding/csv quoting for titles containing commas.
+func TestPrintCSVQuotesCommasAndRowsPerVulnerability(t *testing.T) {
+	res := &scanner.Result{
+		IsWordPress: true,
+		Findings: []scanner.Finding{
+			{
+				Slug: "elementor", Type: "plugin", InstalledVersion: "3.24.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{CVE: "CVE-2024-0001", Rating: "critical",
+						Title:          "Elementor, Website Builder < 3.25.0 - SQL Injection",
+						AffectedLabels: []string{"1.0.0 - 3.24.9"}},
+					{CVE: "CVE-2024-0002", Rating: "high",
+						Title:          "Elementor < 3.24.0 - Stored XSS",
+						AffectedLabels: []string{"1.0.0 - 3.23.9", "1.0.0 - 3.22.4"}},
+				},
+			},
+		},
+	}
+	out := captureStdout(t, func() { PrintCSV(res) })
+
+	if !strings.Contains(out, `"Elementor, Website Builder < 3.25.0 - SQL Injection"`) {
+		t.Errorf("csv output must quote the comma-containing title:\n%s", out)
+	}
+
+	recs, err := csv.NewReader(strings.NewReader(out)).ReadAll()
+	if err != nil {
+		t.Fatalf("csv output is not parseable: %v\n%s", err, out)
+	}
+	wantHeader := []string{"slug", "type", "installed_version", "cve", "severity", "title", "affected_versions"}
+	if len(recs) != 3 {
+		t.Fatalf("expected header + 2 rows (one per vulnerability), got %d records: %v", len(recs), recs)
+	}
+	for i := range wantHeader {
+		if recs[0][i] != wantHeader[i] {
+			t.Errorf("header[%d] = %q, want %q", i, recs[0][i], wantHeader[i])
+		}
+	}
+	if recs[1][0] != "elementor" || recs[1][1] != "plugin" || recs[1][2] != "3.24.0" {
+		t.Errorf("row 1 component columns = %v, want elementor/plugin/3.24.0", recs[1][:3])
+	}
+	if recs[1][3] != "CVE-2024-0001" || recs[1][4] != "critical" {
+		t.Errorf("row 1 cve/severity = %v, want CVE-2024-0001/critical", recs[1][3:5])
+	}
+	if recs[1][5] != "Elementor, Website Builder < 3.25.0 - SQL Injection" {
+		t.Errorf("row 1 title = %q, comma value must round-trip", recs[1][5])
+	}
+	if recs[1][6] != "1.0.0 - 3.24.9" {
+		t.Errorf("row 1 affected_versions = %q, want 1.0.0 - 3.24.9", recs[1][6])
+	}
+	if recs[2][3] != "CVE-2024-0002" || recs[2][5] != "Elementor < 3.24.0 - Stored XSS" {
+		t.Errorf("row 2 = %v, want the second vulnerability", recs[2])
+	}
+}
+
+// TestCliNoColourSuppressesANSI verifies the cli-no-colour behavior: with
+// NoColor set the table never emits ESC (ANSI) codes even when stdout
+// looks like a terminal (useColor forced on).
+func TestCliNoColourSuppressesANSI(t *testing.T) {
+	oldColor, oldNoColor := useColor, NoColor
+	t.Cleanup(func() { useColor, NoColor = oldColor, oldNoColor })
+
+	useColor = true
+	NoColor = false
+	colorOut := captureStdout(t, func() { PrintTable(sampleResult(), false, "") })
+	if !strings.Contains(colorOut, "\x1b[") {
+		t.Fatalf("sanity: with ANSI enabled the table must carry escape codes:\n%s", colorOut)
+	}
+
+	NoColor = true
+	plainOut := captureStdout(t, func() { PrintTable(sampleResult(), false, "") })
+	if strings.Contains(plainOut, "\x1b") {
+		t.Errorf("cli-no-colour output must contain 0 ESC characters, got:\n%s", plainOut)
+	}
+}
+
+// TestPrintSummarySection verifies the exact summary layout of the spec,
+// including the rate-limited note and the severity breakdown.
+func TestPrintSummarySection(t *testing.T) {
+	res := sampleResult()
+	res.Summary = &scanner.Summary{
+		DurationMS: 42300, Requests: 512, RateLimited: 42,
+		Detected: 2, Findings: 104, Critical: 2, High: 7, Medium: 95, Users: 3,
+	}
+	out := captureStdout(t, func() { PrintSummary(res) })
+	for _, want := range []string{
+		"Scan summary:",
+		"  Duration:    42.3s",
+		"  Requests:    512 (42 rate-limited)",
+		"  Detected:    2 components",
+		"  Findings:    104 vulnerabilities (2 critical, 7 high, 95 medium)",
+		"  Users found: 3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestPrintSummaryOmitsZeroSeveritiesAndRateLimit verifies the compact
+// summary lines: no rate-limited note and no severity breakdown when the
+// counters are zero.
+func TestPrintSummaryOmitsZeroSeveritiesAndRateLimit(t *testing.T) {
+	res := sampleResult()
+	res.Summary = &scanner.Summary{
+		DurationMS: 1500, Requests: 4, Detected: 1, Findings: 1, Critical: 1,
+	}
+	out := captureStdout(t, func() { PrintSummary(res) })
+	if strings.Contains(out, "rate-limited") {
+		t.Errorf("no rate-limited note expected when RateLimited is 0:\n%s", out)
+	}
+	if !strings.Contains(out, "  Duration:    1.5s") {
+		t.Errorf("duration line missing:\n%s", out)
+	}
+	if !strings.Contains(out, "  Requests:    4\n") {
+		t.Errorf("requests line missing:\n%s", out)
+	}
+	if !strings.Contains(out, "  Findings:    1 vulnerabilities (1 critical)") {
+		t.Errorf("findings line missing:\n%s", out)
+	}
+	if !strings.Contains(out, "\n  Users found: 0") {
+		t.Errorf("users line missing:\n%s", out)
+	}
+}
+
+// TestPrintSummaryNilSummaryPrintsNothing verifies a scan without summary
+// statistics prints no summary section.
+func TestPrintSummaryNilSummaryPrintsNothing(t *testing.T) {
+	out := captureStdout(t, func() { PrintSummary(sampleResult()) })
+	if out != "" {
+		t.Errorf("nil summary must print nothing, got:\n%s", out)
 	}
 }
