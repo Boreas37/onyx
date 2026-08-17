@@ -60,11 +60,34 @@ onyx scan https://example.com
 | `--max-requests N` | Cap on brute-force enumeration requests (default 500) |
 | `--max-scan-duration D` | Stop after a duration (`30s`, `5m`) and report partial results |
 | `--cache-ttl H` | Cache HTTP responses on disk for H hours |
+| `--nuclei` | Verify findings against projectdiscovery templates (needs the nuclei binary) |
 | `--output FILE` | Also write JSON results to `FILE` (table still prints to stdout) |
 | `--config FILE` | Load defaults from a JSON config file (CLI flags win) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
+
+### Nuclei verification pipeline
+
+Like RustScan's `--nmap` flag, `--nuclei` chains a second tool onto the scan:
+
+```bash
+onyx scan https://example.com --nuclei
+```
+
+1. onyx runs its normal scan and collects the CVE IDs from its findings.
+2. For each CVE it looks up the matching template in the local
+   projectdiscovery templates clone (`~/nuclei-templates` or
+   `$NUCLEI_TEMPLATES_DIR`, override with `--nuclei-template-dir`).
+3. All found templates are fired at the target with the nuclei binary; every
+   match is parsed and shown under a "Nuclei verification" section.
+4. When a CVE gets confirmed by nuclei, onyx also pulls up to **5 most-starred
+   PoC repositories** from the local [`CVE-PoC-Tracker`](https://github.com/Boreas37/CVE-PoC-Tracker)
+   clone (`~/projects/cve-tracker` or `$POC_TRACKER_DIR`), plus a link to the
+   tracker itself.
+
+The whole chain degrades gracefully: missing nuclei binary, missing template,
+or missing tracker clone only print a `[WARN]` and the scan still completes.
 
 ### Exit codes
 
@@ -121,17 +144,21 @@ See its README for the license terms.
 
 ## Roadmap
 
-- [x] `onyx update` wired to the GitHub Releases API (auto-updates on a missing database)
-- [x] User enumeration via `--enumerate u` (incl. subdirectory multisite)
-- [x] Passive + aggressive detection modes (`--detection-mode`)
-- [x] JSON / JSONL / SARIF output (`--format`, `--stream`)
-- [x] WAF evasion: custom / random user agents, proxy support
-- [x] Rate limiting + automatic 429 backoff
-- [x] Config backup / DB export / timthumb checks
-- [x] HTTP response cache (`--cache-ttl`)
-- [x] Scan time limit (`--max-scan-duration`)
-- [x] Config file support (`--config`)
-- [x] Machine-readable exit codes (0 / 5 / 2)
+Continuous development — next up, in rough order:
+
+- **Exploit-oriented checks**: wp-login brute force (`--passwords` /
+  `--usernames`), XML-RPC multicall password attack, authenticated REST
+  inventory via application passwords (`--wp-auth`).
+- **WAF and evasion hardening**: SOCKS5 proxy support, TLS fingerprint
+  rotation, per-host rate limiting, `--proxy-target-only` style scoping.
+- **Data layer**: scanner-feed support (broader, noisier detections),
+  incremental DB updates with checksum, `--no-update` and staleness prompts.
+- **Output**: CSV and color-free `cli-no-colour` formats, scan summary
+  statistics (request counts, duration, coverage).
+- **Packaging**: GitHub Actions release workflow for binaries, Homebrew tap,
+  `go install` version pinning, signed SBOM.
+- **Community**: plugin/theme slug contribution workflow, template
+  pre-registration, issue templates.
 
 ## License
 
