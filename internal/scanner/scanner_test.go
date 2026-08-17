@@ -132,7 +132,10 @@ func TestDetectWordPress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ver, ev := sc.detectWP()
+	ver, ev, err := sc.detectWP()
+	if err != nil {
+		t.Fatalf("detectWP: %v", err)
+	}
 	if ver != "6.4.2" {
 		t.Errorf("core version = %q, want 6.4.2", ver)
 	}
@@ -211,6 +214,52 @@ func TestScanNonWordPressTarget(t *testing.T) {
 	}
 	if _, err := sc.Scan(); err != ErrNotWordPress {
 		t.Fatalf("expected ErrNotWordPress, got %v", err)
+	}
+}
+
+// TestScanUnreachableHostFatal verifies a target that cannot be reached at
+// all (connection refused) fails the scan with a hard error instead of
+// being reported as "not WordPress".
+func TestScanUnreachableHostFatal(t *testing.T) {
+	// A closed httptest server leaves no listener behind: connecting to
+	// it gets an immediate connection refused.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err == nil {
+		t.Fatal("expected a fatal error for an unreachable host")
+	}
+	if !strings.Contains(err.Error(), "cannot reach target") {
+		t.Errorf("error = %q, want contains %q", err, "cannot reach target")
+	}
+	if res != nil {
+		t.Errorf("expected nil result on fatal fetch failure, got %+v", res)
+	}
+}
+
+// TestScanDeadProxyFatal verifies a broken proxy (nothing listening on the
+// proxy port) is a hard scan failure, not a false "WordPress found".
+func TestScanDeadProxyFatal(t *testing.T) {
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, "http://example.test", Options{Proxy: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err == nil {
+		t.Fatal("expected a fatal error through a dead proxy")
+	}
+	if !strings.Contains(err.Error(), "cannot reach target") {
+		t.Errorf("error = %q, want contains %q", err, "cannot reach target")
+	}
+	if res != nil {
+		t.Errorf("expected nil result on fatal fetch failure, got %+v", res)
 	}
 }
 
@@ -418,6 +467,109 @@ func TestScanAuthorRedirectEnumeration(t *testing.T) {
 	}
 }
 
+// TestUsersFromAPISkipsPHPNoticePrefix verifies the /wp-json/wp/v2/users
+// parser digs the JSON payload out from behind PHP Deprecated/Warning
+// notice text that WordPress may prepend to the body.
+func TestUsersFromAPISkipsPHPNoticePrefix(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(
+			"Deprecated: Function dynamic_sidebar is deprecated since version 5.0.0! Use widgets instead. in /var/www/html/wp-includes/functions.php on line 521\n" +
+				`[{"id":1,"name":"Administrator","slug":"admin"},{"id":2,"name":"Editor","slug":"editor"}]`,
+		))
+	}))
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, errs := sc.usersFromAPI()
+	if len(errs) != 0 {
+		t.Fatalf("usersFromAPI errors = %+v, want none", errs)
+	}
+	if len(users) != 2 || users[0].Slug != "admin" || users[1].Slug != "editor" {
+		t.Errorf("users = %+v, want admin + editor", users)
+	}
+}
+
+// TestUsersFromAPIUnparseableBody verifies a body with no JSON payload at
+// all is reported as unparseable instead of silently yielding no users.
+func TestUsersFromAPIUnparseableBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<html><body>not json</body></html>"))
+	}))
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, errs := sc.usersFromAPI()
+	if len(users) != 0 {
+		t.Errorf("users = %+v, want none for an unparseable body", users)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0], "unparseable") {
+		t.Errorf("errors = %+v, want one unparseable error", errs)
+	}
+}
+
+// author200Server answers /?author=N with a 200 page instead of a redirect
+// (WP 7.x behaviour), carrying the author slug in a canonical <link> only
+// for author=1. The site itself lives under /blog/ (subdir multisite).
+func author200Server() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("author") == "1" {
+			_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html><head><link rel="canonical" href="https://example.com/blog/author/superadmin/" /></head>
+<body><h1>superadmin</h1><a href="/blog/author/superadmin/">Posts by superadmin</a></body></html>`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<!DOCTYPE html>
+<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><a href="/blog/author/superadmin/">superadmin</a></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake"}`))
+	})
+	mux.HandleFunc("/wp-json/wp/v2/users", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"rest_user_cannot_view"}`))
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestScanAuthorBodyCanonicalEnumeration verifies users are still found
+// when /?author=N answers 200 instead of redirecting: the slug is extracted
+// from the canonical link / body reference in a subdirectory multisite
+// layout (/blog/author/<slug>/).
+func TestScanAuthorBodyCanonicalEnumeration(t *testing.T) {
+	srv := author200Server()
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{Enumerate: "u"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.Users) != 1 {
+		t.Fatalf("expected 1 user from 200 ?author body, got %+v", res.Users)
+	}
+	if res.Users[0].Slug != "superadmin" || res.Users[0].ID != 1 {
+		t.Errorf("user = %+v, want superadmin/1", res.Users[0])
+	}
+}
+
 func TestScanAuthorChecksStopAtTen(t *testing.T) {
 	srv, c := fakeWPServer(t, `[]`, 200, nil)
 	defer srv.Close()
@@ -565,6 +717,8 @@ func TestAuthorSlugFromLocation(t *testing.T) {
 		{"http://example.com/author/admin/", "admin"},
 		{"/author/simpleadmin/", "simpleadmin"},
 		{"author/no-slash/", "no-slash"},
+		{"http://example.com/blog/author/superadmin/", "superadmin"},
+		{"/blog/author/superadmin/", "superadmin"},
 		{"http://example.com/", ""},
 		{"", ""},
 		{"/?author=1", ""},
@@ -1368,5 +1522,60 @@ func TestNewScannerRejectsBadRegexes(t *testing.T) {
 	}
 	if _, err := NewScanner(nil, "http://example.test", Options{ExcludeContentBased: "["}); err == nil {
 		t.Fatal("expected error for invalid --exclude-content-based regex")
+	}
+}
+
+// TestCacheNegativeResponses verifies deterministic negative responses
+// (404s from brute-force probes) are cached: the second scan with the same
+// --cache-ttl must not re-request them.
+func TestCacheNegativeResponses(t *testing.T) {
+	t.Setenv("ONYX_CACHE_DIR", t.TempDir())
+	srv, c := fakeWPServer(t, `[]`, 200, nil)
+	defer srv.Close()
+
+	d, _ := db.Load(multiPluginFeed(t, 5))
+	opts := Options{Enumerate: "pt", CacheTTL: 24 * time.Hour}
+
+	sc1, err := NewScanner(d, srv.URL, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc1.Scan(); err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+	first := c.content.Load()
+	if first == 0 {
+		t.Fatal("expected brute-force probes on the first scan")
+	}
+
+	sc2, err := NewScanner(d, srv.URL, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc2.Scan(); err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if got := c.content.Load(); got != first {
+		t.Errorf("brute-force requests after cached scan = %d, want %d (negative responses must be cached)", got, first)
+	}
+
+	// 5xx responses must never be cached: serve a 500, scan, then serve
+	// 200 and confirm the 500 was not replayed from cache.
+	flaky := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("boom"))
+	}))
+	defer flaky.Close()
+	sc3, err := NewScanner(d, flaky.URL, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A 500 homepage yields no WordPress evidence; the scan reports
+	// "not WordPress" but must have left nothing in the cache.
+	if _, err := sc3.Scan(); err != nil && err != ErrNotWordPress {
+		t.Fatalf("flaky Scan: %v", err)
+	}
+	if code, _, ok := sc3.cacheGet(flaky.URL + "/"); ok {
+		t.Errorf("5xx response was cached: status %d must never be cached", code)
 	}
 }
