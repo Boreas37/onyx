@@ -60,6 +60,11 @@ type Scanner struct {
 	maxRequests int
 	progress    *progress.Bar
 	homepage    string // raw homepage HTML for passive slug detection
+
+	rlMu       sync.Mutex // guards rateLimitHits
+	rateHits   int        // count of 429 responses seen
+	rlBackoff  time.Duration
+	maxBackoff time.Duration
 }
 
 type rateLimiter struct {
@@ -133,6 +138,7 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	if opts.RateLimit > 0 {
 		s.lim = &rateLimiter{interval: time.Duration(float64(time.Second) / opts.RateLimit)}
 	}
+	s.maxBackoff = 30 * time.Second
 	return s, nil
 }
 
@@ -204,6 +210,7 @@ type Result struct {
 	Detected         []Detected `json:"detected,omitempty"`
 	Findings         []Finding  `json:"findings,omitempty"`
 	Users            []User     `json:"users,omitempty"`
+	RateLimitHits    int        `json:"rate_limit_hits,omitempty"` // 429s seen
 	Errors           []string   `json:"errors,omitempty"`
 }
 
@@ -214,6 +221,36 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
+
+	// Detect rate limiting (HTTP 429). Count it, then back off so the
+	// server has a chance to recover — hammering it harder just makes the
+	// block longer. Backoff doubles up to 30s, then returns the 429 so the
+	// caller can skip the job instead of burning the whole request budget.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		s.rlMu.Lock()
+		s.rateHits++
+		if s.rlBackoff == 0 {
+			s.rlBackoff = time.Second
+		} else {
+			s.rlBackoff *= 2
+			if s.rlBackoff > s.maxBackoff {
+				s.rlBackoff = s.maxBackoff
+			}
+		}
+		wait := s.rlBackoff
+		s.rlMu.Unlock()
+
+		if pr := s.progress; pr != nil {
+			pr.LogInf("rate limited (429) — backing off %s", wait)
+		}
+		time.Sleep(wait)
+		return resp.StatusCode, nil, nil
+	}
+
+	s.rlMu.Lock()
+	s.rlBackoff = 0
+	s.rlMu.Unlock()
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	return resp.StatusCode, body, err
 }
@@ -753,7 +790,15 @@ func (s *Scanner) Scan() (*Result, error) {
 	sort.Slice(res.Detected, func(i, j int) bool { return res.Detected[i].Slug < res.Detected[j].Slug })
 	sort.Slice(res.Findings, func(i, j int) bool { return res.Findings[i].Slug < res.Findings[j].Slug })
 
+	res.RateLimitHits = s.rateLimitHits()
 	return res, nil
+}
+
+// rateLimitHits returns the number of 429 responses seen during the scan.
+func (s *Scanner) rateLimitHits() int {
+	s.rlMu.Lock()
+	defer s.rlMu.Unlock()
+	return s.rateHits
 }
 
 // countKinds tallies job kinds for progress logging.
