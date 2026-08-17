@@ -2,11 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Boreas37/onyx/internal/scanner"
 )
@@ -122,6 +126,155 @@ func TestTimeoutFlagAliasesRequestTimeout(t *testing.T) {
 	if o.timeout != 20 || o.requestTimeout != 0 {
 		t.Errorf("--timeout: timeout=%d requestTimeout=%d, want 20/0", o.timeout, o.requestTimeout)
 	}
+}
+
+func TestParseScanArgsPart3Flags(t *testing.T) {
+	target, o := parseScanArgs([]string{
+		"http://example.test",
+		"--exclude-content-based", "Access Denied",
+		"--scope", `^https://example\.com`,
+		"--no-update-check",
+		"--enumerate", "m",
+	})
+	if target != "http://example.test" {
+		t.Errorf("target = %q", target)
+	}
+	if o.excludeContentBased != "Access Denied" {
+		t.Errorf("excludeContentBased = %q, want Access Denied", o.excludeContentBased)
+	}
+	if o.scope != `^https://example\.com` {
+		t.Errorf("scope = %q", o.scope)
+	}
+	if !o.noUpdateCheck {
+		t.Error("noUpdateCheck = false, want true")
+	}
+	if o.enumerate != "m" {
+		t.Errorf("enumerate = %q, want m", o.enumerate)
+	}
+}
+
+func TestEnumerateMediaModeAllowed(t *testing.T) {
+	target, o := parseScanArgs([]string{"http://example.test", "--enumerate", "ptum"})
+	if target != "http://example.test" || o.enumerate != "ptum" {
+		t.Errorf("--enumerate ptum: target=%q enumerate=%q", target, o.enumerate)
+	}
+}
+
+// staticSite serves a non-WordPress page (scan exits 0, quick to run).
+func staticSite() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<html><body>static</body></html>"))
+	}))
+}
+
+func TestRunScanOutOfScopeExitCode(t *testing.T) {
+	srv := staticSite()
+	defer srv.Close()
+
+	opts := scanOptions{dbPath: emptyDB(t), scope: `^https://allowed\.example/`, silent: true}
+	if code := runScan(srv.URL, opts); code != 2 {
+		t.Errorf("out-of-scope exit code = %d, want 2", code)
+	}
+}
+
+func TestRunScanExcludeContentBasedExitCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head>
+<body><h1>Access Denied</h1></body></html>`))
+	}))
+	defer srv.Close()
+
+	opts := scanOptions{dbPath: emptyDB(t), excludeContentBased: `Access Denied`, silent: true}
+	if code := runScan(srv.URL, opts); code != 2 {
+		t.Errorf("exclude-content-based exit code = %d, want 2", code)
+	}
+}
+
+// captureStderr runs fn with os.Stderr redirected to a pipe and returns
+// everything written to it.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(r)
+	r.Close()
+	return string(out)
+}
+
+// staleDatabase writes an empty DB whose mtime is 21 days in the past.
+func staleDatabase(t *testing.T) string {
+	t.Helper()
+	path := emptyDB(t)
+	old := time.Now().AddDate(0, 0, -21)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestStaleDatabaseWarning(t *testing.T) {
+	path := staleDatabase(t)
+	srv := staticSite()
+	defer srv.Close()
+
+	out := captureStderr(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: path, silent: true, format: "json"}); code != 0 {
+			t.Errorf("exit code = %d, want 0 (warning is informational)", code)
+		}
+	})
+	want := fmt.Sprintf("[WARN] database is %d days old — run 'onyx update' for fresh data",
+		int(time.Since(mustModTime(t, path)).Hours()/24))
+	if !strings.Contains(out, want) {
+		t.Errorf("stderr = %q, want %q", out, want)
+	}
+}
+
+func TestNoUpdateCheckSuppressesStaleWarning(t *testing.T) {
+	path := staleDatabase(t)
+	srv := staticSite()
+	defer srv.Close()
+
+	out := captureStderr(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: path, noUpdateCheck: true, silent: true, format: "json"}); code != 0 {
+			t.Errorf("exit code = %d, want 0", code)
+		}
+	})
+	if strings.Contains(out, "[WARN] database is") {
+		t.Errorf("stale warning printed despite --no-update-check: %q", out)
+	}
+}
+
+func TestFreshDatabaseNoWarning(t *testing.T) {
+	srv := staticSite()
+	defer srv.Close()
+
+	out := captureStderr(t, func() {
+		if code := runScan(srv.URL, scanOptions{dbPath: emptyDB(t), silent: true, format: "json"}); code != 0 {
+			t.Errorf("exit code = %d, want 0", code)
+		}
+	})
+	if strings.Contains(out, "[WARN] database is") {
+		t.Errorf("stale warning printed for a fresh database: %q", out)
+	}
+}
+
+func mustModTime(t *testing.T, path string) time.Time {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.ModTime()
 }
 
 func TestScanExitCodes(t *testing.T) {

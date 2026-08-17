@@ -23,6 +23,13 @@ import (
 // ErrNotWordPress is returned when a scan target shows no WordPress signs.
 var ErrNotWordPress = errors.New("target does not appear to be a WordPress site")
 
+// ErrOutOfScope is returned when --scope does not match the target URL.
+var ErrOutOfScope = errors.New("target out of scope")
+
+// ErrBlocked is returned when the homepage HTML matches
+// --exclude-content-based (WAF or error page).
+var ErrBlocked = errors.New("blocked by WAF or error page")
+
 // maxBodySize caps response bodies (readme.txt / style.css are small).
 const maxBodySize = 1 << 20
 
@@ -42,23 +49,25 @@ var authorSlugRe = regexp.MustCompile(`^/author/([^/]+)`)
 
 // Options tunes the scan behaviour. Zero values fall back to defaults.
 type Options struct {
-	Threads        int           // concurrent HTTP requests (default 5)
-	Timeout        time.Duration // per-request timeout (default 10s, alias for RequestTimeout)
-	Stealth        bool          // throttle to 1 request/second
-	RateLimit      float64       // max requests per second (0 = unlimited)
-	APIOnly        bool          // skip brute-force enumeration, only wp-json/plugins
-	MaxRequests    int           // cap on brute-force enumeration requests (default 500)
-	Enumerate      string        // what to enumerate: u/p/t, combinable (default "pt")
-	UserAgent      string        // custom User-Agent for all requests
-	RandomUA       bool          // pick a random browser User-Agent per request
-	DetectionMode  string        // passive (homepage only), aggressive (DB only), mixed (default)
-	Proxy          string        // http:// or https:// proxy URL (socks5 unsupported)
-	NoXMLRPC       bool          // skip the XML-RPC (xmlrpc.php) ping check
-	Checks         string        // extra checks: cb (config backups), dbe (db exports), comma-separated
-	ConnectTimeout time.Duration // TCP dial timeout (default 10s)
-	RequestTimeout time.Duration // per-request timeout (default 10s)
-	ContentDir     string        // wp-content directory (default "wp-content")
-	PluginsDir     string        // plugins directory (default "wp-content/plugins")
+	Threads             int           // concurrent HTTP requests (default 5)
+	Timeout             time.Duration // per-request timeout (default 10s, alias for RequestTimeout)
+	Stealth             bool          // throttle to 1 request/second
+	RateLimit           float64       // max requests per second (0 = unlimited)
+	APIOnly             bool          // skip brute-force enumeration, only wp-json/plugins
+	MaxRequests         int           // cap on brute-force enumeration requests (default 500)
+	Enumerate           string        // what to enumerate: u/p/t, combinable (default "pt")
+	UserAgent           string        // custom User-Agent for all requests
+	RandomUA            bool          // pick a random browser User-Agent per request
+	DetectionMode       string        // passive (homepage only), aggressive (DB only), mixed (default)
+	Proxy               string        // http:// or https:// proxy URL (socks5 unsupported)
+	NoXMLRPC            bool          // skip the XML-RPC (xmlrpc.php) ping check
+	Checks              string        // extra checks: cb (config backups), dbe (db exports), comma-separated
+	ConnectTimeout      time.Duration // TCP dial timeout (default 10s)
+	RequestTimeout      time.Duration // per-request timeout (default 10s)
+	ContentDir          string        // wp-content directory (default "wp-content")
+	PluginsDir          string        // plugins directory (default "wp-content/plugins")
+	ExcludeContentBased string        // regex; matching homepage HTML aborts the scan
+	Scope               string        // regex; a non-matching target URL is out of scope
 }
 
 // Scanner drives one scan against a single target.
@@ -82,6 +91,9 @@ type Scanner struct {
 	checks     map[string]bool // extra checks requested via --checks (cb, dbe)
 	contentDir string
 	pluginsDir string
+
+	scopeRe   *regexp.Regexp // --scope target URL filter
+	excludeRe *regexp.Regexp // --exclude-content-based homepage filter
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -206,9 +218,24 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		enum = "pt"
 	}
 	for _, c := range enum {
-		if c != 'p' && c != 't' && c != 'u' {
-			return nil, fmt.Errorf("invalid --enumerate value %q (use p, t and/or u)", opts.Enumerate)
+		if c != 'p' && c != 't' && c != 'u' && c != 'm' {
+			return nil, fmt.Errorf("invalid --enumerate value %q (use p, t, u and/or m)", opts.Enumerate)
 		}
+	}
+	var scopeRe, excludeRe *regexp.Regexp
+	if opts.Scope != "" {
+		re, err := regexp.Compile(opts.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --scope regex %q: %v", opts.Scope, err)
+		}
+		scopeRe = re
+	}
+	if opts.ExcludeContentBased != "" {
+		re, err := regexp.Compile(opts.ExcludeContentBased)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --exclude-content-based regex %q: %v", opts.ExcludeContentBased, err)
+		}
+		excludeRe = re
 	}
 	if opts.MaxRequests <= 0 {
 		opts.MaxRequests = defaultMaxRequests
@@ -260,6 +287,8 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		checks:      checks,
 		contentDir:  contentDir,
 		pluginsDir:  pluginsDir,
+		scopeRe:     scopeRe,
+		excludeRe:   excludeRe,
 	}
 	if opts.Stealth {
 		s.lim = &rateLimiter{interval: time.Second}
@@ -290,6 +319,9 @@ func (s *Scanner) enumerateThemes() bool { return strings.Contains(s.enum, "t") 
 
 // enumerateUsers reports whether users should be enumerated.
 func (s *Scanner) enumerateUsers() bool { return strings.Contains(s.enum, "u") }
+
+// enumerateMedia reports whether media upload presence should be checked.
+func (s *Scanner) enumerateMedia() bool { return strings.Contains(s.enum, "m") }
 
 // Detected is a plugin/theme/core component whose presence and version were
 // identified on the target.
@@ -340,6 +372,7 @@ type Result struct {
 	Findings         []Finding  `json:"findings,omitempty"`
 	Users            []User     `json:"users,omitempty"`
 	XMLRPC           bool       `json:"xmlrpc,omitempty"` // xmlrpc.php ping answered
+	Interesting      []string   `json:"interesting,omitempty"`
 	ConfigBackups    []string   `json:"config_backups,omitempty"`
 	DBExports        []string   `json:"db_exports,omitempty"`
 	RateLimitHits    int        `json:"rate_limit_hits,omitempty"` // 429s seen
@@ -466,7 +499,47 @@ func (s *Scanner) dbExportFinder() []string {
 	return found
 }
 
-// usersFromAPI reads the (usually open) /wp-json/wp/v2/users listing and
+// interestingFinders runs the always-on file checks (WPScan-style): each is
+// a simple GET plus a status/content rule flagging exposed files and
+// directory listings.
+func (s *Scanner) interestingFinders() []string {
+	var out []string
+	try := func(path, needle, desc string) {
+		code, body, err := s.fetch(path)
+		if err != nil || code != http.StatusOK {
+			return
+		}
+		if needle != "" && !strings.Contains(string(body), needle) {
+			return
+		}
+		out = append(out, desc)
+	}
+	try("/robots.txt", "Disallow", "robots.txt with disallow rules")
+	try("/readme.html", "WordPress", "WordPress readme.html exposed")
+
+	code, body, err := s.fetch("/" + s.contentDir + "/debug.log")
+	if err == nil && code == http.StatusOK {
+		b := string(body)
+		if strings.Contains(b, "PHP") || strings.Contains(b, "Warning") || strings.Contains(b, "Fatal") {
+			out = append(out, "debug.log exposed")
+		}
+	}
+
+	try("/xmlrpc.php", "XML-RPC", "xmlrpc.php exposed")
+
+	code, body, err = s.fetch("/" + s.contentDir + "/uploads/")
+	if err == nil && code == http.StatusOK {
+		b := string(body)
+		if strings.Contains(b, "Index of") || strings.Contains(b, "Parent Directory") {
+			out = append(out, "uploads directory listing")
+		}
+	}
+
+	try("/wp-config.php.bak", "", "wp-config.php.bak exposed")
+	try("/wp-includes/version.php", "", "wp-includes/version.php exposed")
+	return out
+}
+
 // extracts id/slug/name for each account.
 func (s *Scanner) usersFromAPI() ([]User, []string) {
 	var errs []string
@@ -826,6 +899,11 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 
 // Scan runs the full workflow: WordPress detection, enumeration and matching.
 func (s *Scanner) Scan() (*Result, error) {
+	// --scope target URL validation happens before any request.
+	if s.scopeRe != nil && !s.scopeRe.MatchString(s.base) {
+		return nil, ErrOutOfScope
+	}
+
 	res := &Result{Target: s.base}
 	pr := s.progress
 	if pr != nil {
@@ -833,6 +911,13 @@ func (s *Scanner) Scan() (*Result, error) {
 	}
 
 	coreVersion, evidence := s.detectWP()
+
+	// --exclude-content-based: a matching homepage means a WAF or error
+	// page, so the scan stops right away.
+	if s.excludeRe != nil && s.excludeRe.MatchString(s.homepage) {
+		return nil, ErrBlocked
+	}
+
 	res.Evidence = evidence
 	res.IsWordPress = coreVersion != "" || len(evidence) > 0
 	if !res.IsWordPress {
@@ -849,6 +934,16 @@ func (s *Scanner) Scan() (*Result, error) {
 			ver = " " + coreVersion
 		}
 		pr.LogInf("detected WordPress%s at %s", ver, s.base)
+	}
+
+	// Always-on interesting finders (robots.txt, readme.html, debug.log,
+	// xmlrpc.php, uploads listing, wp-config.php.bak, version.php).
+	res.Interesting = s.interestingFinders()
+
+	// Media enumeration: a homepage reference to the uploads directory is
+	// enough for the simple presence check.
+	if s.enumerateMedia() && strings.Contains(s.homepage, "/"+s.contentDir+"/uploads/") {
+		res.Interesting = append(res.Interesting, "media uploads present")
 	}
 
 	// XML-RPC ping check (skip with --no-xmlrpc).
