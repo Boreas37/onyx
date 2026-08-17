@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1137,5 +1138,71 @@ func TestRunScanCSVOutput(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(file), "slug,type,installed_version,cve,severity,title,affected_versions\n") {
 		t.Errorf("--output csv file content = %q, want the CSV output", file)
+	}
+}
+
+func TestVersionJSONValidAndFields(t *testing.T) {
+	type vinfo struct {
+		Version   string `json:"version"`
+		GoVersion string `json:"go_version"`
+		OS        string `json:"os"`
+		Arch      string `json:"arch"`
+		Commit    string `json:"commit"`
+		BuildTime string `json:"build_time"`
+	}
+
+	oldCommit, oldTime := buildCommit, buildTime
+	buildCommit, buildTime = "abcdef", "2026-08-17T00:00:00Z"
+	defer func() { buildCommit, buildTime = oldCommit, oldTime }()
+
+	var got vinfo
+	if err := json.Unmarshal([]byte(versionJSON()), &got); err != nil {
+		t.Fatalf("version --json output is not valid JSON: %v", err)
+	}
+	if got.Version != "0.2.0" {
+		t.Errorf("version = %q, want 0.2.0", got.Version)
+	}
+	if got.GoVersion == "" {
+		t.Error("go_version is empty")
+	}
+	if got.OS != runtime.GOOS {
+		t.Errorf("os = %q, want %q", got.OS, runtime.GOOS)
+	}
+	if got.Arch != runtime.GOARCH {
+		t.Errorf("arch = %q, want %q", got.Arch, runtime.GOARCH)
+	}
+	if got.Commit != "abcdef" {
+		t.Errorf("commit = %q, want abcdef", got.Commit)
+	}
+	if got.BuildTime != "2026-08-17T00:00:00Z" {
+		t.Errorf("build_time = %q, want 2026-08-17T00:00:00Z", got.BuildTime)
+	}
+}
+
+func TestVersionJSONUnknownMetadata(t *testing.T) {
+	oldCommit, oldTime := buildCommit, buildTime
+	buildCommit, buildTime = "", ""
+	defer func() { buildCommit, buildTime = oldCommit, oldTime }()
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(versionJSON()), &got); err != nil {
+		t.Fatalf("version --json output is not valid JSON: %v", err)
+	}
+	if got["commit"] != "unknown" {
+		t.Errorf("commit = %v, want unknown (local build)", got["commit"])
+	}
+	if got["build_time"] != "unknown" {
+		t.Errorf("build_time = %v, want unknown (local build)", got["build_time"])
+	}
+}
+
+func TestVersionPlainKeepsFormat(t *testing.T) {
+	if out := captureStdout(t, func() {
+		oldArgs := os.Args
+		os.Args = []string{"onyx", "version"}
+		defer func() { os.Args = oldArgs }()
+		main()
+	}); out != "onyx 0.2.0\n" {
+		t.Errorf("plain version output = %q, want %q", out, "onyx 0.2.0\n")
 	}
 }

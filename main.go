@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ import (
 )
 
 const (
+	onyxVersion     = "0.2.0"
 	defaultDB       = "data/wordfence.json"
 	feedProduction  = "production"
 	feedScanner     = "scanner"
@@ -32,6 +35,11 @@ const (
 	productionRepo  = "Boreas37/onyx-db"
 	productionAsset = "wordfence-latest.json.gz"
 )
+
+// buildCommit and buildTime are injected at build time via
+// -ldflags "-X main.buildCommit=<sha> -X main.buildTime=<RFC3339>".
+// Local builds leave them empty, reported as "unknown" in --json output.
+var buildCommit, buildTime string
 
 func main() {
 	updCmd := flag.NewFlagSet("update", flag.ExitOnError)
@@ -65,11 +73,51 @@ func main() {
 			os.Exit(2)
 		}
 	case "version":
-		fmt.Println("onyx 0.2.0")
+		if slices.Contains(os.Args[2:], "--json") {
+			fmt.Println(versionJSON())
+		} else {
+			fmt.Println("onyx", onyxVersion)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+// versionInfo is the machine-readable shape of `onyx version --json`.
+type versionInfo struct {
+	Version   string `json:"version"`
+	GoVersion string `json:"go_version"`
+	OS        string `json:"os"`
+	Arch      string `json:"arch"`
+	Commit    string `json:"commit"`
+	BuildTime string `json:"build_time"`
+}
+
+// versionJSON renders build metadata as a single-line JSON object. Commit
+// and build time come from ldflags (release builds); local builds report
+// "unknown" for both.
+func versionJSON() string {
+	commit, ts := buildCommit, buildTime
+	if commit == "" {
+		commit = "unknown"
+	}
+	if ts == "" {
+		ts = "unknown"
+	}
+	info := versionInfo{
+		Version:   onyxVersion,
+		GoVersion: runtime.Version(),
+		OS:        runtime.GOOS,
+		Arch:      runtime.GOARCH,
+		Commit:    commit,
+		BuildTime: ts,
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return `{"error": "cannot marshal version info"}`
+	}
+	return string(b)
 }
 
 // scanOptions holds the parsed scan flags.
@@ -519,7 +567,7 @@ func runScan(target string, o scanOptions) int {
 	}
 
 	if o.format == "table" || o.format == "cli-no-colour" {
-		report.PrintBanner("0.2.0", database.Count())
+		report.PrintBanner(onyxVersion, database.Count())
 	}
 
 	// --timeout stays as an alias for --request-timeout.
@@ -641,7 +689,7 @@ func runScan(target string, o scanOptions) int {
 			report.PrintJSONL(res)
 		}
 	case "sarif":
-		report.PrintSARIF("0.2.0", res)
+		report.PrintSARIF(onyxVersion, res)
 	case "csv":
 		report.PrintCSV(res)
 	case "cli-no-colour":
