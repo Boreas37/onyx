@@ -1,0 +1,184 @@
+// Package nuclei verifies scan findings with projectdiscovery/nuclei:
+// it locates the matching template file for a CVE and runs the nuclei
+// binary to confirm the vulnerability against the target.
+package nuclei
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// runTimeout caps a single nuclei invocation (templates may take a long
+// time against hostile or slow targets).
+const runTimeout = 60 * time.Second
+
+// ErrBinaryNotFound is returned by Run when no usable nuclei binary can be
+// resolved (neither $NUCLEI_BIN nor `nuclei` on PATH). The pipeline treats
+// it as a soft failure and skips verification.
+var ErrBinaryNotFound = errors.New("nuclei binary not found")
+
+// NucleiResult is one verified match emitted by nuclei (JSON Lines).
+type NucleiResult struct {
+	TemplateID  string `json:"template_id"`
+	CVE         string `json:"cve,omitempty"`
+	MatchedAt   string `json:"matched_at"`
+	Severity    string `json:"severity"`
+	Name        string `json:"name"`
+	MatcherName string `json:"matcher_name,omitempty"`
+}
+
+// jsonLine mirrors the nuclei -json -silent output for one match.
+type jsonLine struct {
+	TemplateID string `json:"template-id"`
+	MatchedAt  string `json:"matched-at"`
+	Matcher    string `json:"matcher-name"`
+	Info       struct {
+		Name           string `json:"name"`
+		Severity       string `json:"severity"`
+		Classification *struct {
+			CVEID string `json:"cve-id"`
+		} `json:"classification"`
+	} `json:"info"`
+}
+
+// FindTemplate resolves the evidence template for cve under dir:
+// first <dir>/http/cves/<year>/<cve>.yaml (year = the CVE's 4-digit year,
+// when it is within 2002-2026), then a recursive search below
+// <dir>/http/cves/ for any file named <cve>.yaml.
+func FindTemplate(dir, cve string) (string, bool) {
+	if y := cveYear(cve); y != "" {
+		p := filepath.Join(dir, "http", "cves", y, cve+".yaml")
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, true
+		}
+	}
+	found := ""
+	root := filepath.Join(dir, "http", "cves")
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != cve+".yaml" {
+			return nil
+		}
+		found = path
+		return fs.SkipAll
+	})
+	if found != "" {
+		return found, true
+	}
+	return "", false
+}
+
+// cveYear extracts the 4-digit year of a CVE id (2002-2026), or "" when the
+// id does not carry a usable year.
+func cveYear(cve string) string {
+	if len(cve) < 9 || !strings.HasPrefix(cve, "CVE-") {
+		return ""
+	}
+	y := cve[4:8]
+	n, err := strconv.Atoi(y)
+	if err != nil || n < 2002 || n > 2026 {
+		return ""
+	}
+	return y
+}
+
+// NucleiBinary resolves the nuclei binary: $NUCLEI_BIN when set, otherwise
+// `nuclei` looked up on PATH.
+func NucleiBinary() (string, error) {
+	if bin := os.Getenv("NUCLEI_BIN"); bin != "" {
+		if fi, err := os.Stat(bin); err == nil && !fi.IsDir() {
+			return bin, nil
+		}
+		return "", ErrBinaryNotFound
+	}
+	p, err := exec.LookPath("nuclei")
+	if err != nil {
+		return "", ErrBinaryNotFound
+	}
+	return p, nil
+}
+
+// Run executes
+//
+//	nuclei -target <target> -t <t1> -t <t2> ... -json -silent [extra args...]
+//
+// and parses the JSON Lines stdout into stable NucleiResults.
+func Run(target string, templates []string, extraArgs []string) ([]NucleiResult, error) {
+	bin, err := NucleiBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	args := []string{"-target", target}
+	for _, t := range templates {
+		args = append(args, "-t", t)
+	}
+	args = append(args, "-json", "-silent")
+	args = append(args, extraArgs...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting nuclei: %w", err)
+	}
+
+	var results []NucleiResult
+	sc := bufio.NewScanner(stdout)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		if r, err := ParseLine(line); err == nil {
+			results = append(results, r)
+		}
+	}
+	err = cmd.Wait()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("nuclei timed out after %s", runTimeout)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("nuclei failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return results, nil
+}
+
+// ParseLine decodes one JSON Lines match into a NucleiResult. The CVE
+// field is filled from info.classification.cve-id when present, falling
+// back to the template-id itself when it looks like a CVE id.
+func ParseLine(line string) (NucleiResult, error) {
+	var raw jsonLine
+	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		return NucleiResult{}, err
+	}
+	r := NucleiResult{
+		TemplateID:  raw.TemplateID,
+		MatchedAt:   raw.MatchedAt,
+		Severity:    raw.Info.Severity,
+		Name:        raw.Info.Name,
+		MatcherName: raw.Matcher,
+	}
+	if raw.Info.Classification != nil && raw.Info.Classification.CVEID != "" {
+		r.CVE = raw.Info.Classification.CVEID
+	} else if cveYear(raw.TemplateID) != "" {
+		r.CVE = raw.TemplateID
+	}
+	return r, nil
+}

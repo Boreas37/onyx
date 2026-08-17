@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Boreas37/onyx/internal/nuclei"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
 
@@ -289,6 +290,7 @@ func TestScanExitCodes(t *testing.T) {
 		{"clean scan", someRes, nil, 0},
 		{"not wordpress", &scanner.Result{IsWordPress: false}, scanner.ErrNotWordPress, 0},
 		{"findings", findings, nil, 5},
+		{"nuclei only", &scanner.Result{Nuclei: []nuclei.NucleiResult{{TemplateID: "x"}}}, nil, 5},
 		{"network failure", nil, scanner.ErrNotWordPress, 2},
 	}
 	for _, c := range cases {
@@ -382,5 +384,108 @@ func TestRunScanFindingsExitCode(t *testing.T) {
 	code := runScan(srv.URL, scanOptions{dbPath: path, silent: true})
 	if code != 5 {
 		t.Errorf("findings exit code = %d, want 5", code)
+	}
+}
+
+// TestNucleiPipelineVerification drives the whole --nuclei pipeline with a
+// mock nuclei binary and a template directory in t.TempDir: minimal
+// findings with CVE ids resolve to templates, nuclei is invoked once, and
+// every match lands in res.Nuclei.
+func TestNucleiPipelineVerification(t *testing.T) {
+	tmp := t.TempDir()
+
+	templateDir := filepath.Join(tmp, "templates")
+	tpl := filepath.Join(templateDir, "http", "cves", "2026", "CVE-2026-8081.yaml")
+	if err := os.MkdirAll(filepath.Dir(tpl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tpl, []byte("id: CVE-2026-8081\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mock := filepath.Join(tmp, "nuclei-mock")
+	script := `#!/bin/sh
+printf '%s\n' '{"template-id":"CVE-2026-8081","info":{"name":"Elementor File Read","severity":"critical"},"matched-at":"https://host/wp-admin/","matcher-name":"y-word"}'
+`
+	if err := os.WriteFile(mock, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NUCLEI_BIN", mock)
+
+	res := &scanner.Result{
+		Target:      "https://host/",
+		IsWordPress: true,
+		Findings: []scanner.Finding{
+			{Slug: "elementor", Type: "plugin", InstalledVersion: "3.24.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{CVE: "CVE-2026-8081"},
+					{CVE: "CVE-2026-8081"}, // duplicate — must be collected once
+				}},
+			{Slug: "akismet", Type: "plugin", InstalledVersion: "4.0.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{CVE: ""}, // no CVE id — must be skipped
+				}},
+		},
+	}
+
+	verifyWithNuclei(res, scanOptions{nuclei: true, nucleiTemplateDir: templateDir, nucleiArgs: `-H "X-Api-Key: x"`})
+
+	if len(res.Nuclei) != 1 {
+		t.Fatalf("len(res.Nuclei) = %d, want 1: %+v", len(res.Nuclei), res.Nuclei)
+	}
+	got := res.Nuclei[0]
+	if got.TemplateID != "CVE-2026-8081" || got.CVE != "CVE-2026-8081" {
+		t.Errorf("TemplateID/CVE = %q/%q, want CVE-2026-8081", got.TemplateID, got.CVE)
+	}
+	if got.Severity != "critical" || got.Name != "Elementor File Read" {
+		t.Errorf("Severity/Name = %q/%q", got.Severity, got.Name)
+	}
+	if got.MatchedAt != "https://host/wp-admin/" || got.MatcherName != "y-word" {
+		t.Errorf("MatchedAt/MatcherName = %q/%q", got.MatchedAt, got.MatcherName)
+	}
+}
+
+// TestNucleiMissingBinaryWarns verifies the soft-fail path: no nuclei
+// binary anywhere → WARN on stderr, res.Nuclei untouched, no error.
+func TestNucleiMissingBinaryWarns(t *testing.T) {
+	t.Setenv("NUCLEI_BIN", "")
+	t.Setenv("PATH", filepath.Dir(t.TempDir()))
+
+	res := &scanner.Result{
+		Target:   "https://host/",
+		Findings: []scanner.Finding{{Vulnerabilities: []scanner.Vulnerability{{CVE: "CVE-2026-8081"}}}},
+	}
+	out := captureStderr(t, func() {
+		verifyWithNuclei(res, scanOptions{nuclei: true, nucleiTemplateDir: t.TempDir()})
+	})
+	if len(res.Nuclei) != 0 {
+		t.Errorf("res.Nuclei = %+v, want empty on soft fail", res.Nuclei)
+	}
+	if !strings.Contains(out, "[WARN] nuclei not found in PATH — skipping verification") {
+		t.Errorf("stderr = %q, want nuclei-not-found WARN", out)
+	}
+}
+
+// TestNucleiMissingTemplateWarns verifies the per-CVE soft fail: no
+// matching template file → WARN, other CVEs still verified.
+func TestNucleiMissingTemplateWarns(t *testing.T) {
+	mock := filepath.Join(t.TempDir(), "nuclei-mock")
+	if err := os.WriteFile(mock, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NUCLEI_BIN", mock)
+
+	res := &scanner.Result{
+		Target:   "https://host/",
+		Findings: []scanner.Finding{{Vulnerabilities: []scanner.Vulnerability{{CVE: "CVE-2026-8081"}}}},
+	}
+	out := captureStderr(t, func() {
+		verifyWithNuclei(res, scanOptions{nuclei: true, nucleiTemplateDir: t.TempDir()})
+	})
+	if len(res.Nuclei) != 0 {
+		t.Errorf("res.Nuclei = %+v, want empty when no template resolves", res.Nuclei)
+	}
+	if !strings.Contains(out, "[WARN] no nuclei template for CVE-2026-8081") {
+		t.Errorf("stderr = %q, want no-template WARN", out)
 	}
 }

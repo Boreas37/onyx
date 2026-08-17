@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/nuclei"
 	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/version"
 )
@@ -449,8 +450,9 @@ type Result struct {
 	WordPressVersion string     `json:"wordpress_version,omitempty"`
 	Evidence         []string   `json:"evidence,omitempty"`
 	Detected         []Detected `json:"detected,omitempty"`
-	Findings         []Finding  `json:"findings,omitempty"`
-	Users            []User     `json:"users,omitempty"`
+	Findings         []Finding                `json:"findings,omitempty"`
+	Nuclei           []nuclei.NucleiResult    `json:"nuclei,omitempty"`
+	Users            []User                   `json:"users,omitempty"`
 	XMLRPC           bool       `json:"xmlrpc,omitempty"` // xmlrpc.php ping answered
 	Interesting      []string   `json:"interesting,omitempty"`
 	ConfigBackups    []string   `json:"config_backups,omitempty"`
