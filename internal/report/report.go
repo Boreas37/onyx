@@ -2,6 +2,7 @@
 package report
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -170,4 +171,86 @@ func severityRank(rating string) int {
 	default:
 		return 0
 	}
+}
+
+// PrintJSONL prints res as JSON Lines: one compact JSON object per finding.
+func PrintJSONL(res *scanner.Result) {
+	enc := json.NewEncoder(os.Stdout)
+	for i := range res.Findings {
+		_ = enc.Encode(&res.Findings[i])
+	}
+}
+
+// sarifLevel maps a CVSS rating to a SARIF result level.
+func sarifLevel(rating string) string {
+	switch strings.ToLower(rating) {
+	case "critical", "high":
+		return "error"
+	case "medium":
+		return "warning"
+	case "low":
+		return "note"
+	default:
+		return "none"
+	}
+}
+
+// PrintSARIF writes res as a minimal SARIF 2.1.0 report: a single run whose
+// tool driver is "onyx" and whose results are the scan findings.
+func PrintSARIF(version string, res *scanner.Result) {
+	type location struct {
+		ArtifactLocation struct {
+			URI string `json:"uri"`
+		} `json:"artifactLocation"`
+	}
+	type result struct {
+		RuleID  string `json:"ruleId"`
+		Level   string `json:"level"`
+		Message struct {
+			Text string `json:"text"`
+		} `json:"message"`
+		Locations []location `json:"locations"`
+	}
+	type run struct {
+		Tool struct {
+			Driver struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			} `json:"driver"`
+		} `json:"tool"`
+		Results []result `json:"results"`
+	}
+	type sarif struct {
+		Schema  string `json:"$schema"`
+		Version string `json:"version"`
+		Runs    []run  `json:"runs"`
+	}
+
+	out := sarif{
+		Schema:  "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+		Version: "2.1.0",
+		Runs:    []run{{}},
+	}
+	out.Runs[0].Tool.Driver.Name = "onyx"
+	out.Runs[0].Tool.Driver.Version = version
+	for i := range res.Findings {
+		f := &res.Findings[i]
+		for _, v := range f.Vulnerabilities {
+			ruleID := v.CVE
+			if ruleID == "" {
+				ruleID = v.ID
+			}
+			r := result{
+				RuleID:    ruleID,
+				Level:     sarifLevel(v.Rating),
+				Locations: []location{{}},
+			}
+			r.Message.Text = v.Title
+			r.Locations[0].ArtifactLocation.URI = res.Target
+			out.Runs[0].Results = append(out.Runs[0].Results, r)
+		}
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
 }

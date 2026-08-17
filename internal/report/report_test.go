@@ -1,0 +1,133 @@
+package report
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/Boreas37/onyx/internal/scanner"
+)
+
+// sampleResult builds a small Result with two findings for output tests.
+func sampleResult() *scanner.Result {
+	return &scanner.Result{
+		Target:      "https://example.test",
+		IsWordPress: true,
+		Findings: []scanner.Finding{
+			{
+				Slug: "elementor", Name: "Elementor", Type: "plugin", InstalledVersion: "3.24.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{ID: "aaaaaaaa-0000-0000-0000-000000000001", CVE: "CVE-2024-0001",
+						Title: "Elementor < 3.25.0 - SQL Injection", CVSSScore: 9.1, Rating: "critical"},
+				},
+			},
+			{
+				Slug: "akismet", Name: "Akismet", Type: "plugin", InstalledVersion: "4.0.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{ID: "bbbbbbbb-0000-0000-0000-000000000002", CVE: "CVE-2024-0002",
+						Title: "Akismet < 5.0 - Stored XSS", CVSSScore: 6.1, Rating: "medium"},
+				},
+			},
+		},
+	}
+}
+
+// captureStdout runs fn with stdout redirected to a pipe and returns what
+// was written.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old }()
+	fn()
+	os.Stdout = old
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+func TestPrintJSONLWritesOneLinePerFinding(t *testing.T) {
+	out := captureStdout(t, func() { PrintJSONL(sampleResult()) })
+
+	sc := bufio.NewScanner(strings.NewReader(out))
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 JSON lines, got %d: %q", len(lines), out)
+	}
+	for i, ln := range lines {
+		var f scanner.Finding
+		if err := json.Unmarshal([]byte(ln), &f); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v", i, err)
+		}
+		if f.Slug == "" {
+			t.Fatalf("line %d missing slug: %s", i, ln)
+		}
+	}
+}
+
+func TestPrintSARIFMinimalStructure(t *testing.T) {
+	out := captureStdout(t, func() { PrintSARIF("0.1.0", sampleResult()) })
+
+	var doc struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Tool struct {
+				Driver struct {
+					Name    string `json:"name"`
+					Version string `json:"version"`
+				} `json:"driver"`
+			} `json:"tool"`
+			Results []struct {
+				RuleID  string `json:"ruleId"`
+				Level   string `json:"level"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("sarif output is not valid JSON: %v\n%s", err, out)
+	}
+	if doc.Version != "2.1.0" {
+		t.Errorf("sarif version = %q, want 2.1.0", doc.Version)
+	}
+	if len(doc.Runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(doc.Runs))
+	}
+	run := doc.Runs[0]
+	if run.Tool.Driver.Name != "onyx" {
+		t.Errorf("driver name = %q, want onyx", run.Tool.Driver.Name)
+	}
+	if run.Tool.Driver.Version != "0.1.0" {
+		t.Errorf("driver version = %q, want 0.1.0", run.Tool.Driver.Version)
+	}
+	if len(run.Results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(run.Results))
+	}
+	if run.Results[0].RuleID != "CVE-2024-0001" || run.Results[0].Level != "error" {
+		t.Errorf("result[0] = %+v, want CVE-2024-0001/error", run.Results[0])
+	}
+	if run.Results[1].Level != "warning" {
+		t.Errorf("result[1] level = %q, want warning", run.Results[1].Level)
+	}
+}
