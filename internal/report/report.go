@@ -126,45 +126,55 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 		} else {
 			fmt.Println("\nNo matching vulnerabilities found.")
 		}
-		return
-	}
+	} else {
+		if res.RateLimitHits > 0 {
+			fmt.Printf("Note: %d request(s) were rate limited (HTTP 429) — results may be incomplete. Try --rate-limit N or --stealth.\n", res.RateLimitHits)
+		}
 
-	if res.RateLimitHits > 0 {
-		fmt.Printf("Note: %d request(s) were rate limited (HTTP 429) — results may be incomplete. Try --rate-limit N or --stealth.\n", res.RateLimitHits)
-	}
-
-	fmt.Println()
-	if verbose {
-		for _, c := range comps {
-			for _, v := range c.vulns {
-				sev := severityColor(v.Rating)
-				cve := v.CVE
-				if cve == "" {
-					cve = v.ID
+		fmt.Println()
+		if verbose {
+			for _, c := range comps {
+				for _, v := range c.vulns {
+					sev := severityColor(v.Rating)
+					cve := v.CVE
+					if cve == "" {
+						cve = v.ID
+					}
+					fmt.Printf("[%s] [%s:%s:%s] %s (%s)\n",
+						sev, c.f.Type, c.f.Slug, c.f.InstalledVersion, v.Title, cve)
 				}
-				fmt.Printf("[%s] [%s:%s:%s] %s (%s)\n",
-					sev, c.f.Type, c.f.Slug, c.f.InstalledVersion, v.Title, cve)
+			}
+		} else {
+			// Compact summary: one line per component.
+			for _, c := range comps {
+				maxRank := 0
+				var worst scanner.Vulnerability
+				for _, v := range c.vulns {
+					if severityRank(v.Rating) > maxRank {
+						maxRank = severityRank(v.Rating)
+						worst = v
+					}
+				}
+				worstSev := severityColor(worst.Rating)
+				fmt.Printf("[%s] [%s:%s:%s] %d vulnerabilities (worst: %s)\n",
+					worstSev, c.f.Type, c.f.Slug, c.f.InstalledVersion, len(c.vulns), worst.Title)
 			}
 		}
 		fmt.Println()
-		return
 	}
 
-	// Compact summary: one line per component.
-	for _, c := range comps {
-		maxRank := 0
-		var worst scanner.Vulnerability
-		for _, v := range c.vulns {
-			if severityRank(v.Rating) > maxRank {
-				maxRank = severityRank(v.Rating)
-				worst = v
+	if len(res.Nuclei) > 0 {
+		fmt.Println("Nuclei verification:")
+		for _, n := range res.Nuclei {
+			id := n.CVE
+			if id == "" {
+				id = n.TemplateID
 			}
+			fmt.Printf("  [%s] [%s] %s (matched at %s)\n",
+				severityColor(n.Severity), strings.ToLower(id), n.Name, n.MatchedAt)
 		}
-		worstSev := severityColor(worst.Rating)
-		fmt.Printf("[%s] [%s:%s:%s] %d vulnerabilities (worst: %s)\n",
-			worstSev, c.f.Type, c.f.Slug, c.f.InstalledVersion, len(c.vulns), worst.Title)
+		fmt.Println()
 	}
-	fmt.Println()
 }
 
 // severityRank maps a rating to a numeric level for filtering/sorting.

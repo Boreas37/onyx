@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/nuclei"
 	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/report"
 	"github.com/Boreas37/onyx/internal/scanner"
@@ -89,6 +90,9 @@ type scanOptions struct {
 	cacheTTL            time.Duration
 	stream              bool
 	configPath          string
+	nuclei              bool
+	nucleiTemplateDir   string
+	nucleiArgs          string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -213,6 +217,14 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.cacheTTL = time.Duration(atoi(args[i], 0)) * time.Hour
 		case a == "--stream":
 			o.stream = true
+		case a == "--nuclei":
+			o.nuclei = true
+		case a == "--nuclei-template-dir" && i+1 < len(args):
+			i++
+			o.nucleiTemplateDir = args[i]
+		case a == "--nuclei-args" && i+1 < len(args):
+			i++
+			o.nucleiArgs = args[i]
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -353,6 +365,9 @@ Scan flags:
   --max-scan-duration D  stop the scan after D (Go duration format, e.g. 30s or 5m)
   --cache-ttl HOURS  cache HTTP responses on disk for HOURS (default: 0 = off; dir: ~/.cache/onyx/http or $ONYX_CACHE_DIR)
   --stream           emit findings as JSON Lines the moment they are found (implies --format jsonl)
+  --nuclei           verify findings against projectdiscovery templates (needs the nuclei binary)
+  --nuclei-template-dir PATH  template directory (default: ~/nuclei-templates or $NUCLEI_TEMPLATES_DIR)
+  --nuclei-args ARGS extra arguments passed to nuclei (shell-free split, quotes supported)
   --config FILE      JSON config file; explicit CLI flags win over config values
 `, defaultDB)
 }
@@ -463,6 +478,13 @@ func runScan(target string, o scanOptions) int {
 		pr.Finish()
 	}
 
+	// --nuclei: after the regular scan, verify every CVE from the findings
+	// with projectdiscovery templates. Hard failures degrade to WARNs — the
+	// scan result is never discarded because nuclei is missing or crashed.
+	if o.nuclei && res != nil {
+		verifyWithNuclei(res, o)
+	}
+
 	if o.output != "" {
 		if werr := writeScanOutput(o.output, res); werr != nil {
 			fmt.Fprintln(os.Stderr, "error writing output:", werr)
@@ -489,15 +511,127 @@ func runScan(target string, o scanOptions) int {
 
 // scanExitCode maps a scan outcome onto the onyx exit codes: 0 when the
 // scan completed with no findings (including non-WordPress targets), 5 when
-// findings were found, 2 on outright failure.
+// findings were found (by the scanner or by nuclei verification), 2 on
+// outright failure.
 func scanExitCode(res *scanner.Result, err error) int {
 	if err != nil && res == nil {
 		return 2
 	}
-	if len(res.Findings) > 0 {
+	if len(res.Findings) > 0 || len(res.Nuclei) > 0 {
 		return 5
 	}
 	return 0
+}
+
+// verifyWithNuclei drives the --nuclei pipeline after a scan: collect the
+// unique CVE ids from res.Findings, resolve one template per CVE, run the
+// nuclei binary once with all templates, and append every match to
+// res.Nuclei. Every failure along the way is soft — a WARN to stderr and a
+// skip, never an error.
+func verifyWithNuclei(res *scanner.Result, o scanOptions) {
+	seen := make(map[string]bool)
+	var cves []string
+	for i := range res.Findings {
+		for _, v := range res.Findings[i].Vulnerabilities {
+			if v.CVE == "" || seen[v.CVE] {
+				continue
+			}
+			seen[v.CVE] = true
+			cves = append(cves, v.CVE)
+		}
+	}
+	if len(cves) == 0 {
+		return
+	}
+
+	// Resolve the nuclei binary first: when it is missing the whole
+	// pipeline is skipped (soft fail) without spamming template WARNs.
+	if _, err := nuclei.NucleiBinary(); err != nil {
+		fmt.Fprintln(os.Stderr, "[WARN] nuclei not found in PATH — skipping verification")
+		return
+	}
+
+	dir := o.nucleiTemplateDir
+	if dir == "" {
+		dir = os.Getenv("NUCLEI_TEMPLATES_DIR")
+	}
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dir = filepath.Join(home, "nuclei-templates")
+		}
+	}
+	dir = expandHome(dir)
+
+	var templates []string
+	for _, cve := range cves {
+		tpl, ok := nuclei.FindTemplate(dir, cve)
+		if !ok {
+			fmt.Fprintf(os.Stderr, "[WARN] no nuclei template for %s\n", cve)
+			continue
+		}
+		templates = append(templates, tpl)
+	}
+	if len(templates) == 0 {
+		return
+	}
+
+	results, err := nuclei.Run(res.Target, templates, splitNucleiArgs(o.nucleiArgs))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] nuclei verification failed: %v — skipping verification\n", err)
+		return
+	}
+	res.Nuclei = results
+}
+
+// splitNucleiArgs splits a --nuclei-args string into direct exec arguments
+// (never through a shell). Whitespace separates arguments; double and
+// single quotes group words, e.g. `-H "X-Api-Key: x"` yields
+// [-H, X-Api-Key: x].
+func splitNucleiArgs(s string) []string {
+	var args []string
+	start := -1
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case ' ', '\t', '\r', '\n':
+			if start >= 0 {
+				args = append(args, s[start:i])
+				start = -1
+			}
+		default:
+			if start < 0 {
+				start = i
+			}
+		}
+	}
+	if start >= 0 {
+		args = append(args, s[start:])
+	}
+	return args
+}
+
+// expandHome replaces a leading ~/ (and bare ~) with the user's home
+// directory.
+func expandHome(p string) string {
+	if p == "~" {
+		home, _ := os.UserHomeDir()
+		return home
+	}
+	if strings.HasPrefix(p, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, p[2:])
+	}
+	return p
 }
 
 // writeScanOutput serializes res as indented JSON to path, creating the
