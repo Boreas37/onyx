@@ -15,6 +15,7 @@ import (
 
 	"github.com/Boreas37/onyx/internal/db"
 	"github.com/Boreas37/onyx/internal/nuclei"
+	"github.com/Boreas37/onyx/internal/pocs"
 	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/report"
 	"github.com/Boreas37/onyx/internal/scanner"
@@ -93,6 +94,8 @@ type scanOptions struct {
 	nuclei              bool
 	nucleiTemplateDir   string
 	nucleiArgs          string
+	pocTrackerDir       string
+	noPocs              bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -225,6 +228,11 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--nuclei-args" && i+1 < len(args):
 			i++
 			o.nucleiArgs = args[i]
+		case a == "--poc-tracker-dir" && i+1 < len(args):
+			i++
+			o.pocTrackerDir = args[i]
+		case a == "--no-pocs":
+			o.noPocs = true
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -368,6 +376,8 @@ Scan flags:
   --nuclei           verify findings against projectdiscovery templates (needs the nuclei binary)
   --nuclei-template-dir PATH  template directory (default: ~/nuclei-templates or $NUCLEI_TEMPLATES_DIR)
   --nuclei-args ARGS extra arguments passed to nuclei (shell-free split, quotes supported)
+  --poc-tracker-dir PATH  local clone of CVE-PoC-Tracker (default: ~/projects/cve-tracker or $POC_TRACKER_DIR)
+  --no-pocs          skip PoC reference lookup (nuclei findings only)
   --config FILE      JSON config file; explicit CLI flags win over config values
 `, defaultDB)
 }
@@ -483,6 +493,9 @@ func runScan(target string, o scanOptions) int {
 	// scan result is never discarded because nuclei is missing or crashed.
 	if o.nuclei && res != nil {
 		verifyWithNuclei(res, o)
+		if !o.noPocs {
+			collectPoCs(res, o)
+		}
 	}
 
 	if o.output != "" {
@@ -582,6 +595,61 @@ func verifyWithNuclei(res *scanner.Result, o scanOptions) {
 		return
 	}
 	res.Nuclei = results
+}
+
+// collectPoCs enriches nuclei findings with the top-5 most-starred PoC
+// repositories per CVE, looked up in a local clone of CVE-PoC-Tracker.
+// Every failure is soft: a missing tracker clone produces a WARN, a CVE
+// missing from the tracker is skipped silently, and unknown star counts
+// (GitHub API errors) fall back to 0 with the links still listed.
+func collectPoCs(res *scanner.Result, o scanOptions) {
+	if len(res.Nuclei) == 0 {
+		return
+	}
+	dir := o.pocTrackerDir
+	if dir == "" {
+		dir = os.Getenv("POC_TRACKER_DIR")
+	}
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dir = filepath.Join(home, "projects", "cve-tracker")
+		}
+	}
+	dir = expandHome(dir)
+	if dir == "" {
+		return
+	}
+	if _, err := os.Stat(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] CVE-PoC-Tracker not found at %s — skipping PoC lookup\n", dir)
+		return
+	}
+
+	seen := make(map[string]bool)
+	var cves []string
+	for _, n := range res.Nuclei {
+		if n.CVE == "" || seen[n.CVE] {
+			continue
+		}
+		seen[n.CVE] = true
+		cves = append(cves, n.CVE)
+	}
+	if len(cves) == 0 {
+		return
+	}
+
+	fetcher := pocs.NewFetcher(os.Getenv("GITHUB_TOKEN"))
+	for _, cve := range cves {
+		links := pocs.ExtractLinks(dir, cve)
+		if len(links) == 0 {
+			continue
+		}
+		top := pocs.TopByStars(fetcher.Fetch(links))
+		for i := range top {
+			top[i].CVE = cve
+		}
+		res.PoCs = append(res.PoCs, top...)
+	}
 }
 
 // splitNucleiArgs splits a --nuclei-args string into direct exec arguments
