@@ -23,6 +23,19 @@ That puts `onyx` in `$(go env GOPATH)/bin`. Make sure that's on your PATH.
 No runtime deps, one binary. Docker image is also published:
 `docker pull ghcr.io/boreas37/onyx:latest`.
 
+On macOS (or Linux) with Homebrew, from the onyx tap:
+
+```bash
+brew tap Boreas37/homebrew-onyx
+brew install onyx
+```
+
+(The tap repo is pending — the formula template lives in `docs/homebrew/`.)
+
+Release builds embed build metadata, visible via `onyx version --json`
+(commit SHA, build time, Go version, target OS/arch). See
+[`docs/SBOM.md`](docs/SBOM.md) for the supply-chain notes.
+
 ## Usage
 
 First, get the database:
