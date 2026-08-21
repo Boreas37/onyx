@@ -83,6 +83,7 @@ onyx scan https://example.com
 | `--multicall-max-passwords N` | Passwords per XML-RPC multicall request (default 3) |
 | `--wp-auth USER:PASS` | Authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (create one in wp-admin → Users → Profile → Application Passwords) |
 | `--no-brute` | Disable credential brute force (wp-login and XML-RPC) |
+| `--strict-wp` | Exit `3` when the target does not look like WordPress (default: warn, exit `0`) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -140,7 +141,13 @@ or missing tracker clone only print a `[WARN]` and the scan still completes.
 |---|---|
 | `0` | Scan finished, no vulnerable components found |
 | `5` | Vulnerabilities found |
+| `3` | Target does not look like WordPress (only with `--strict-wp`) |
 | `2` | Error (bad URL, unreachable target, missing DB) |
+
+By default a non-WordPress target is reported ("does not look like
+WordPress") and the scan exits `0`. Pass `--strict-wp` to make that case a
+distinct failure (`3`) — useful in CI so a misconfigured URL doesn't read as
+a clean pass.
 
 ## How it works
 

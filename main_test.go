@@ -382,20 +382,23 @@ func mustModTime(t *testing.T, path string) time.Time {
 func TestScanExitCodes(t *testing.T) {
 	someRes := &scanner.Result{IsWordPress: true}
 	findings := &scanner.Result{Findings: []scanner.Finding{{Slug: "x"}}}
+	notWP := &scanner.Result{IsWordPress: false}
 	cases := []struct {
-		name string
-		res  *scanner.Result
-		err  error
-		want int
+		name     string
+		res      *scanner.Result
+		err      error
+		strictWP bool
+		want     int
 	}{
-		{"clean scan", someRes, nil, 0},
-		{"not wordpress", &scanner.Result{IsWordPress: false}, scanner.ErrNotWordPress, 0},
-		{"findings", findings, nil, 5},
-		{"nuclei only", &scanner.Result{Nuclei: []nuclei.NucleiResult{{TemplateID: "x"}}}, nil, 5},
-		{"network failure", nil, scanner.ErrNotWordPress, 2},
+		{"clean scan", someRes, nil, false, 0},
+		{"not wordpress", notWP, scanner.ErrNotWordPress, false, 0},
+		{"not wordpress strict", notWP, scanner.ErrNotWordPress, true, 3},
+		{"findings", findings, nil, false, 5},
+		{"nuclei only", &scanner.Result{Nuclei: []nuclei.NucleiResult{{TemplateID: "x"}}}, nil, false, 5},
+		{"network failure", nil, scanner.ErrNotWordPress, true, 2},
 	}
 	for _, c := range cases {
-		if got := scanExitCode(c.res, c.err); got != c.want {
+		if got := scanExitCode(c.res, c.err, c.strictWP); got != c.want {
 			t.Errorf("%s: scanExitCode = %d, want %d", c.name, got, c.want)
 		}
 	}

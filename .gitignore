@@ -2,3 +2,4 @@ onyx
 *.test
 .wpscan-src/
 docs/GAP_*.md
+data/

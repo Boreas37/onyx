@@ -14,7 +14,20 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Boreas37/onyx/internal/sanitize"
 	"github.com/Boreas37/onyx/internal/version"
+)
+
+// Render-safety caps for feed-sourced strings. The mirror is semi-trusted;
+// these bounds keep a corrupted or poisoned feed from producing absurd or
+// control-character-laden report lines.
+const (
+	maxTitleLen       = 300
+	maxDescriptionLen = 2000
+	maxCVENLen        = 64
+	maxLabelLen       = 128
+	maxNameLen        = 200
+	maxSlugLen        = 200
 )
 
 // AffectedVersion is a single affected-version entry for a piece of
@@ -220,11 +233,16 @@ func Load(path string) (*DB, error) {
 		if raw.ID == "" {
 			raw.ID = key
 		}
+		// Feed data is semi-trusted (mirrored from Wordfence): strip control
+		// characters and cap the strings that get rendered into reports so a
+		// corrupted or poisoned mirror cannot forge output lines.
+		raw.Title = sanitize.Text(raw.Title, maxTitleLen)
+		raw.CVE = sanitize.Text(raw.CVE, maxCVENLen)
 		rec := Vuln{
 			ID:            raw.ID,
 			Title:         raw.Title,
 			Informational: raw.Informational,
-			Description:   raw.Description,
+			Description:   sanitize.Text(raw.Description, maxDescriptionLen),
 			CVE:           raw.CVE,
 			CVSS:          raw.CVSS,
 			PublishedAt:   raw.PublishedAt,
@@ -308,15 +326,16 @@ func decodeSoftware(rm json.RawMessage) (Software, bool) {
 		return Software{}, true
 	}
 	out := Software{
-		Type:            raw.Type,
-		Name:            raw.Name,
-		Slug:            raw.Slug,
+		Type:            sanitize.Text(raw.Type, 32),
+		Name:            sanitize.Text(raw.Name, maxNameLen),
+		Slug:            sanitize.Text(raw.Slug, maxSlugLen),
 		Patched:         raw.Patched,
 		PatchedVersions: raw.PatchedVersions,
-		Remediation:     raw.Remediation,
+		Remediation:     sanitize.Text(raw.Remediation, maxDescriptionLen),
 		AffectedVersions: make(map[string]AffectedVersion, len(raw.AffectedVersions)),
 	}
 	for label, ra := range raw.AffectedVersions {
+		label = sanitize.Text(label, maxLabelLen)
 		st := ra.FromVersion != "" || ra.ToVersion != ""
 		av := AffectedVersion{Label: label}
 		if st {

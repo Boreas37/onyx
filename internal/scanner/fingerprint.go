@@ -6,8 +6,8 @@ package scanner
 import (
 	"regexp"
 	"sort"
-	"strings"
-	"unicode"
+
+	"github.com/Boreas37/onyx/internal/sanitize"
 )
 
 const (
@@ -31,25 +31,11 @@ var (
 	passiveThemeRe  = regexp.MustCompile(`(?i)wp-content/themes/([a-z0-9_-]+)/`)
 )
 
-// sanitizeText makes a target-supplied string safe to embed in reports:
-// control characters (including ANSI escapes and newlines) are stripped so a
-// hostile server cannot forge report lines, and the result is truncated to
-// maxLen runes. Empty strings after cleaning return "".
+// sanitizeText makes a target-supplied string safe to embed in reports.
+// See the sanitize package for the rules; kept here as a thin wrapper so
+// call sites stay readable.
 func sanitizeText(s string, maxLen int) string {
-	if s == "" {
-		return ""
-	}
-	cleaned := strings.Map(func(r rune) rune {
-		if r == unicode.ReplacementChar || r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
-			return -1
-		}
-		return r
-	}, s)
-	r := []rune(cleaned)
-	if len(r) > maxLen {
-		r = r[:maxLen]
-	}
-	return string(r)
+	return sanitize.Text(s, maxLen)
 }
 
 // sanitizeVersion is sanitizeText with the tighter version-string cap.

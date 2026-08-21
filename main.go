@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -174,6 +175,7 @@ type scanOptions struct {
 	wpAuth              string
 	noBrute             bool
 	noSummary           bool
+	strictWP            bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -349,6 +351,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.noBrute = true
 		case a == "--no-summary":
 			o.noSummary = true
+		case a == "--strict-wp":
+			o.strictWP = true
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -529,6 +533,7 @@ Scan flags:
   --multicall-max-passwords N  passwords per XML-RPC multicall request (default: 3)
   --wp-auth USER:PASS  authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (wp-admin → Users → Profile → Application Passwords)
   --no-brute         disable credential brute force (wp-login and XML-RPC)
+  --strict-wp        exit with code 3 when the target does not look like WordPress (default: warn and continue)
   --config FILE      JSON config file; explicit CLI flags win over config values
 
 Update flags:
@@ -704,16 +709,20 @@ func runScan(target string, o scanOptions) int {
 			report.PrintSummary(res)
 		}
 	}
-	return scanExitCode(res, err)
+	return scanExitCode(res, err, o.strictWP)
 }
 
 // scanExitCode maps a scan outcome onto the onyx exit codes: 0 when the
 // scan completed with no findings (including non-WordPress targets), 5 when
-// findings were found (by the scanner or by nuclei verification), 2 on
-// outright failure.
-func scanExitCode(res *scanner.Result, err error) int {
+// findings were found (by the scanner or by nuclei verification), 3 when
+// --strict-wp is set and the target turned out not to be WordPress, and 2
+// on outright failure.
+func scanExitCode(res *scanner.Result, err error, strictWP bool) int {
 	if err != nil && res == nil {
 		return 2
+	}
+	if strictWP && errors.Is(err, scanner.ErrNotWordPress) {
+		return 3
 	}
 	if len(res.Findings) > 0 || len(res.Nuclei) > 0 {
 		return 5
