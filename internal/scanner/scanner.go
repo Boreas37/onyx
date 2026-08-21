@@ -1030,11 +1030,6 @@ func (s *Scanner) usersFromAPI() ([]User, []string) {
 	if code != http.StatusOK {
 		return nil, errs
 	}
-	var items []struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-		Slug string `json:"slug"`
-	}
 	// WordPress can prepend PHP Deprecated/Warning notices to the JSON
 	// payload; skip everything before the first '[' or '{' so the JSON
 	// decoder never sees the noise.
@@ -1049,18 +1044,33 @@ func (s *Scanner) usersFromAPI() ([]User, []string) {
 		errs = append(errs, "wp-json/wp/v2/users returned unparseable data")
 		return nil, errs
 	}
-	if err := json.Unmarshal(body[start:], &items); err != nil {
+	users := usersFromJSON(body[start:])
+	if users == nil {
 		errs = append(errs, "wp-json/wp/v2/users returned unparseable data")
 		return nil, errs
 	}
+	return users, nil
+}
+
+// usersFromJSON decodes a wp-json users payload into sanitized User entries.
+func usersFromJSON(body []byte) []User {
+	var items []struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	}
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil
+	}
 	var out []User
 	for _, it := range items {
-		if it.Slug == "" {
+		slug := sanitizeText(it.Slug, maxSlugLen)
+		if slug == "" {
 			continue
 		}
-		out = append(out, User{ID: it.ID, Slug: it.Slug, Name: it.Name})
+		out = append(out, User{ID: it.ID, Slug: slug, Name: sanitizeText(it.Name, maxNameLen)})
 	}
-	return out, nil
+	return out
 }
 
 // usersFromAuthors walks /?author=1..N following the redirect chain and
@@ -1107,7 +1117,7 @@ func (s *Scanner) authorLocation(n int) (string, []byte, error) {
 // or any /author/<slug>/ path mentioned in the page.
 func authorSlugFromBody(body []byte) string {
 	if m := authorSlugRe.FindStringSubmatch(string(body)); m != nil {
-		return m[1]
+		return sanitizeText(m[1], maxSlugLen)
 	}
 	return ""
 }
@@ -1124,10 +1134,10 @@ func authorSlugFromLocation(loc string) string {
 		return ""
 	}
 	if m := authorSlugRe.FindStringSubmatch(u.Path); m != nil {
-		return m[1]
+		return sanitizeText(m[1], maxSlugLen)
 	}
 	if m := authorSlugRe.FindStringSubmatch("/" + strings.TrimLeft(u.Path, "/")); m != nil {
-		return m[1]
+		return sanitizeText(m[1], maxSlugLen)
 	}
 	return ""
 }
@@ -1235,14 +1245,15 @@ func (s *Scanner) apiPlugins() ([]Detected, []string) {
 		if i := strings.IndexByte(slug, '/'); i >= 0 {
 			slug = slug[:i]
 		}
+		slug = sanitizeText(slug, maxSlugLen)
 		if slug == "" {
 			continue
 		}
-		ver := it.Version
+		ver := sanitizeVersion(it.Version)
 		if ver == "" {
 			ver = "unknown"
 		}
-		out = append(out, Detected{Slug: slug, Name: it.Name, Type: "plugin", Version: ver})
+		out = append(out, Detected{Slug: slug, Name: sanitizeText(it.Name, maxNameLen), Type: "plugin", Version: ver})
 	}
 	return out, nil
 }

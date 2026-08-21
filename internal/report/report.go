@@ -236,6 +236,22 @@ var csvHeader = []string{
 // WriteCSV writes res as CSV to w: one row per vulnerability with the
 // columns slug,type,installed_version,cve,severity,title,affected_versions.
 // Values containing commas (or quotes/newlines) are quoted by encoding/csv.
+// csvSafe neutralizes spreadsheet formula injection: a field that starts
+// with =, +, - or @ (or a tab/CR that Excel also treats as formula start)
+// gets a leading single quote so opening the CSV in Excel/Sheets cannot
+// execute it. Target-controlled fields (slugs, versions, titles from feeds)
+// make this reachable in practice.
+func csvSafe(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
+}
+
 func WriteCSV(w io.Writer, res *scanner.Result) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
@@ -245,12 +261,12 @@ func WriteCSV(w io.Writer, res *scanner.Result) error {
 		f := &res.Findings[i]
 		for _, v := range f.Vulnerabilities {
 			if err := cw.Write([]string{
-				f.Slug,
+				csvSafe(f.Slug),
 				f.Type,
-				f.InstalledVersion,
+				csvSafe(f.InstalledVersion),
 				v.CVE,
 				strings.ToLower(v.Rating),
-				v.Title,
+				csvSafe(v.Title),
 				strings.Join(v.AffectedLabels, "; "),
 			}); err != nil {
 				return err
