@@ -1190,23 +1190,8 @@ func update(dst, feed string, force bool) error {
 	if err := updateFromURL(dst, url, gz, feed, force); err != nil {
 		return err
 	}
-	// Signature verification is opt-in via --db-pubkey / $ONYX_DB_PUBKEY;
-	// when configured, an invalid or missing signature is a hard error —
-	// never a silent downgrade.
-	if pub := dbPubKeyPath(); pub != "" {
-		sig := url + ".minisig"
-		tmp := dst + ".verify"
-		if err := downloadToFile(sig, tmp); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("signature fetch (pubkey configured): %w", err)
-		}
-		defer os.Remove(tmp)
-		if err := dbupdate.VerifyMinisign(pub, tmp, dst); err != nil {
-			os.Remove(dst + ".sha256")
-			return fmt.Errorf("database signature verification FAILED: %w (database removed from trust: delete %s or update the key)", err, dst)
-		}
-		fmt.Println("update: signature verified")
-	}
+	// Signature verification happens inside updateFromURL, on the raw
+	// published artifact before unpacking.
 	return nil
 }
 
@@ -1243,6 +1228,25 @@ func downloadToFile(url, path string) error {
 		return err
 	}
 	return f.Close()
+}
+
+// copyFile copies the file at src to dst with 0o644 permissions,
+// replacing any existing content.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // manifestURL is where the mirror publishes its update manifest; deltas
@@ -1364,9 +1368,41 @@ func productionAssetURL() (string, error) {
 // when the digest matches a previous download the database file is not
 // rewritten. The feed name is recorded in dst+".feedtype" so scans can
 // report which feed produced the database.
+//
+// When $ONYX_DB_PUBKEY is set, the RAW published artifact (the exact bytes
+// on the mirror) is verified against url+".minisig" BEFORE unpacking —
+// signatures cover the artifact as published, not its decompressed form.
 func updateFromURL(dst, url string, gz bool, feed string, force bool) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
+	}
+
+	raw, err := os.CreateTemp(filepath.Dir(dst), ".onyx-raw-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(raw.Name())
+
+	checksum, err := downloadFeed(url, false, raw)
+	if err != nil {
+		return err
+	}
+	if cErr := raw.Close(); cErr != nil {
+		return cErr
+	}
+
+	// Signature gate: hard error when a pubkey is configured and the
+	// artifact is unsigned or fails verification.
+	if pub := dbPubKeyPath(); pub != "" {
+		sigTmp := raw.Name() + ".sig"
+		defer os.Remove(sigTmp)
+		if dErr := downloadToFile(url+".minisig", sigTmp); dErr != nil {
+			return fmt.Errorf("signature fetch (pubkey configured): %w", dErr)
+		}
+		if vErr := dbupdate.VerifyMinisign(pub, sigTmp, raw.Name()); vErr != nil {
+			return fmt.Errorf("database signature verification FAILED: %w (database removed from trust: delete %s or update the key)", vErr, dst)
+		}
+		fmt.Println("update: signature verified")
 	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".onyx-db-*")
@@ -1375,16 +1411,30 @@ func updateFromURL(dst, url string, gz bool, feed string, force bool) error {
 	}
 	defer os.Remove(tmp.Name())
 
-	checksum, err := downloadFeed(url, gz, tmp)
-	if err != nil {
-		return err
+	if gz {
+		rawFile, oErr := os.Open(raw.Name())
+		if oErr != nil {
+			return oErr
+		}
+		zr, gErr := gzip.NewReader(rawFile)
+		if gErr != nil {
+			rawFile.Close()
+			return fmt.Errorf("gzip: %w", gErr)
+		}
+		_, cErr := io.Copy(tmp, zr)
+		zr.Close()
+		rawFile.Close()
+		if cErr != nil {
+			return fmt.Errorf("unpack: %w", cErr)
+		}
+	} else if cErr := copyFile(raw.Name(), tmp.Name()); cErr != nil {
+		return cErr
 	}
 
 	// Incremental check: the same checksum as the last successful download
 	// means the feed has not changed — leave the database untouched.
 	if !force {
-		if prev, err := os.ReadFile(dst + ".sha256"); err == nil && strings.TrimSpace(string(prev)) == checksum {
-			tmp.Close()
+		if prev, rErr := os.ReadFile(dst + ".sha256"); rErr == nil && strings.TrimSpace(string(prev)) == checksum {
 			fmt.Printf("update: already up to date — %s\n", dst)
 			return nil
 		}
