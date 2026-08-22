@@ -693,6 +693,12 @@ type Vulnerability struct {
 	Description    string   `json:"description"`
 	AffectedLabels []string `json:"affected_versions"`
 	PublishedAt    string   `json:"published_at"`
+	// Epss is the EXPloit Prediction Scoring System probability (0..1)
+	// attached by the intel enrichment step; omitted when unknown.
+	Epss float64 `json:"epss,omitempty"`
+	// Kev reports whether the CVE is listed in the CISA Known Exploited
+	// Vulnerabilities catalog; omitted when false.
+	Kev bool `json:"kev,omitempty"`
 }
 
 // Finding links an installed component to its matching vulnerabilities.
