@@ -20,11 +20,14 @@ import (
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/dbupdate"
+	"github.com/Boreas37/onyx/internal/intel"
 	"github.com/Boreas37/onyx/internal/nuclei"
 	"github.com/Boreas37/onyx/internal/pocs"
 	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/report"
 	"github.com/Boreas37/onyx/internal/scanner"
+	"github.com/Boreas37/onyx/internal/watch"
 )
 
 const (
@@ -73,6 +76,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
 			os.Exit(2)
 		}
+	case "watch":
+		target, opts, wopts := parseWatchArgs(os.Args[2:])
+		if target == "" {
+			fmt.Fprintln(os.Stderr, "error: watch needs a target URL")
+			usage()
+			os.Exit(2)
+		}
+		os.Exit(runWatch(target, opts, wopts))
 	case "version":
 		if slices.Contains(os.Args[2:], "--json") {
 			fmt.Println(versionJSON())
@@ -176,6 +187,9 @@ type scanOptions struct {
 	noBrute             bool
 	noSummary           bool
 	strictWP            bool
+	crawlPages          int
+	failOn              string
+	noIntel             bool
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -353,6 +367,18 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.noSummary = true
 		case a == "--strict-wp":
 			o.strictWP = true
+		case a == "--crawl-pages" && i+1 < len(args):
+			i++
+			o.crawlPages = atoi(args[i], 25)
+		case a == "--fail-on" && i+1 < len(args):
+			i++
+			o.failOn = strings.ToLower(args[i])
+			if severityRankOf(o.failOn) == 0 {
+				fmt.Fprintf(os.Stderr, "error: invalid --fail-on %q (use critical, high, medium or low)\n", args[i])
+				os.Exit(2)
+			}
+		case a == "--no-intel":
+			o.noIntel = true
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -386,9 +412,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		}
 	}
 	switch o.format {
-	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv":
+	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx":
 	default:
-		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif or csv)\n", o.format)
+		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif, csv or cyclonedx)\n", o.format)
 		os.Exit(2)
 	}
 	return target, o
@@ -534,7 +560,16 @@ Scan flags:
   --wp-auth USER:PASS  authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (wp-admin → Users → Profile → Application Passwords)
   --no-brute         disable credential brute force (wp-login and XML-RPC)
   --strict-wp        exit with code 3 when the target does not look like WordPress (default: warn and continue)
+  --crawl-pages N    fetch N sitemap pages for passive plugin/theme discovery (default: 0 = off)
+  --fail-on SEV      only exit 5 when findings >= SEV exist (critical/high/medium/low); default: any finding
+  --no-intel         skip EPSS/CISA KEV enrichment
   --config FILE      JSON config file; explicit CLI flags win over config values
+
+Watch mode:
+  onyx watch URL [--interval D] [--webhook URL] [scan flags]
+  --interval D       re-scan every duration (30m, 1h); default: single compare-and-exit pass
+  --webhook URL      POST a JSON change report when new/resolved vulnerabilities appear
+  --state-dir DIR    where baselines are stored (default: user cache dir /onyx/watch)
 
 Update flags:
   --db PATH          destination database file (default: %s)
@@ -575,12 +610,6 @@ func runScan(target string, o scanOptions) int {
 		report.PrintBanner(onyxVersion, database.Count())
 	}
 
-	// --timeout stays as an alias for --request-timeout.
-	reqTimeout := o.requestTimeout
-	if reqTimeout == 0 {
-		reqTimeout = o.timeout
-	}
-
 	// --stream: findings are emitted as JSON Lines the moment they are
 	// found (only meaningful with --format jsonl).
 	var findings chan scanner.Finding
@@ -597,7 +626,155 @@ func runScan(target string, o scanOptions) int {
 		}()
 	}
 
-	sc, err := scanner.NewScanner(database, target, scanner.Options{
+	sc, err := scanner.NewScanner(database, target, scannerOptionsFrom(o, findings))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+
+	// Progress bar is on by default (a single live line showing a
+	// percentage bar — no per-request noise). --silent disables it.
+	if !o.silent {
+		bar := progress.New(os.Stderr, false)
+		sc.SetProgress(bar)
+	}
+
+	res, err := sc.Scan()
+	if streamDone != nil {
+		<-streamDone
+	}
+	if res != nil && res.TimedOut {
+		spec := o.maxScanDurationSpec
+		if spec == "" {
+			spec = o.maxScanDuration.String()
+		}
+		fmt.Fprintf(os.Stderr, "[WARN] scan timed out after %s — results may be incomplete\n", spec)
+	}
+	if err != nil && res == nil {
+		fmt.Fprintln(os.Stderr, "scan failed:", err)
+		return 2
+	}
+
+	if pr := sc.Progress(); pr != nil {
+		pr.Finish()
+	}
+
+	// EPSS/KEV enrichment: annotate every finding with exploitation
+	// intelligence and sort by real-world priority (KEV first, then EPSS,
+	// then CVSS). Fully optional — offline or a broken feed degrades to a
+	// WARN and the raw findings are still reported.
+	if !o.noIntel && res != nil && len(res.Findings) > 0 {
+		enrichFindings(res)
+	}
+
+	// --nuclei: after the regular scan, verify every CVE from the findings
+	// with projectdiscovery templates. Hard failures degrade to WARNs — the
+	// scan result is never discarded because nuclei is missing or crashed.
+	if o.nuclei && res != nil {
+		verifyWithNuclei(res, o)
+		if !o.noPocs {
+			collectPoCs(res, o)
+		}
+	}
+
+	if o.output != "" {
+		if werr := writeScanOutput(o.output, res, o.format); werr != nil {
+			fmt.Fprintln(os.Stderr, "error writing output:", werr)
+		} else if pr := sc.Progress(); pr != nil {
+			pr.LogInf("results written to %s", o.output)
+		}
+	}
+
+	switch o.format {
+	case "json":
+		out, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Println(string(out))
+	case "jsonl":
+		if !o.stream {
+			report.PrintJSONL(res)
+		}
+	case "sarif":
+		report.PrintSARIF(onyxVersion, res)
+	case "csv":
+		report.PrintCSV(res)
+	case "cyclonedx":
+		report.PrintCycloneDX(onyxVersion, res)
+	case "cli-no-colour":
+		report.NoColor = true
+		report.PrintTable(res, o.verbose, o.minSeverity)
+		if !o.noSummary {
+			report.PrintSummary(res)
+		}
+	default:
+		report.PrintTable(res, o.verbose, o.minSeverity)
+		if !o.noSummary {
+			report.PrintSummary(res)
+		}
+	}
+	return scanExitCode(res, err, o.strictWP, o.failOn)
+}
+
+// severityRankOf maps a severity name to a rank (critical=4 … low=1);
+// unknown names return 0.
+func severityRankOf(sev string) int {
+	switch strings.ToLower(sev) {
+	case "critical":
+		return 4
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	case "low":
+		return 1
+	}
+	return 0
+}
+
+// scanExitCode maps a scan outcome onto the onyx exit codes: 0 when the
+// scan completed with no qualifying findings (including non-WordPress
+// targets), 5 when findings were found (by the scanner or by nuclei
+// verification), 3 when --strict-wp is set and the target turned out not
+// to be WordPress, and 2 on outright failure. failOn raises the bar for
+// exit 5: only findings at or above that severity count ("high" is the
+// typical CI choice); an empty failOn keeps the old any-finding behavior.
+func scanExitCode(res *scanner.Result, err error, strictWP bool, failOn string) int {
+	if err != nil && res == nil {
+		return 2
+	}
+	if strictWP && errors.Is(err, scanner.ErrNotWordPress) {
+		return 3
+	}
+	// Nuclei-verified hits always count as failures: they are confirmed
+	// exploitations, not version-inference guesses.
+	if len(res.Nuclei) > 0 {
+		return 5
+	}
+	if len(res.Findings) == 0 {
+		return 0
+	}
+	if rank := severityRankOf(failOn); rank > 0 {
+		for i := range res.Findings {
+			f := &res.Findings[i]
+			for _, v := range f.Vulnerabilities {
+				if severityRankOf(strings.ToLower(v.Rating)) >= rank {
+					return 5
+				}
+			}
+		}
+		return 0
+	}
+	return 5
+}
+
+// scannerOptionsFrom translates parsed CLI options into the scanner's
+// Options struct; shared by `scan` and `watch` so both honor the same
+// flags. findings may be nil (no streaming).
+func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Options {
+	reqTimeout := o.requestTimeout
+	if reqTimeout == 0 {
+		reqTimeout = o.timeout
+	}
+	return scanner.Options{
 		Threads:             o.threads,
 		Timeout:             time.Duration(o.timeout) * time.Second,
 		ConnectTimeout:      time.Duration(o.connectTimeout) * time.Second,
@@ -634,100 +811,152 @@ func runScan(target string, o scanOptions) int {
 		WPAuth:              o.wpAuth,
 		NoBrute:             o.noBrute,
 		NoSummary:           o.noSummary,
-	})
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 2
+		CrawlPages:          o.crawlPages,
 	}
-
-	// Progress bar is on by default (a single live line showing a
-	// percentage bar — no per-request noise). --silent disables it.
-	if !o.silent {
-		bar := progress.New(os.Stderr, false)
-		sc.SetProgress(bar)
-	}
-
-	res, err := sc.Scan()
-	if streamDone != nil {
-		<-streamDone
-	}
-	if res != nil && res.TimedOut {
-		spec := o.maxScanDurationSpec
-		if spec == "" {
-			spec = o.maxScanDuration.String()
-		}
-		fmt.Fprintf(os.Stderr, "[WARN] scan timed out after %s — results may be incomplete\n", spec)
-	}
-	if err != nil && res == nil {
-		fmt.Fprintln(os.Stderr, "scan failed:", err)
-		return 2
-	}
-
-	if pr := sc.Progress(); pr != nil {
-		pr.Finish()
-	}
-
-	// --nuclei: after the regular scan, verify every CVE from the findings
-	// with projectdiscovery templates. Hard failures degrade to WARNs — the
-	// scan result is never discarded because nuclei is missing or crashed.
-	if o.nuclei && res != nil {
-		verifyWithNuclei(res, o)
-		if !o.noPocs {
-			collectPoCs(res, o)
-		}
-	}
-
-	if o.output != "" {
-		if werr := writeScanOutput(o.output, res, o.format); werr != nil {
-			fmt.Fprintln(os.Stderr, "error writing output:", werr)
-		} else if pr := sc.Progress(); pr != nil {
-			pr.LogInf("results written to %s", o.output)
-		}
-	}
-
-	switch o.format {
-	case "json":
-		out, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Println(string(out))
-	case "jsonl":
-		if !o.stream {
-			report.PrintJSONL(res)
-		}
-	case "sarif":
-		report.PrintSARIF(onyxVersion, res)
-	case "csv":
-		report.PrintCSV(res)
-	case "cli-no-colour":
-		report.NoColor = true
-		report.PrintTable(res, o.verbose, o.minSeverity)
-		if !o.noSummary {
-			report.PrintSummary(res)
-		}
-	default:
-		report.PrintTable(res, o.verbose, o.minSeverity)
-		if !o.noSummary {
-			report.PrintSummary(res)
-		}
-	}
-	return scanExitCode(res, err, o.strictWP)
 }
 
-// scanExitCode maps a scan outcome onto the onyx exit codes: 0 when the
-// scan completed with no findings (including non-WordPress targets), 5 when
-// findings were found (by the scanner or by nuclei verification), 3 when
-// --strict-wp is set and the target turned out not to be WordPress, and 2
-// on outright failure.
-func scanExitCode(res *scanner.Result, err error, strictWP bool) int {
-	if err != nil && res == nil {
-		return 2
+// enrichFindings pulls the cached EPSS scores and CISA KEV catalog
+// (downloading them into the user cache dir when stale) and reorders
+// res.Findings by exploitation priority. Every failure mode is soft: a
+// warning on stderr, un-enriched but still correct findings.
+func enrichFindings(res *scanner.Result) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = os.TempDir()
 	}
-	if strictWP && errors.Is(err, scanner.ErrNotWordPress) {
-		return 3
+	cacheDir := filepath.Join(base, "onyx", "intel")
+	in, warns, err := intel.Load(cacheDir, http.DefaultClient, time.Now())
+	for _, w := range warns {
+		fmt.Fprintf(os.Stderr, "[WARN] intel: %s\n", w)
 	}
-	if len(res.Findings) > 0 || len(res.Nuclei) > 0 {
-		return 5
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] intel unavailable (%v) — findings are not EPSS/KEV-annotated\n", err)
+		return
 	}
-	return 0
+	intel.Enrich(res.Findings, in)
+}
+
+// watchOptions are the flags unique to `onyx watch`.
+type watchOptions struct {
+	interval time.Duration
+	webhook  string
+	stateDir string
+}
+
+// parseWatchArgs parses `watch` arguments. A subset of scan flags is
+// honored for the underlying scan; --interval loops forever when > 0,
+// the default (0) runs a single compare-and-exit pass.
+func parseWatchArgs(args []string) (target string, o scanOptions, w watchOptions) {
+	o.dbPath = defaultDB
+	o.threads = 5
+	o.maxReq = 500
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--interval" && i+1 < len(args):
+			i++
+			d, err := time.ParseDuration(args[i])
+			if err != nil || d <= 0 {
+				fmt.Fprintf(os.Stderr, "error: invalid --interval %q (use e.g. 30m, 1h)\n", args[i])
+				os.Exit(2)
+			}
+			w.interval = d
+		case a == "--webhook" && i+1 < len(args):
+			i++
+			w.webhook = args[i]
+		case a == "--state-dir" && i+1 < len(args):
+			i++
+			w.stateDir = args[i]
+		case a == "--db" && i+1 < len(args):
+			i++
+			o.dbPath = args[i]
+		case a == "--threads" && i+1 < len(args):
+			i++
+			o.threads = atoi(args[i], 5)
+		case a == "--max-requests" && i+1 < len(args):
+			i++
+			o.maxReq = atoi(args[i], 500)
+		case a == "--enumerate" && i+1 < len(args):
+			i++
+			o.enumerate = args[i]
+		case a == "--silent":
+			o.silent = true
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintln(os.Stderr, "unknown flag:", a)
+			os.Exit(2)
+		default:
+			if target == "" {
+				target = a
+			}
+		}
+	}
+	return target, o, w
+}
+
+// runWatch drives recurring scans with baseline diffing: every pass scans
+// the target, diffs the findings against the stored state, reports new and
+// resolved vulnerabilities, optionally POSTs a webhook on changes, and —
+// when --interval is set — sleeps and repeats. Exit codes: 0 on success,
+// 2 on hard failure.
+func runWatch(target string, o scanOptions, w watchOptions) int {
+	stateDir := w.stateDir
+	if stateDir == "" {
+		base, err := os.UserCacheDir()
+		if err != nil {
+			base = os.TempDir()
+		}
+		stateDir = filepath.Join(base, "onyx", "watch")
+	}
+
+	pass := 0
+	for {
+		pass++
+		database, err := db.Load(o.dbPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error loading database:", err)
+			return 2
+		}
+		sc, err := scanner.NewScanner(database, target, scannerOptionsFrom(o, nil))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 2
+		}
+		if !o.silent {
+			sc.SetProgress(progress.New(os.Stderr, false))
+		}
+		res, err := sc.Scan()
+		if pr := sc.Progress(); pr != nil {
+			pr.Finish()
+		}
+		if err != nil && res == nil {
+			fmt.Fprintln(os.Stderr, "scan failed:", err)
+			return 2
+		}
+		if !o.noIntel && res != nil && len(res.Findings) > 0 {
+			enrichFindings(res)
+		}
+
+		diff, err := watch.Run(target, res, watch.Options{
+			StateDir: stateDir,
+			Webhook:  w.webhook,
+		}, time.Now())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "watch error:", err)
+			return 2
+		}
+		fmt.Printf("[%s] %s\n", time.Now().UTC().Format("2006-01-02T15:04:05Z"), diff.Summary())
+		if !diff.Empty() {
+			watch.PrintDiff(diff)
+		} else if w.webhook != "" && pass == 1 && !o.silent {
+			// Run() already notified on first-run baselines; nothing else to do.
+			_ = diff
+		}
+
+		if w.interval <= 0 {
+			return 0
+		}
+		time.Sleep(w.interval)
+	}
 }
 
 // verifyWithNuclei drives the --nuclei pipeline after a scan: collect the
@@ -937,6 +1166,18 @@ func update(dst, feed string, force bool) error {
 	case feedScanner:
 		url, gz = scannerFeedURL, false
 	case feedProduction:
+		// Fast path: when a delta from the locally installed version is
+		// available on the mirror, apply it instead of re-downloading the
+		// whole 151MB feed. Any problem along the way falls back to the
+		// classic full download, so this can never make update worse.
+		if !force {
+			done, err := updateViaDelta(dst)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[WARN] delta update unavailable (%v) — falling back to full download\n", err)
+			} else if done {
+				return nil
+			}
+		}
 		var err error
 		url, err = productionAssetURL()
 		if err != nil {
@@ -946,7 +1187,121 @@ func update(dst, feed string, force bool) error {
 	default:
 		return fmt.Errorf("unknown feed %q (use production or scanner)", feed)
 	}
-	return updateFromURL(dst, url, gz, feed, force)
+	if err := updateFromURL(dst, url, gz, feed, force); err != nil {
+		return err
+	}
+	// Signature verification is opt-in via --db-pubkey / $ONYX_DB_PUBKEY;
+	// when configured, an invalid or missing signature is a hard error —
+	// never a silent downgrade.
+	if pub := dbPubKeyPath(); pub != "" {
+		sig := url + ".minisig"
+		tmp := dst + ".verify"
+		if err := downloadToFile(sig, tmp); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("signature fetch (pubkey configured): %w", err)
+		}
+		defer os.Remove(tmp)
+		if err := dbupdate.VerifyMinisign(pub, tmp, dst); err != nil {
+			os.Remove(dst + ".sha256")
+			return fmt.Errorf("database signature verification FAILED: %w (database removed from trust: delete %s or update the key)", err, dst)
+		}
+		fmt.Println("update: signature verified")
+	}
+	return nil
+}
+
+// dbPubKeyPath returns the minisign public key path configured for
+// database signature verification, or "" when verification is off.
+func dbPubKeyPath() string {
+	if v := os.Getenv("ONYX_DB_PUBKEY"); v != "" {
+		return v
+	}
+	return ""
+}
+
+// downloadToFile streams url into path without any re-encoding.
+func downloadToFile(url, path string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "onyx")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+// manifestURL is where the mirror publishes its update manifest; deltas
+// are keyed by the sha256 of the local file they patch.
+const manifestURL = "https://raw.githubusercontent.com/" + productionRepo + "/main/manifest.json"
+
+// updateViaDelta tries the incremental update path: read the local
+// checksum, fetch the mirror manifest, and when a delta exists for the
+// installed version, download + apply it. Returns done=true when the
+// database was updated (or already current per the manifest), false when
+// a full download should proceed. The result's checksum is taken from the
+// manifest so subsequent runs keep chaining deltas.
+func updateViaDelta(dst string) (bool, error) {
+	prevBytes, err := os.ReadFile(dst + ".sha256")
+	if err != nil || strings.TrimSpace(string(prevBytes)) == "" {
+		return false, fmt.Errorf("no local checksum to delta from")
+	}
+	localSHA := strings.TrimSpace(string(prevBytes))
+
+	m, err := dbupdate.FetchManifest(http.DefaultClient, manifestURL)
+	if err != nil {
+		return false, fmt.Errorf("manifest: %w", err)
+	}
+	if m.Full.Sha256 == localSHA {
+		fmt.Printf("update: already up to date — %s\n", dst)
+		return true, nil
+	}
+	var entry *dbupdate.DeltaEntry
+	for i := range m.Deltas {
+		if m.Deltas[i].FromSha256 == localSHA {
+			entry = &m.Deltas[i]
+			break
+		}
+	}
+	if entry == nil {
+		return false, fmt.Errorf("no delta from the installed version")
+	}
+
+	deltaPath := dst + ".delta.tmp"
+	defer os.Remove(deltaPath)
+	if err := downloadToFile(entry.Path, deltaPath); err != nil {
+		return false, fmt.Errorf("delta download: %w", err)
+	}
+	outPath := dst + ".delta-out.tmp"
+	defer os.Remove(outPath)
+	st, err := dbupdate.ApplyDelta(dst, deltaPath, outPath)
+	if err != nil {
+		return false, fmt.Errorf("delta apply: %w", err)
+	}
+	if err := os.Rename(outPath, dst); err != nil {
+		return false, fmt.Errorf("rename: %w", err)
+	}
+	checksum := m.Full.Sha256
+	_ = os.WriteFile(dst+".sha256", []byte(checksum+"\n"), 0o644)
+	if ft, err := os.ReadFile(dst + ".feedtype"); err == nil && strings.TrimSpace(string(ft)) != "" {
+		_ = os.WriteFile(dst+".feedtype", ft, 0o644)
+	} else {
+		_ = os.WriteFile(dst+".feedtype", []byte(feedProduction+"\n"), 0o644)
+	}
+	fmt.Printf("update: applied delta (+%d -%d ~%d) — %s\n", st.Added, st.Removed, st.Updated, dst)
+	return true, nil
 }
 
 // productionAssetURL resolves the browser download URL of the production

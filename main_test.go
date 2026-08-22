@@ -381,24 +381,39 @@ func mustModTime(t *testing.T, path string) time.Time {
 
 func TestScanExitCodes(t *testing.T) {
 	someRes := &scanner.Result{IsWordPress: true}
-	findings := &scanner.Result{Findings: []scanner.Finding{{Slug: "x"}}}
+	findings := &scanner.Result{Findings: []scanner.Finding{{
+		Slug: "x",
+		Vulnerabilities: []scanner.Vulnerability{
+			{CVE: "CVE-2026-0001", Rating: "medium"},
+			{CVE: "CVE-2026-0002", Rating: "low"},
+		},
+	}}}
+	high := &scanner.Result{Findings: []scanner.Finding{{
+		Slug: "y",
+		Vulnerabilities: []scanner.Vulnerability{{CVE: "CVE-2026-0003", Rating: "High"}},
+	}}}
 	notWP := &scanner.Result{IsWordPress: false}
 	cases := []struct {
 		name     string
 		res      *scanner.Result
 		err      error
 		strictWP bool
+		failOn   string
 		want     int
 	}{
-		{"clean scan", someRes, nil, false, 0},
-		{"not wordpress", notWP, scanner.ErrNotWordPress, false, 0},
-		{"not wordpress strict", notWP, scanner.ErrNotWordPress, true, 3},
-		{"findings", findings, nil, false, 5},
-		{"nuclei only", &scanner.Result{Nuclei: []nuclei.NucleiResult{{TemplateID: "x"}}}, nil, false, 5},
-		{"network failure", nil, scanner.ErrNotWordPress, true, 2},
+		{"clean scan", someRes, nil, false, "", 0},
+		{"not wordpress", notWP, scanner.ErrNotWordPress, false, "", 0},
+		{"not wordpress strict", notWP, scanner.ErrNotWordPress, true, "", 3},
+		{"findings", findings, nil, false, "", 5},
+		{"fail-on below max", findings, nil, false, "high", 0},
+		{"fail-on at max", findings, nil, false, "medium", 5},
+		{"fail-on low catches all", findings, nil, false, "low", 5},
+		{"high finding passes gate", high, nil, false, "high", 5},
+		{"nuclei only", &scanner.Result{Nuclei: []nuclei.NucleiResult{{TemplateID: "x"}}}, nil, false, "high", 5},
+		{"network failure", nil, scanner.ErrNotWordPress, true, "", 2},
 	}
 	for _, c := range cases {
-		if got := scanExitCode(c.res, c.err, c.strictWP); got != c.want {
+		if got := scanExitCode(c.res, c.err, c.strictWP, c.failOn); got != c.want {
 			t.Errorf("%s: scanExitCode = %d, want %d", c.name, got, c.want)
 		}
 	}

@@ -84,6 +84,9 @@ onyx scan https://example.com
 | `--wp-auth USER:PASS` | Authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (create one in wp-admin → Users → Profile → Application Passwords) |
 | `--no-brute` | Disable credential brute force (wp-login and XML-RPC) |
 | `--strict-wp` | Exit `3` when the target does not look like WordPress (default: warn, exit `0`) |
+| `--crawl-pages N` | Fetch N pages from the target's sitemap and mine them for plugin/theme references + `?ver=` versions (default 0 = off) |
+| `--fail-on SEV` | Exit `5` only when a finding is `SEV` or worse (`critical`/`high`/`medium`/`low`); default: any finding. Nuclei-verified hits always exit `5` |
+| `--no-intel` | Skip EPSS / CISA KEV enrichment (enabled by default; findings are annotated and sorted by exploitation priority) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -139,8 +142,8 @@ or missing tracker clone only print a `[WARN]` and the scan still completes.
 
 | Code | Meaning |
 |---|---|
-| `0` | Scan finished, no vulnerable components found |
-| `5` | Vulnerabilities found |
+| `0` | Scan finished, no qualifying vulnerable components found |
+| `5` | Vulnerabilities found (with `--fail-on SEV`: at least one at `SEV` or worse) |
 | `3` | Target does not look like WordPress (only with `--strict-wp`) |
 | `2` | Error (bad URL, unreachable target, missing DB) |
 
@@ -149,25 +152,71 @@ WordPress") and the scan exits `0`. Pass `--strict-wp` to make that case a
 distinct failure (`3`) — useful in CI so a misconfigured URL doesn't read as
 a clean pass.
 
+## Watch mode
+
+```bash
+onyx watch https://example.com --interval 1h --webhook https://hooks.example/xyz
+```
+
+Every pass scans the target and diffs the findings against the previous
+run's baseline (stored under the user cache dir, `--state-dir` to override):
+
+```
+[2026-08-22T14:47:23Z] 0 new, 0 resolved, 12 unchanged
+```
+
+New vulnerabilities print under "New vulnerabilities:", fixed ones under
+"Resolved:". When anything changes and `--webhook` is set, onyx POSTs a JSON
+report (`target`, `summary`, `new[]`, `resolved[]`). Without `--interval`,
+watch runs a single compare-and-exit pass — handy for CI drift checks.
+Scan flags like `--db`, `--threads`, `--enumerate`, `--max-requests` are
+honored.
+
+## Exploitation intelligence
+
+By default every finding is annotated with its EPSS score (probability of
+exploitation in the wild) and CISA KEV membership, then findings are sorted
+by that priority: KEV-confirmed first, highest EPSS next. The data lives in
+the user cache dir and refreshes daily; offline scans fall back to the last
+cached copy with a warning, and `--no-intel` skips enrichment entirely.
+
+## Component inventory output
+
+`--format cyclonedx` emits the detected plugins/themes as a CycloneDX 1.5
+SBOM (`components[]` with name/version), ready for dependency tracking
+pipelines.
+
 ## How it works
 
 1. Fetch the homepage, `/wp-login.php` and the REST API root. If the target
    can't be reached at all, it stops with an error (exit 2).
 2. **Passive detection:** scan the homepage HTML for `wp-content/plugins/…`
    and `wp-content/themes/…` references — anything the page mentions gets
-   checked, with no extra requests (same trick WPScan uses).
+   checked, with no extra requests (same trick WPScan uses). `?ver=`
+   parameters on plugin/theme assets are read as version hints, so many
+   components get a version without any probing.
 3. **Aggressive enumeration:** walk the most vuln-heavy plugin and theme
    slugs from the database (top 200 by default, raise with
    `--max-requests`), fetch their `readme.txt` / `style.css`, and read the
    version out of it. Supply your own lists with `--plugins-list FILE` /
    `--themes-list FILE`.
+4. **Sitemap discovery** (`--crawl-pages N`): fetch pages from the
+   target's sitemap (`/wp-sitemap.xml`, falling back to `/sitemap.xml`,
+   one index level deep) and run passive detection over each — sites whose
+   homepage is minimal often expose different plugins on inner pages.
+5. **Core fingerprinting:** the WordPress version comes from whichever
+   source answers first: the generator meta tag, the RSS feed generator,
+   or `wp-links-opml.php`. The winning source is reported in JSON output
+   under `core_evidence`.
 4. Enumerate users (`--enumerate u`): read `/wp-json/wp/v2/users` when it's
    parseable, then walk `/?author=N` redirect chains to `/author/<slug>/`,
    including subdirectory multisite installs (`/blog/author/<slug>/`).
 5. Probe for interesting leftovers: `robots.txt`, `readme.html`, `debug.log`,
    `xmlrpc.php`, upload directory listing, `wp-config.php.bak`,
    `wp-includes/version.php`. Optional `--checks cb,dbe,timthumb` digs for
-   config backups and database dumps.
+   config backups and database dumps. Cache-layer headers (LiteSpeed,
+   WP Super Cache, W3TC, Varnish, …) and an exposed `mu-plugins/` listing
+   are reported as interesting finds too.
 6. Compare each installed version against the affected ranges in the
    database, and report anything that matches.
 
@@ -193,6 +242,19 @@ which is licensed free for personal and commercial use, including
 redistribution. The mirror lives in the
 [`onyx-db`](https://github.com/Boreas37/onyx-db) repository, updated daily.
 See its README for the license terms.
+
+### Incremental updates and signatures
+
+`onyx update` first checks the mirror's `manifest.json`: when it publishes
+a delta from the checksum you have on disk, only that changeset (a few KB)
+is downloaded and applied — the full 151 MB feed transfers only on the
+first run or when no delta applies. Any manifest/delta problem falls back
+to the full download with a warning, so updates never get *worse*.
+
+For supply-chain hardening, point `ONYX_DB_PUBKEY` at a minisign public
+key; update then verifies the feed signature (`<asset>.minisig`) after
+every download and refuses to bless a database that fails verification —
+a missing or bad signature is a hard error, not a warning.
 
 ## Roadmap
 
