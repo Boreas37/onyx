@@ -1286,6 +1286,19 @@ func updateViaDelta(dst string) (bool, error) {
 	if err := downloadToFile(entry.Path, deltaPath); err != nil {
 		return false, fmt.Errorf("delta download: %w", err)
 	}
+	// Signature verification for deltas mirrors the full-download path:
+	// when a pubkey is configured a missing or bad signature is a hard
+	// error — never a silent downgrade.
+	if pub := dbPubKeyPath(); pub != "" {
+		sigPath := dst + ".delta.sig.tmp"
+		defer os.Remove(sigPath)
+		if dErr := downloadToFile(entry.Path+".minisig", sigPath); dErr != nil {
+			return false, fmt.Errorf("delta signature fetch (pubkey configured): %w", dErr)
+		}
+		if vErr := dbupdate.VerifyMinisign(pub, sigPath, deltaPath); vErr != nil {
+			return false, fmt.Errorf("delta signature verification FAILED: %w", vErr)
+		}
+	}
 	outPath := dst + ".delta-out.tmp"
 	defer os.Remove(outPath)
 	st, err := dbupdate.ApplyDelta(dst, deltaPath, outPath)
