@@ -96,6 +96,8 @@ func main() {
 		}
 	case "db":
 		os.Exit(runDB(os.Args[2:]))
+	case "completion":
+		os.Exit(runCompletion(os.Args[2:]))
 	default:
 		usage()
 		os.Exit(2)
@@ -195,6 +197,7 @@ type scanOptions struct {
 	strictWP            bool
 	targets             []string
 	targetsFile         string
+	profile             string
 	crawlPages          int
 	failOn              string
 	noIntel             bool
@@ -387,6 +390,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			}
 		case a == "--no-intel":
 			o.noIntel = true
+		case a == "--profile" && i+1 < len(args):
+			i++
+			o.profile = args[i]
 		case a == "-T" && i+1 < len(args), a == "--targets" && i+1 < len(args):
 			i++
 			o.targetsFile = args[i]
@@ -413,6 +419,18 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	if o.configPath != "" {
 		if err := applyConfig(&o, &target, setFlags, o.configPath); err != nil {
 			fmt.Fprintln(os.Stderr, "error loading config:", err)
+			os.Exit(2)
+		}
+	}
+	if o.profile != "" {
+		ppath, pcleanup, perr := resolveProfile(o.profile)
+		if perr != nil {
+			fmt.Fprintln(os.Stderr, "error loading profile:", perr)
+			os.Exit(2)
+		}
+		defer pcleanup()
+		if aerr := applyConfig(&o, &target, setFlags, ppath); aerr != nil {
+			fmt.Fprintln(os.Stderr, "error loading profile:", aerr)
 			os.Exit(2)
 		}
 	}
@@ -455,12 +473,21 @@ func applyConfig(o *scanOptions, target *string, setFlags map[string]bool, path 
 		return err
 	}
 	var cfg struct {
-		URL           string   `json:"url"`
-		Threads       *int     `json:"threads"`
-		RateLimit     *float64 `json:"rate_limit"`
-		DetectionMode *string  `json:"detection_mode"`
-		Format        *string  `json:"format"`
-		MinSeverity   *string  `json:"min_severity"`
+		URL            string   `json:"url"`
+		Threads        *int     `json:"threads"`
+		RateLimit      *float64 `json:"rate_limit"`
+		DetectionMode  *string  `json:"detection_mode"`
+		Format         *string  `json:"format"`
+		MinSeverity    *string  `json:"min_severity"`
+		Enumerate      *string  `json:"enumerate"`
+		MaxRequests    *int     `json:"max_requests"`
+		CrawlPages     *int     `json:"crawl_pages"`
+		Stealth        *bool    `json:"stealth"`
+		RandomUA       *bool    `json:"random_user_agent"`
+		NoBrute        *bool    `json:"no_brute"`
+		FailOn         *string  `json:"fail_on"`
+		StrictWP       *bool    `json:"strict_wp"`
+		PerHostLimiter *float64 `json:"per_host_rate_limit"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return fmt.Errorf("parsing %s: %w", path, err)
@@ -483,7 +510,78 @@ func applyConfig(o *scanOptions, target *string, setFlags map[string]bool, path 
 	if !setFlags["min-severity"] && cfg.MinSeverity != nil {
 		o.minSeverity = strings.ToLower(*cfg.MinSeverity)
 	}
+	if !setFlags["enumerate"] && cfg.Enumerate != nil {
+		o.enumerate = strings.ToLower(*cfg.Enumerate)
+	}
+	if !setFlags["max-requests"] && cfg.MaxRequests != nil {
+		o.maxReq = *cfg.MaxRequests
+	}
+	if !setFlags["crawl-pages"] && cfg.CrawlPages != nil {
+		o.crawlPages = *cfg.CrawlPages
+	}
+	if !setFlags["stealth"] && cfg.Stealth != nil {
+		o.stealth = *cfg.Stealth
+	}
+	if !setFlags["random-user-agent"] && cfg.RandomUA != nil {
+		o.randomUA = *cfg.RandomUA
+	}
+	if !setFlags["no-brute"] && cfg.NoBrute != nil {
+		o.noBrute = *cfg.NoBrute
+	}
+	if !setFlags["fail-on"] && cfg.FailOn != nil {
+		o.failOn = strings.ToLower(*cfg.FailOn)
+	}
+	if !setFlags["strict-wp"] && cfg.StrictWP != nil {
+		o.strictWP = *cfg.StrictWP
+	}
+	if !setFlags["per-host-rate-limit"] && cfg.PerHostLimiter != nil {
+		o.perHostRateLimit = *cfg.PerHostLimiter
+	}
 	return nil
+}
+
+// builtinProfiles are named option presets shipped with onyx. Values here
+// are applied like a config file: explicit CLI flags always win.
+var builtinProfiles = map[string]string{
+	// stealth: one request per second, randomized UA, trimmed request
+	// budget — for targets where getting blocked matters more than speed.
+	"stealth": `{"threads":1,"rate_limit":1,"random_user_agent":true,"stealth":true,"max_requests":300,"crawl_pages":0}`,
+	// aggressive: wide-open enumeration with sitemap discovery.
+	"aggressive": `{"threads":20,"detection_mode":"aggressive","max_requests":1500,"crawl_pages":25,"enumerate":"ptum"}`,
+	// fast: quick surface pass — passive only, no brute force.
+	"fast": `{"threads":10,"detection_mode":"passive","enumerate":"pt","max_requests":200,"no_brute":true}`,
+}
+
+// resolveProfile returns the config-file path for a --profile name:
+// built-in presets render to a temp file; anything else is looked up in
+// $HOME/.onyx/profiles/<name>.json then ./.onyx/profiles/<name>.json.
+func resolveProfile(name string) (path string, cleanup func(), err error) {
+	cleanup = func() {}
+	if js, ok := builtinProfiles[name]; ok {
+		tmp, tErr := os.CreateTemp("", ".onyx-profile-*")
+		if tErr != nil {
+			return "", cleanup, tErr
+		}
+		if _, wErr := tmp.WriteString(js); wErr != nil {
+			tmp.Close()
+			return "", cleanup, wErr
+		}
+		p := tmp.Name()
+		return p, func() { os.Remove(p) }, tmp.Close()
+	}
+	home := ""
+	if h, hErr := os.UserHomeDir(); hErr == nil {
+		home = filepath.Join(h, ".onyx", "profiles", name+".json")
+	}
+	for _, candidate := range []string{home, filepath.Join(".onyx", "profiles", name+".json")} {
+		if candidate == "" {
+			continue
+		}
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			return candidate, cleanup, nil
+		}
+	}
+	return "", cleanup, fmt.Errorf("unknown profile %q (built-ins: stealth, aggressive, fast — or a file in ~/.onyx/profiles/)", name)
 }
 
 func atoi(s string, def int) int {
@@ -601,6 +699,9 @@ Watch mode:
 
 Database inspection:
   onyx db stats|lookup SLUG|top [N]|search QUERY [--db PATH]
+
+Shell completions:
+  onyx completion bash|zsh|fish     (add the output to your shell config)
 
 Update flags:
   --db PATH          destination database file (default: %s)

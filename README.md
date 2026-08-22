@@ -76,6 +76,7 @@ onyx scan https://example.com
 | `--nuclei` | Verify findings against projectdiscovery templates (needs the nuclei binary) |
 | `--output FILE` | Also write JSON results to `FILE` (table still prints to stdout) |
 | `--config FILE` | Load defaults from a JSON config file (CLI flags win) |
+| `--profile NAME` | Named preset: built-ins `stealth`, `aggressive`, `fast`, or a custom file in `~/.onyx/profiles/NAME.json`. Applied after `--config`; explicit CLI flags still win |
 | `--passwords FILE` | Wordlist of passwords (one per line) — enables the wp-login brute force (needs `--usernames FILE` or `--enumerate u`) |
 | `--usernames FILE` | Wordlist of usernames (one per line) for brute-force attacks |
 | `--user USER` | Single username for the XML-RPC multicall attack (`--xmlrpc-brute`) |
@@ -162,6 +163,15 @@ a clean pass.
 
 All `db` subcommands are read-only and work fully offline; pass `--db PATH`
 to inspect a file other than the default.
+
+## Shell completions
+
+```bash
+onyx completion bash >> ~/.bashrc     # or ~/.zshrc
+onyx completion fish >> ~/.config/fish/completions/onyx.fish
+```
+
+Completes subcommands, `db` subcommands and every scan flag.
 
 ## Watch mode
 
