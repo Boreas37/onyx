@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -809,8 +810,11 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 
 	// Detect rate limiting (HTTP 429). Count it, then back off so the
 	// server has a chance to recover — hammering it harder just makes the
-	// block longer. Backoff doubles up to 30s, then returns the 429 so the
-	// caller can skip the job instead of burning the whole request budget.
+	// block longer. When the server sends Retry-After, that hint wins over
+	// the exponential schedule (clamped to [1s, 60s] so a hostile target
+	// cannot stall the scan indefinitely). Otherwise backoff doubles up to
+	// 30s. The 429 is returned so the caller can skip the job instead of
+	// burning the whole request budget.
 	if resp.StatusCode == http.StatusTooManyRequests {
 		s.rlMu.Lock()
 		s.rateHits++
@@ -823,9 +827,24 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 			}
 		}
 		wait := s.rlBackoff
+		hinted := false
+		if ra, ok := retryAfter(resp.Header, time.Now()); ok {
+			// Clamp to [1s, 60s]: never spin faster than a second against
+			// an explicit hint, and never let one stall the scan forever.
+			if ra > maxRetryAfterWait {
+				ra = maxRetryAfterWait
+			}
+			if ra < time.Second {
+				ra = time.Second
+			}
+			wait = ra
+			hinted = true
+		}
 		s.rlMu.Unlock()
 
-		if pr := s.progress; pr != nil {
+		if pr := s.progress; pr != nil && hinted {
+			pr.LogInf("rate limited (429) — honoring Retry-After: %s", wait)
+		} else if pr != nil {
 			pr.LogInf("rate limited (429) — backing off %s", wait)
 		}
 		time.Sleep(wait)
@@ -846,6 +865,35 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 // cacheableStatus reports whether a response may be cached: successful and
 // deterministic client-error responses (200s and 4xx) are reused within the
 // TTL, while 5xx server errors are never cached because they are transient.
+// maxRetryAfterWait caps how long a server's Retry-After hint may stall a
+// single fetch. Hostile targets could otherwise park the scanner forever
+// with an ever-growing delay.
+const maxRetryAfterWait = 60 * time.Second
+
+// retryAfter parses the Retry-After response header per RFC 7231: either
+// delay-seconds or an HTTP-date. ok is false when the header is absent,
+// unparseable, or already in the past.
+func retryAfter(h http.Header, now time.Time) (time.Duration, bool) {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := t.Sub(now)
+		if d <= 0 {
+			return 0, false
+		}
+		return d, true
+	}
+	return 0, false
+}
+
 func cacheableStatus(code int) bool {
 	return code >= http.StatusOK && code < 500 && code != http.StatusTooManyRequests
 }

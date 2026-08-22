@@ -1177,8 +1177,8 @@ func TestVersionJSONValidAndFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(versionJSON()), &got); err != nil {
 		t.Fatalf("version --json output is not valid JSON: %v", err)
 	}
-	if got.Version != "0.2.0" {
-		t.Errorf("version = %q, want 0.2.0", got.Version)
+	if got.Version != onyxVersion {
+		t.Errorf("version = %q, want %q", got.Version, onyxVersion)
 	}
 	if got.GoVersion == "" {
 		t.Error("go_version is empty")
@@ -1220,7 +1220,7 @@ func TestVersionPlainKeepsFormat(t *testing.T) {
 		os.Args = []string{"onyx", "version"}
 		defer func() { os.Args = oldArgs }()
 		main()
-	}); out != "onyx 0.2.0\n" {
-		t.Errorf("plain version output = %q, want %q", out, "onyx 0.2.0\n")
+	}); out != "onyx "+onyxVersion+"\n" {
+		t.Errorf("plain version output = %q, want %q", out, "onyx "+onyxVersion+"\n")
 	}
 }
