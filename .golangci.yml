@@ -1,0 +1,18 @@
+version: "2"
+
+linters:
+  # default = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  exclusions:
+    rules:
+      # Test servers/writers are intentionally fire-and-forget.
+      - path: _test\.go
+        linters:
+          - errcheck
+      # Best-effort I/O: read-side/cleanup Closes and deadline resets,
+      # temp-file removal after a failed or superseded operation, terminal
+      # progress output. Write-path closes that can lose data are checked
+      # explicitly in code (downloadToFile, watch.SaveState, delta apply).
+      - linters:
+          - errcheck
+        source: '(Close\(\)|SetDeadline|os\.Remove|fmt\.Fprint)'

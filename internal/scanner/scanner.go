@@ -1122,7 +1122,7 @@ func (s *Scanner) usersFromAuthors(maxN int) ([]User, []string) {
 			out = append(out, User{ID: n, Slug: slug})
 		}
 	}
-	return out, nil
+	return out, errs
 }
 
 // authorLocation returns the Location header of the /?author=N redirect,
@@ -1752,14 +1752,15 @@ func (s *Scanner) Scan() (*Result, error) {
 	// WARN, never an error — the scan continues.
 	if s.wpUser != "" {
 		authDetected, authFindings, authStatus := s.authInventory()
-		if authStatus == "failed" {
+		switch authStatus {
+		case "failed":
 			res.AuthStatus = "failed"
 			if pr != nil {
 				pr.LogInf("[WARN] wp-auth failed — invalid credentials")
 			} else {
 				fmt.Fprintln(os.Stderr, "[WARN] wp-auth failed — invalid credentials")
 			}
-		} else if authStatus == "authenticated" {
+		case "authenticated":
 			res.AuthStatus = "authenticated"
 			if pr != nil {
 				pr.LogInf("wp-auth: %d plugin(s)/theme(s) detected", len(authDetected))

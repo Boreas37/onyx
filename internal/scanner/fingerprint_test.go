@@ -371,8 +371,8 @@ func TestDetectWPCoreVersionFallbackOrder(t *testing.T) {
 			if ver != c.wantVersion {
 				t.Errorf("core version = %q, want %q", ver, c.wantVersion)
 			}
-			switch {
-			case c.wantSource == "":
+			switch c.wantSource {
+			case "":
 				if len(sc.coreEvidence) != 0 {
 					t.Errorf("coreEvidence = %+v, want empty", sc.coreEvidence)
 				}

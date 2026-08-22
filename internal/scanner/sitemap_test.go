@@ -90,12 +90,12 @@ func sitemapServer() (*httptest.Server, *sitemapHits) {
 	mux.HandleFunc("/wp-sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
 		hits.add("/wp-sitemap.xml")
 		base := "http://" + r.Host
-		_, _ = w.Write([]byte(fmt.Sprintf(index, base)))
+		_, _ = fmt.Fprintf(w, index, base)
 	})
 	mux.HandleFunc("/wp-sitemap-pages-1.xml", func(w http.ResponseWriter, r *http.Request) {
 		hits.add("child:/wp-sitemap-pages-1.xml")
 		base := "http://" + r.Host
-		_, _ = w.Write([]byte(fmt.Sprintf(child, base, base, base)))
+		_, _ = fmt.Fprintf(w, child, base, base, base)
 	})
 	mux.HandleFunc("/wp-sitemap-pages-2.xml", func(w http.ResponseWriter, r *http.Request) {
 		hits.add("deeper:/wp-sitemap-pages-2.xml") // one level too deep

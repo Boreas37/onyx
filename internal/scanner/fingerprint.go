@@ -35,10 +35,6 @@ var (
 	// opmlGenRe parses the WordPress version from the generator attribute
 	// of wp-links-opml.php: generator="WordPress/X.Y".
 	opmlGenRe = regexp.MustCompile(`(?i)generator=["']WordPress/([0-9][0-9a-zA-Z.-]*)`)
-	// wpscan-style passive references in HTML: /wp-content/plugins/<slug>/ and
-	// /wp-content/themes/<slug>/
-	passivePluginRe = regexp.MustCompile(`(?i)wp-content/plugins/([a-z0-9_-]+)/`)
-	passiveThemeRe  = regexp.MustCompile(`(?i)wp-content/themes/([a-z0-9_-]+)/`)
 )
 
 // sanitizeText makes a target-supplied string safe to embed in reports.

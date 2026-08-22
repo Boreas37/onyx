@@ -1,0 +1,62 @@
+name: fuzz
+
+# Nightly fuzzing of the report-safety invariants: version extractors,
+# REST/JSON parsers, the feed loader and the sanitizer. Each target gets a
+# short budget; any crash or invariant violation fails the run and uploads
+# the failing corpus entry as an artifact.
+#
+# Note: `go test -fuzz` accepts exactly one fuzz target per invocation, so
+# the targets are enumerated explicitly.
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: ./internal/scanner
+            target: FuzzParseDetectedList
+          - package: ./internal/scanner
+            target: FuzzUsersFromJSON
+          - package: ./internal/scanner
+            target: FuzzExtractVersionFromReadme
+          - package: ./internal/scanner
+            target: FuzzExtractVersionFromStyleCSS
+          - package: ./internal/scanner
+            target: FuzzExtractWordPressVersion
+          - package: ./internal/scanner
+            target: FuzzAuthorSlugFromBody
+          - package: ./internal/db
+            target: FuzzLoad
+          - package: ./internal/sanitize
+            target: FuzzText
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Fuzz ${{ matrix.target }} (${{ matrix.package }})
+        id: fuzz
+        continue-on-error: true
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 120s ${{ matrix.package }}
+      - name: Upload crash artifacts
+        if: steps.fuzz.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            ${{ matrix.package }}/testdata/fuzz/
+      - name: Fail on crash
+        if: steps.fuzz.outcome == 'failure'
+        run: |
+          echo "::error::fuzz target ${{ matrix.target }} found a failure — see artifact"
+          exit 1

@@ -66,7 +66,7 @@ func main() {
 		}
 		os.Exit(runScan(target, opts))
 	case "update":
-		updCmd.Parse(os.Args[2:])
+		_ = updCmd.Parse(os.Args[2:]) // ExitOnError flag set: never returns an error
 		feed := strings.ToLower(*updFeed)
 		if feed != feedProduction && feed != feedScanner {
 			fmt.Fprintf(os.Stderr, "error: invalid --feed %q (use production or scanner)\n", feed)
@@ -1238,9 +1238,11 @@ func downloadToFile(url, path string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	if _, err = io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // manifestURL is where the mirror publishes its update manifest; deltas
@@ -1429,6 +1431,6 @@ func downloadFeed(url string, gz bool, out io.Writer) (string, error) {
 	}
 	// Drain whatever the decompressor did not consume so every raw byte
 	// contributes to the digest.
-	io.Copy(io.Discard, raw)
+	_, _ = io.Copy(io.Discard, raw) // intentional drain; errors surface via the digest check
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
