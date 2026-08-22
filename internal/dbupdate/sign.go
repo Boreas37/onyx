@@ -58,7 +58,8 @@ func GenerateKeypair(dir, comment string) (pubPath, secPath string, err error) {
 
 // Sign creates a minisign signature over the data at dataPath using the
 // secret key at secPath and writes it next to the data as
-// filepath.Ext(dataPath)+".minisig" (e.g. feed.json.gz → feed.json.minisig).
+// dataPath+".minisig" (e.g. feed.json.gz → feed.json.gz.minisig), matching
+// minisign's own naming convention.
 //
 // The trusted comment binds a timestamp and the file name into the global
 // signature so signatures cannot be replayed across files undetected.
@@ -82,7 +83,7 @@ func Sign(secPath, dataPath string) (sigPath string, err error) {
 	trustedComment := fmt.Sprintf("timestamp:%d\tfile:%s", time.Now().Unix(), filepath.Base(dataPath))
 	globalSig := ed25519.Sign(priv, append(append([]byte{}, sigBlob...), trustedComment...))
 
-	sigPath = dataPath[:len(dataPath)-len(filepath.Ext(dataPath))] + ".minisig"
+	sigPath = dataPath + ".minisig"
 	body := untrustedCommentSig + "\n" +
 		base64.StdEncoding.EncodeToString(sigBlob) + "\n" +
 		trustedCommentLine + trustedComment + "\n" +

@@ -21,7 +21,7 @@ func TestSignAndVerifyRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "feed.json.minisig"; filepath.Base(sigPath) != want {
+	if want := "feed.json.gz.minisig"; filepath.Base(sigPath) != want {
 		t.Fatalf("sig path = %s, want *%s", sigPath, want)
 	}
 	if err := VerifyMinisign(pubPath, sigPath, data); err != nil {
