@@ -63,7 +63,7 @@ onyx scan https://example.com
 | `--enumerate M` | What to probe: `p` plugins, `t` themes, `u` users, `m` media — combine letters (default `pt`) |
 | `--detection-mode M` | `passive`, `aggressive`, or `mixed` (default: mixed) |
 | `--min-severity S` | Only show findings >= `critical`/`high`/`medium`/`low` |
-| `--format F` | Output format: `table`, `json`, `jsonl`, `sarif` (default: table) |
+| `--format F` | Output format: `table`, `json`, `jsonl`, `sarif`, `csv`, `cyclonedx`, `markdown`/`md`, `html`, `junit` (default: table) |
 | `--rate-limit N` | Max requests per second |
 | `--stealth` | One request per second + random user agent |
 | `--user-agent S` | Set a fixed User-Agent header |
@@ -200,6 +200,21 @@ exploitation in the wild) and CISA KEV membership, then findings are sorted
 by that priority: KEV-confirmed first, highest EPSS next. The data lives in
 the user cache dir and refreshes daily; offline scans fall back to the last
 cached copy with a warning, and `--no-intel` skips enrichment entirely.
+
+## CI-friendly report formats
+
+Beyond machine formats (`json`, `jsonl`, `sarif`, `csv`, `cyclonedx`),
+onyx renders human-readable and CI-gating outputs:
+
+```bash
+onyx scan https://example.com --format md      > report.md       # Markdown
+onyx scan https://example.com --format html    > report.html     # standalone page
+onyx scan https://example.com --format junit   > junit.xml       # CI test reports
+```
+
+JUnit marks one failing testcase per vulnerability, so GitLab/Jenkins test
+widgets light up per finding; a clean scan emits a passing testcase so the
+report is always structurally valid. `--output FILE` honors these formats.
 
 ## Component inventory output
 

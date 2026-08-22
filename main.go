@@ -443,9 +443,10 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		}
 	}
 	switch o.format {
-	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx":
+	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx",
+		"markdown", "md", "html", "junit":
 	default:
-		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif, csv or cyclonedx)\n", o.format)
+		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif, csv, cyclonedx, markdown, html or junit)\n", o.format)
 		os.Exit(2)
 	}
 	if o.targetsFile != "" {
@@ -831,6 +832,12 @@ func runScan(target string, o scanOptions) int {
 		report.PrintCSV(res)
 	case "cyclonedx":
 		report.PrintCycloneDX(onyxVersion, res)
+	case "markdown", "md":
+		report.PrintMarkdown(res)
+	case "html":
+		report.PrintHTML(res)
+	case "junit":
+		report.PrintJUnit(onyxVersion, res)
 	case "cli-no-colour":
 		report.NoColor = true
 		report.PrintTable(res, o.verbose, o.minSeverity)
@@ -1304,23 +1311,56 @@ func expandHome(p string) string {
 // if needed.
 func writeScanOutput(path string, res *scanner.Result, format string) error {
 	var out []byte
-	if format == "csv" {
+	switch format {
+	case "csv":
 		var buf bytes.Buffer
 		if err := report.WriteCSV(&buf, res); err != nil {
 			return err
 		}
 		out = buf.Bytes()
-	} else {
+	case "markdown", "md", "html", "junit":
+		var buf bytes.Buffer
+		if format == "markdown" {
+			format = "md"
+		}
+		if err := writeFormatTo(&buf, format, res); err != nil {
+			return err
+		}
+		out = buf.Bytes()
+	default:
 		j, err := json.MarshalIndent(res, "", "  ")
 		if err != nil {
 			return err
 		}
 		out = append(j, '\n')
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
 	}
 	return os.WriteFile(path, out, 0o644)
+}
+
+// writeFormatTo renders one of the text report formats into w.
+func writeFormatTo(w io.Writer, format string, res *scanner.Result) error {
+	switch format {
+	case "csv":
+		return report.WriteCSV(w, res)
+	case "md":
+		report.WriteMarkdown(w, res)
+		return nil
+	case "html":
+		return report.WriteHTML(w, res)
+	case "junit":
+		return report.WriteJUnit(w, onyxVersion, res)
+	}
+	j, err := json.MarshalIndent(res, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(j, '\n'))
+	return err
 }
 
 // update fetches the newest feed and unpacks it to dst. feed selects the
