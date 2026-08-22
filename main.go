@@ -64,7 +64,11 @@ func main() {
 			usage()
 			os.Exit(2)
 		}
-		os.Exit(runScan(target, opts))
+		all := append([]string{target}, opts.targets...)
+		if len(all) == 1 {
+			os.Exit(runScan(target, opts))
+		}
+		os.Exit(runMulti(all, opts))
 	case "update":
 		_ = updCmd.Parse(os.Args[2:]) // ExitOnError flag set: never returns an error
 		feed := strings.ToLower(*updFeed)
@@ -90,6 +94,8 @@ func main() {
 		} else {
 			fmt.Println("onyx", onyxVersion)
 		}
+	case "db":
+		os.Exit(runDB(os.Args[2:]))
 	default:
 		usage()
 		os.Exit(2)
@@ -187,6 +193,8 @@ type scanOptions struct {
 	noBrute             bool
 	noSummary           bool
 	strictWP            bool
+	targets             []string
+	targetsFile         string
 	crawlPages          int
 	failOn              string
 	noIntel             bool
@@ -379,6 +387,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			}
 		case a == "--no-intel":
 			o.noIntel = true
+		case a == "-T" && i+1 < len(args), a == "--targets" && i+1 < len(args):
+			i++
+			o.targetsFile = args[i]
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -389,6 +400,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			if target == "" {
 				target = a
 				setFlags["url"] = true
+			} else {
+				o.targets = append(o.targets, a)
 			}
 		}
 	}
@@ -416,6 +429,20 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	default:
 		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif, csv or cyclonedx)\n", o.format)
 		os.Exit(2)
+	}
+	if o.targetsFile != "" {
+		data, err := os.ReadFile(o.targetsFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error reading --targets: %v\n", err)
+			os.Exit(2)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			o.targets = append(o.targets, line)
+		}
 	}
 	return target, o
 }
@@ -561,6 +588,7 @@ Scan flags:
   --no-brute         disable credential brute force (wp-login and XML-RPC)
   --strict-wp        exit with code 3 when the target does not look like WordPress (default: warn and continue)
   --crawl-pages N    fetch N sitemap pages for passive plugin/theme discovery (default: 0 = off)
+  -T, --targets FILE scan several targets sequentially (one URL per line; # comments); exit code aggregates
   --fail-on SEV      only exit 5 when findings >= SEV exist (critical/high/medium/low); default: any finding
   --no-intel         skip EPSS/CISA KEV enrichment
   --config FILE      JSON config file; explicit CLI flags win over config values
@@ -570,6 +598,9 @@ Watch mode:
   --interval D       re-scan every duration (30m, 1h); default: single compare-and-exit pass
   --webhook URL      POST a JSON change report when new/resolved vulnerabilities appear
   --state-dir DIR    where baselines are stored (default: user cache dir /onyx/watch)
+
+Database inspection:
+  onyx db stats|lookup SLUG|top [N]|search QUERY [--db PATH]
 
 Update flags:
   --db PATH          destination database file (default: %s)
@@ -712,6 +743,47 @@ func runScan(target string, o scanOptions) int {
 		}
 	}
 	return scanExitCode(res, err, o.strictWP, o.failOn)
+}
+
+// runMulti scans several targets sequentially, printing a section header
+// per target and aggregating exit codes: any hard failure (2) wins, then
+// findings (5), then strict-WP misses (3), else 0.
+//
+// Formats that cannot be meaningfully concatenated (json document, sarif,
+// cyclonedx) are rejected up front; jsonl and csv are flat formats and
+// concatenate naturally, table output simply repeats per target.
+func runMulti(targets []string, o scanOptions) int {
+	if len(targets) > 1 {
+		switch o.format {
+		case "table", "cli-no-colour", "jsonl", "csv":
+		default:
+			fmt.Fprintf(os.Stderr,
+				"error: --format %s cannot represent multiple targets (use table, jsonl or csv)\n", o.format)
+			return 2
+		}
+	}
+	worst := 0
+	rank := func(c int) int {
+		switch c {
+		case 2:
+			return 3
+		case 5:
+			return 2
+		case 3:
+			return 1
+		}
+		return 0
+	}
+	for i, t := range targets {
+		if len(targets) > 1 {
+			fmt.Fprintf(os.Stderr, "\n=== [%d/%d] %s ===\n", i+1, len(targets), t)
+		}
+		code := runScan(t, o)
+		if rank(code) > rank(worst) {
+			worst = code
+		}
+	}
+	return worst
 }
 
 // severityRankOf maps a severity name to a rank (critical=4 … low=1);

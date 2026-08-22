@@ -85,6 +85,7 @@ onyx scan https://example.com
 | `--no-brute` | Disable credential brute force (wp-login and XML-RPC) |
 | `--strict-wp` | Exit `3` when the target does not look like WordPress (default: warn, exit `0`) |
 | `--crawl-pages N` | Fetch N pages from the target's sitemap and mine them for plugin/theme references + `?ver=` versions (default 0 = off) |
+| `-T FILE`, `--targets FILE` | Scan many sites sequentially (one URL per line, `#` comments). Extra URLs can also be passed positionally. Exit code aggregates: any hard failure → `2`, else any findings → `5`. Formats that cannot be concatenated (`json`, `sarif`, `cyclonedx`) require a single target |
 | `--fail-on SEV` | Exit `5` only when a finding is `SEV` or worse (`critical`/`high`/`medium`/`low`); default: any finding. Nuclei-verified hits always exit `5` |
 | `--no-intel` | Skip EPSS / CISA KEV enrichment (enabled by default; findings are annotated and sorted by exploitation priority) |
 | `--silent` | Suppress progress output; only the result is printed |
@@ -151,6 +152,16 @@ By default a non-WordPress target is reported ("does not look like
 WordPress") and the scan exits `0`. Pass `--strict-wp` to make that case a
 distinct failure (`3`) — useful in CI so a misconfigured URL doesn't read as
 a clean pass.
+
+## Inspecting the local database
+
+    onyx db stats                     # record counts by type, freshness
+    onyx db lookup contact-form-7     # all recorded vulns for one slug, most severe first
+    onyx db top 20                    # most vulnerable slugs in the feed
+    onyx db search "CVE-2025"         # grep titles/CVE ids (capped at 20)
+
+All `db` subcommands are read-only and work fully offline; pass `--db PATH`
+to inspect a file other than the default.
 
 ## Watch mode
 
