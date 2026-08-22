@@ -86,6 +86,7 @@ type Options struct {
 	ThemesList          string        // file with theme slugs (one per line, # comments)
 	MaxScanDuration     time.Duration // hard stop for the whole scan; 0 = unlimited
 	CacheTTL            time.Duration // HTTP response cache TTL; 0 = off
+	CrawlPages          int           // --crawl-pages N: passively crawl up to N sitemap pages (0 = disabled)
 	Findings            chan Finding  // when set, every finding is emitted live
 
 	PasswordsFile string // --passwords FILE: wordlist for the wp-login brute force (one per line)
@@ -110,6 +111,13 @@ type Scanner struct {
 	mode        string // detection mode: passive | aggressive | mixed
 	progress    *progress.Bar
 	homepage    string // raw homepage HTML for passive slug detection
+
+	coreEvidence []CoreEvidence // core version observations (meta/rss/opml)
+
+	sitemapPlugins  []string          // slugs discovered by --crawl-pages sitemap crawling
+	sitemapThemes   []string          //
+	sitemapVersions map[string]string // slug -> ?ver= version from sitemap pages
+	sitemapRequests int               // HTTP requests spent on sitemap discovery
 
 	rlMu       sync.Mutex // guards rateLimitHits
 	rateHits   int        // count of 429 responses seen
@@ -675,12 +683,25 @@ func (s *Scanner) enumerateUsers() bool { return strings.Contains(s.enum, "u") }
 func (s *Scanner) enumerateMedia() bool { return strings.Contains(s.enum, "m") }
 
 // Detected is a plugin/theme/core component whose presence and version were
-// identified on the target.
+// identified on the target. Source records how it was found: "passive"
+// (slug referenced in page HTML), "passive-ver" (asset ?ver= query string),
+// "readme" (plugin readme.txt probe), "style.css" (theme stylesheet probe),
+// "rest" (unauthenticated wp-json listing) or "auth-rest" (authenticated
+// wp-json inventory).
 type Detected struct {
 	Slug    string `json:"slug"`
 	Name    string `json:"name"`
 	Type    string `json:"type"`
 	Version string `json:"installed_version"`
+	Source  string `json:"source,omitempty"`
+}
+
+// CoreEvidence records one WordPress core version observation together with
+// the source that produced it: "meta" (generator meta tag), "rss" (feed
+// generator element) or "opml" (wp-links-opml.php generator attribute).
+type CoreEvidence struct {
+	Source  string `json:"source"`
+	Version string `json:"version"`
 }
 
 // Vulnerability is one matched database record.
@@ -747,6 +768,7 @@ type Result struct {
 	Target           string                `json:"target"`
 	IsWordPress      bool                  `json:"is_wordpress"`
 	WordPressVersion string                `json:"wordpress_version,omitempty"`
+	CoreEvidence     []CoreEvidence        `json:"core_evidence,omitempty"` // which source produced WordPressVersion
 	Evidence         []string              `json:"evidence,omitempty"`
 	Detected         []Detected            `json:"detected,omitempty"`
 	Findings         []Finding             `json:"findings,omitempty"`
@@ -1186,6 +1208,12 @@ func normalizeUsers(lists ...[]User) []User {
 // the list of evidence strings. A homepage fetch failure is returned as a
 // fatal error — an unreachable target is a hard failure, not WordPress
 // evidence. wp-login/wp-json fetch errors are secondary and stay silent.
+//
+// The core version comes from the first source that answers, tried in
+// order: generator meta tag → RSS feed generator element (/?feed=rss2,
+// then /feed/) → wp-links-opml.php generator attribute. The RSS/OPML
+// fetches only run when the meta tag did not yield a version, keeping the
+// request count low; whichever source wins is recorded in s.coreEvidence.
 func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr error) {
 	code, body, err := s.fetch("/")
 	if err != nil {
@@ -1197,12 +1225,39 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 		if v, ok := ExtractWordPressVersion(html); ok {
 			coreVersion = v
 			evidence = append(evidence, "generator meta tag (WordPress "+v+")")
+			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "meta", Version: v})
 		}
 		if strings.Contains(html, "wp-content") {
 			evidence = append(evidence, "wp-content path present in homepage")
 		}
 		if strings.Contains(html, "wp-json") || strings.Contains(html, "/wp-json/") {
 			evidence = append(evidence, "wp-json REST API referenced")
+		}
+	}
+
+	// Multi-source fallbacks, cheapest-first. Each stops the chain as soon
+	// as it produces a version.
+	if coreVersion == "" {
+		for _, path := range []string{"/?feed=rss2", "/feed/"} {
+			code, body, err := s.fetch(path)
+			if err != nil || code != http.StatusOK {
+				continue
+			}
+			if v, ok := ExtractRSSVersion(string(body)); ok {
+				coreVersion = v
+				evidence = append(evidence, "RSS feed generator tag (WordPress "+v+")")
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "rss", Version: v})
+				break
+			}
+		}
+	}
+	if coreVersion == "" {
+		if code, body, err := s.fetch("/wp-links-opml.php"); err == nil && code == http.StatusOK {
+			if v, ok := ExtractOPMLVersion(string(body)); ok {
+				coreVersion = v
+				evidence = append(evidence, "wp-links-opml.php generator (WordPress "+v+")")
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "opml", Version: v})
+			}
 		}
 	}
 
@@ -1259,7 +1314,7 @@ func (s *Scanner) apiPlugins() ([]Detected, []string) {
 		if ver == "" {
 			ver = "unknown"
 		}
-		out = append(out, Detected{Slug: slug, Name: sanitizeText(it.Name, maxNameLen), Type: "plugin", Version: ver})
+		out = append(out, Detected{Slug: slug, Name: sanitizeText(it.Name, maxNameLen), Type: "plugin", Version: ver, Source: "rest"})
 	}
 	return out, nil
 }
@@ -1308,6 +1363,27 @@ func (s *Scanner) buildJobs() []job {
 		for _, slug := range passiveT {
 			if !s.enumerateThemes() {
 				break
+			}
+			seen["t:"+slug] = true
+			jobs = append(jobs, job{kind: "theme", slug: slug,
+				path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
+		}
+	}
+
+	// Passive detection via --crawl-pages: slugs discovered on sitemap
+	// pages join the job list exactly like homepage references.
+	if passive && len(s.sitemapPlugins)+len(s.sitemapThemes) > 0 {
+		for _, slug := range s.sitemapPlugins {
+			if !s.enumeratePlugins() || seen["p:"+slug] {
+				continue
+			}
+			seen["p:"+slug] = true
+			jobs = append(jobs, job{kind: "plugin", slug: slug,
+				path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
+		}
+		for _, slug := range s.sitemapThemes {
+			if !s.enumerateThemes() || seen["t:"+slug] {
+				continue
 			}
 			seen["t:"+slug] = true
 			jobs = append(jobs, job{kind: "theme", slug: slug,
@@ -1431,13 +1507,15 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 
 	var ver string
 	var found bool
+	source := "readme"
 	switch j.kind {
 	case "plugin":
 		ver, found = ExtractVersionFromReadme(string(body))
 	case "theme":
 		ver, found = ExtractVersionFromStyleCSS(string(body))
+		source = "style.css"
 	}
-	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: "unknown"}}
+	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: "unknown", Source: source}}
 	if !found {
 		return detected, nil
 	}
@@ -1447,6 +1525,102 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 		return detected, []Finding{f}
 	}
 	return detected, nil
+}
+
+// fetchHeaders GETs path like fetch() but also returns the response
+// headers, which fetch() discards (needed for cache-layer sniffing). It
+// shares the rate limiter, per-host throttle, UA transport and request
+// counter with fetch(); responses are never served from or written to the
+// disk cache because cached entries do not retain headers.
+func (s *Scanner) fetchHeaders(path string) (int, http.Header, []byte, error) {
+	s.lim.wait()
+	u := s.base + path
+	s.perHostWait(u)
+	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	s.requests.Add(1)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+	hdr := resp.Header.Clone()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+	return resp.StatusCode, hdr, body, err
+}
+
+// mergePassiveDetections upserts Detected entries for components observed
+// in page HTML (homepage or --crawl-pages sitemap pages) whose asset URLs
+// carried ?ver= cache-buster versions. It runs after enumeration so
+// readme.txt/style.css/REST versions win; entries still at "unknown" get
+// the passive version and every versioned entry is matched against the
+// database. Slug-only passive references keep flowing through enumeration
+// jobs and are not materialized here.
+func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding)) {
+	versions := make(map[string]string)
+	for slug, ver := range ExtractPassiveVersionsIn(s.homepage, s.contentDir) {
+		versions[slug] = ver
+	}
+	for slug, ver := range s.sitemapVersions {
+		if _, ok := versions[slug]; !ok {
+			versions[slug] = ver
+		}
+	}
+	if len(versions) == 0 {
+		return
+	}
+
+	// slug -> component type; plugins win when a slug collides.
+	typ := make(map[string]string)
+	reg := func(slugs []string, t string) {
+		for _, slug := range slugs {
+			if _, ok := typ[slug]; !ok {
+				typ[slug] = t
+			}
+		}
+	}
+	hp, ht := ExtractPassiveSlugsIn(s.homepage, s.contentDir)
+	reg(hp, "plugin")
+	reg(ht, "theme")
+	reg(s.sitemapPlugins, "plugin")
+	reg(s.sitemapThemes, "theme")
+
+	index := make(map[string]int, len(res.Detected))
+	for i := range res.Detected {
+		index[res.Detected[i].Slug] = i
+	}
+	slugs := make([]string, 0, len(versions))
+	for slug := range versions {
+		slugs = append(slugs, slug)
+	}
+	sort.Strings(slugs)
+
+	var findings []Finding
+	for _, slug := range slugs {
+		t, ok := typ[slug]
+		if !ok {
+			continue
+		}
+		ver := versions[slug]
+		if i, ok := index[slug]; ok {
+			if res.Detected[i].Version != "unknown" {
+				continue // probed version wins
+			}
+			res.Detected[i].Version = ver
+			res.Detected[i].Source = "passive-ver"
+		} else {
+			index[slug] = len(res.Detected)
+			res.Detected = append(res.Detected, Detected{
+				Slug: slug, Name: slug, Type: t, Version: ver, Source: "passive-ver",
+			})
+		}
+		if f := s.matchDatabase(slug, t, ver); len(f.Vulnerabilities) > 0 {
+			findings = append(findings, f)
+		}
+	}
+	addFindings(findings)
 }
 
 // Scan runs the full workflow: WordPress detection, enumeration and matching.
@@ -1502,6 +1676,7 @@ func (s *Scanner) Scan() (*Result, error) {
 		return res, ErrNotWordPress
 	}
 	res.WordPressVersion = coreVersion
+	res.CoreEvidence = s.coreEvidence
 	if pr != nil {
 		ver := ""
 		if coreVersion != "" {
@@ -1513,6 +1688,10 @@ func (s *Scanner) Scan() (*Result, error) {
 	// Always-on interesting finders (robots.txt, readme.html, debug.log,
 	// xmlrpc.php, uploads listing, wp-config.php.bak, version.php).
 	res.Interesting = s.interestingFinders()
+
+	// Drop-in/cache-layer detection: cache headers on the homepage and an
+	// exposed mu-plugins directory listing.
+	res.Interesting = append(res.Interesting, s.dropinFinder()...)
 
 	// Media enumeration: a homepage reference to the uploads directory is
 	// enough for the simple presence check.
@@ -1598,16 +1777,29 @@ func (s *Scanner) Scan() (*Result, error) {
 		res.Errors = append(res.Errors, apiErrs...)
 	}
 
+	// Sitemap-driven passive discovery (--crawl-pages): runs after the
+	// homepage passive detection stored s.homepage and before enumeration
+	// so discovered slugs join the job list below. Its fetches draw from
+	// the same --max-requests budget as enumeration.
+	if s.opts.CrawlPages > 0 && !s.opts.APIOnly && (s.mode == "mixed" || s.mode == "passive") {
+		s.discoverViaSitemap(s.opts.CrawlPages)
+	}
+
 	jobs := s.buildJobs()
 	if s.opts.APIOnly {
 		jobs = nil
 	}
-	// --max-requests caps the brute-force request budget. Jobs keep their
-	// share first; whatever is left funds user enumeration.
-	if len(jobs) > s.maxRequests {
-		jobs = jobs[:s.maxRequests]
+	// --max-requests caps the brute-force request budget. Sitemap crawling
+	// (--crawl-pages) spent its share first; jobs keep whatever is left,
+	// and the remainder funds user enumeration.
+	budget := s.maxRequests - s.sitemapRequests
+	if budget < 0 {
+		budget = 0
 	}
-	remaining := s.maxRequests - len(jobs)
+	if len(jobs) > budget {
+		jobs = jobs[:budget]
+	}
+	remaining := budget - len(jobs)
 
 	userPlan := 0
 	authorPlan := 0
@@ -1665,6 +1857,11 @@ func (s *Scanner) Scan() (*Result, error) {
 		}
 		wg.Wait()
 	}
+
+	// Passive ?ver= versions (homepage + sitemap pages): fill in versions
+	// for passively observed components that enumeration could not pin
+	// down, then match them against the database.
+	s.mergePassiveDetections(res, addFindings)
 
 	if userPlan > 0 {
 		if pr != nil {
