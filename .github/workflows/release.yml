@@ -46,12 +46,15 @@ jobs:
 
       - name: Package
         run: |
+          # Archives always contain the binary under the canonical name
+          # "onyx" — Homebrew and shell users expect it.
+          cp onyx-${{ matrix.goos }}-${{ matrix.goarch }} onyx
           case "${{ matrix.goos }}" in
             windows)
-              zip onyx-${{ matrix.goos }}-${{ matrix.goarch }}.zip onyx-${{ matrix.goos }}-${{ matrix.goarch }}
+              zip onyx-${{ matrix.goos }}-${{ matrix.goarch }}.zip onyx
               ;;
             *)
-              tar -czf onyx-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz onyx-${{ matrix.goos }}-${{ matrix.goarch }}
+              tar -czf onyx-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz onyx
               ;;
           esac
 
