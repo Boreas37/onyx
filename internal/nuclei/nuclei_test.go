@@ -1,25 +1,35 @@
 package nuclei
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// ceilingCVE returns a CVE id for the current dynamic ceiling year
+// (time.Now().Year()+1), the year a hardcoded bound would reject.
+func ceilingCVE(num string) string {
+	return fmt.Sprintf("CVE-%d-%s", time.Now().Year()+1, num)
+}
 
 func TestFindTemplate(t *testing.T) {
 	dir := t.TempDir()
-	y2026 := filepath.Join(dir, "http", "cves", "2026", "CVE-2026-69084.yaml")
-	if err := os.MkdirAll(filepath.Dir(y2026), 0o755); err != nil {
+	cve := ceilingCVE("69084")
+	yNext := filepath.Join(dir, "http", "cves", strconv.Itoa(time.Now().Year()+1), cve+".yaml")
+	if err := os.MkdirAll(filepath.Dir(yNext), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(y2026, []byte("id: CVE-2026-69084\n"), 0o644); err != nil {
+	if err := os.WriteFile(yNext, []byte("id: "+cve+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok := FindTemplate(dir, "CVE-2026-69084")
-	if !ok || got != y2026 {
-		t.Errorf("FindTemplate(CVE-2026-69084) = %q, %v; want %q, true", got, ok, y2026)
+	got, ok := FindTemplate(dir, cve)
+	if !ok || got != yNext {
+		t.Errorf("FindTemplate(%s) = %q, %v; want %q, true", cve, got, ok, yNext)
 	}
 
 	if _, ok := FindTemplate(dir, "CVE-2025-12345"); ok {
@@ -34,6 +44,29 @@ func TestFindTemplate(t *testing.T) {
 	got, ok = FindTemplate(dir, "CVE-2024-99999")
 	if !ok || got != flat {
 		t.Errorf("FindTemplate(CVE-2024-99999) = %q, %v; want %q, true", got, ok, flat)
+	}
+}
+
+// TestCVEYearTracksWallClock pins the dynamic bounds of cveYear: the
+// floating ceiling (now+1) is accepted, one past it is rejected, and the
+// 2002 lower bound stays.
+func TestCVEYearTracksWallClock(t *testing.T) {
+	next := strconv.Itoa(time.Now().Year() + 1)
+	if got := cveYear("CVE-" + next + "-12345"); got != next {
+		t.Errorf("cveYear(ceiling year) = %q, want %q", got, next)
+	}
+	beyond := strconv.Itoa(time.Now().Year() + 2)
+	if got := cveYear("CVE-" + beyond + "-12345"); got != "" {
+		t.Errorf("cveYear(year beyond ceiling) = %q, want \"\"", got)
+	}
+	if got := cveYear("CVE-2001-99999"); got != "" {
+		t.Errorf("cveYear(pre-2002) = %q, want \"\"", got)
+	}
+	if got := cveYear("CVE-2002-00001"); got != "2002" {
+		t.Errorf("cveYear(2002 lower bound) = %q, want 2002", got)
+	}
+	if got := cveYear("CVE-abcd-1234"); got != "" {
+		t.Errorf("cveYear(non-numeric year) = %q, want \"\"", got)
 	}
 }
 

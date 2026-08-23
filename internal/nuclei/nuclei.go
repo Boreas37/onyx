@@ -54,8 +54,8 @@ type jsonLine struct {
 
 // FindTemplate resolves the evidence template for cve under dir:
 // first <dir>/http/cves/<year>/<cve>.yaml (year = the CVE's 4-digit year,
-// when it is within 2002-2026), then a recursive search below
-// <dir>/http/cves/ for any file named <cve>.yaml.
+// when it is within 2002..time.Now().Year()+1), then a recursive search
+// below <dir>/http/cves/ for any file named <cve>.yaml.
 func FindTemplate(dir, cve string) (string, bool) {
 	if y := cveYear(cve); y != "" {
 		p := filepath.Join(dir, "http", "cves", y, cve+".yaml")
@@ -78,15 +78,17 @@ func FindTemplate(dir, cve string) (string, bool) {
 	return "", false
 }
 
-// cveYear extracts the 4-digit year of a CVE id (2002-2026), or "" when the
-// id does not carry a usable year.
+// cveYear extracts the 4-digit year of a CVE id, or "" when the id does
+// not carry a usable year. The lower bound stays at 2002 (nuclei's template
+// tree starts there); the ceiling floats one year ahead of the wall clock
+// so templates published for the upcoming year resolve before New Year.
 func cveYear(cve string) string {
 	if len(cve) < 9 || !strings.HasPrefix(cve, "CVE-") {
 		return ""
 	}
 	y := cve[4:8]
 	n, err := strconv.Atoi(y)
-	if err != nil || n < 2002 || n > 2026 {
+	if err != nil || n < 2002 || n > time.Now().Year()+1 {
 		return ""
 	}
 	return y

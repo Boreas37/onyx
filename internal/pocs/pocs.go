@@ -49,15 +49,17 @@ var (
 	yearDirRe = regexp.MustCompile(`^[12][0-9]{3}$`)
 )
 
-// cveYear extracts the 4-digit year of a CVE id (1999-2026), or "" when
-// the id does not carry a usable year.
+// cveYear extracts the 4-digit year of a CVE id, or "" when the id does
+// not carry a usable year. The lower bound stays at 1999 (the first year
+// CVEs were issued); the ceiling floats one year ahead of the wall clock
+// so tracker folders for the upcoming year resolve before New Year.
 func cveYear(cve string) string {
 	if len(cve) < 9 || !strings.HasPrefix(cve, "CVE-") {
 		return ""
 	}
 	y := cve[4:8]
 	n, err := strconv.Atoi(y)
-	if err != nil || n < 1999 || n > 2026 {
+	if err != nil || n < 1999 || n > time.Now().Year()+1 {
 		return ""
 	}
 	return y

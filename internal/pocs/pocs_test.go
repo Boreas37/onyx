@@ -6,41 +6,45 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestExtractLinksFromYearREADME verifies that PoC rows are pulled out of
 // the year README table of a fake tracker clone: only rows of the queried
 // CVE are returned, star counts come from the Stars column, duplicate
-// rows collapse, and foreign-host rows are ignored.
+// rows collapse, and foreign-host rows are ignored. The tracker folder and
+// CVE ids use the current year so the test stays valid as the clock moves.
 func TestExtractLinksFromYearREADME(t *testing.T) {
 	dir := t.TempDir()
-	year := filepath.Join(dir, "2026")
-	if err := os.MkdirAll(year, 0o755); err != nil {
+	year := strconv.Itoa(time.Now().Year())
+	cve := "CVE-" + year + "-0073"
+	if err := os.MkdirAll(filepath.Join(dir, year), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	md := `# 2026 CVE PoCs
+	md := `# ` + year + ` CVE PoCs
 
 **1,114 CVEs · 1,996 PoC repositories**
 
 | CVE | Target repository | Stars | Description |
 |---|---:|---|
-| [CVE-2026-0073](https://github.com/xqi1337/poc-CVE-2026-0073) | [xqi1337/poc-CVE-2026-0073](https://github.com/xqi1337/poc-CVE-2026-0073) | 1 | ADB bypass |
-| [CVE-2026-0073](https://github.com/0xbinder/CVE-2026-0073) | [0xbinder/CVE-2026-0073](https://github.com/0xbinder/CVE-2026-0073) | 26 | automated exploit |
-| [CVE-2026-0073](https://github.com/owner/repo-with-dash) | [owner/repo-with-dash](https://github.com/owner/repo-with-dash) | 9 | dash |
-| [CVE-2026-0073](https://github.com/0xbinder/CVE-2026-0073) | [0xbinder/CVE-2026-0073](https://github.com/0xbinder/CVE-2026-0073) | 26 | duplicate row, must collapse |
-| [CVE-2026-9999](https://github.com/other/unrelated) | [other/unrelated](https://github.com/other/unrelated) | 100 | other CVE, must be ignored |
-| [CVE-2026-0073](https://gitlab.com/owner/repo) | [owner/repo](https://gitlab.com/owner/repo) | 5 | foreign host, must be ignored |
+| [` + cve + `](https://github.com/xqi1337/poc-` + cve + `) | [xqi1337/poc-` + cve + `](https://github.com/xqi1337/poc-` + cve + `) | 1 | ADB bypass |
+| [` + cve + `](https://github.com/0xbinder/` + cve + `) | [0xbinder/` + cve + `](https://github.com/0xbinder/` + cve + `) | 26 | automated exploit |
+| [` + cve + `](https://github.com/owner/repo-with-dash) | [owner/repo-with-dash](https://github.com/owner/repo-with-dash) | 9 | dash |
+| [` + cve + `](https://github.com/0xbinder/` + cve + `) | [0xbinder/` + cve + `](https://github.com/0xbinder/` + cve + `) | 26 | duplicate row, must collapse |
+| [CVE-` + year + `-9999](https://github.com/other/unrelated) | [other/unrelated](https://github.com/other/unrelated) | 100 | other CVE, must be ignored |
+| [` + cve + `](https://gitlab.com/owner/repo) | [owner/repo](https://gitlab.com/owner/repo) | 5 | foreign host, must be ignored |
 `
-	if err := os.WriteFile(filepath.Join(year, "README.md"), []byte(md), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, year, "README.md"), []byte(md), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got := ExtractLinks(dir, "CVE-2026-0073")
+	got := ExtractLinks(dir, cve)
 	want := []ExtractedPoC{
-		{URL: "https://github.com/xqi1337/poc-CVE-2026-0073", Stars: 1},
-		{URL: "https://github.com/0xbinder/CVE-2026-0073", Stars: 26},
+		{URL: "https://github.com/xqi1337/poc-" + cve, Stars: 1},
+		{URL: "https://github.com/0xbinder/" + cve, Stars: 26},
 		{URL: "https://github.com/owner/repo-with-dash", Stars: 9},
 	}
 	if len(got) != len(want) {
@@ -54,6 +58,29 @@ func TestExtractLinksFromYearREADME(t *testing.T) {
 
 	if l := ExtractLinks(dir, "CVE-1999-0001"); l != nil {
 		t.Errorf("missing CVE: ExtractLinks = %+v, want nil", l)
+	}
+}
+
+// TestCVEYearTracksWallClock pins the dynamic bounds of cveYear: the
+// floating ceiling (now+1) is accepted, one past it is rejected, and the
+// 1999 lower bound stays.
+func TestCVEYearTracksWallClock(t *testing.T) {
+	next := strconv.Itoa(time.Now().Year() + 1)
+	if got := cveYear("CVE-" + next + "-12345"); got != next {
+		t.Errorf("cveYear(ceiling year) = %q, want %q", got, next)
+	}
+	beyond := strconv.Itoa(time.Now().Year() + 2)
+	if got := cveYear("CVE-" + beyond + "-12345"); got != "" {
+		t.Errorf("cveYear(year beyond ceiling) = %q, want \"\"", got)
+	}
+	if got := cveYear("CVE-1999-00001"); got != "1999" {
+		t.Errorf("cveYear(1999 lower bound) = %q, want 1999", got)
+	}
+	if got := cveYear("CVE-1998-99999"); got != "" {
+		t.Errorf("cveYear(pre-1999) = %q, want \"\"", got)
+	}
+	if got := cveYear(fmt.Sprintf("notcve-%d-x", time.Now().Year())); got != "" {
+		t.Errorf("cveYear(non-CVE id) = %q, want \"\"", got)
 	}
 }
 
