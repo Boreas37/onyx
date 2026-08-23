@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Boreas37/onyx/internal/pocs"
+	"github.com/Boreas37/onyx/internal/sanitize"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
 
@@ -70,31 +71,37 @@ func PrintBanner(version string, dbRecords int) {
 // minSeverity filters findings below the given rating ("critical", "high",
 // "medium", "low").
 func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
+	writeTable(os.Stdout, res, verbose, minSeverity)
+}
+
+// writeTable renders res into w; split from PrintTable so tests can point
+// it at a bytes.Buffer instead of capturing os.Stdout.
+func writeTable(w io.Writer, res *scanner.Result, verbose bool, minSeverity string) {
 	if !res.IsWordPress {
-		fmt.Printf("Target %s does not look like WordPress.\n", res.Target)
+		fmt.Fprintf(w, "Target %s does not look like WordPress.\n", res.Target)
 		return
 	}
 
-	fmt.Printf("Target: %s\n", res.Target)
+	fmt.Fprintf(w, "Target: %s\n", res.Target)
 	if res.WordPressVersion != "" {
-		fmt.Printf("WordPress core: %s\n", res.WordPressVersion)
+		fmt.Fprintf(w, "WordPress core: %s\n", res.WordPressVersion)
 	}
 	if res.XMLRPC {
-		fmt.Printf("XML-RPC: enabled\n")
+		fmt.Fprintf(w, "XML-RPC: enabled\n")
 	}
 	if res.AuthStatus != "" {
-		fmt.Printf("REST auth: %s\n", res.AuthStatus)
+		fmt.Fprintf(w, "REST auth: %s\n", res.AuthStatus)
 	}
 	if len(res.Interesting) > 0 {
-		fmt.Printf("Interesting:\n")
+		fmt.Fprintf(w, "Interesting:\n")
 		for _, item := range res.Interesting {
-			fmt.Printf("  - %s\n", item)
+			fmt.Fprintf(w, "  - %s\n", item)
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	if len(res.Users) > 0 {
-		fmt.Printf("Users:\n")
+		fmt.Fprintf(w, "Users:\n")
 		for _, u := range res.Users {
 			id := ""
 			if u.ID > 0 {
@@ -104,17 +111,19 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 			if u.Name != "" && u.Name != u.Slug {
 				name = fmt.Sprintf(" (%s)", u.Name)
 			}
-			fmt.Printf("  - %s%s%s\n", u.Slug, id, name)
+			fmt.Fprintf(w, "  - %s%s%s\n", u.Slug, id, name)
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	if len(res.LoginBrutes) > 0 {
-		fmt.Printf("Valid credentials:\n")
+		// lb.User/lb.Password come from operator-supplied wordlists, not
+		// from the target, so they are printed verbatim.
+		fmt.Fprintf(w, "Valid credentials:\n")
 		for _, lb := range res.LoginBrutes {
-			fmt.Printf("  - %s:%s%s\n", lb.User, lb.Password, lb.URL)
+			fmt.Fprintf(w, "  - %s:%s%s\n", lb.User, lb.Password, lb.URL)
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	threshold := severityRank(minSeverity)
@@ -140,25 +149,25 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 
 	if len(comps) == 0 {
 		if res.RateLimitHits > 0 {
-			fmt.Printf("\nNo matching vulnerabilities found. (%d request(s) were rate limited — results may be incomplete)\n", res.RateLimitHits)
+			fmt.Fprintf(w, "\nNo matching vulnerabilities found. (%d request(s) were rate limited — results may be incomplete)\n", res.RateLimitHits)
 		} else {
-			fmt.Println("\nNo matching vulnerabilities found.")
+			fmt.Fprintln(w, "\nNo matching vulnerabilities found.")
 		}
 	} else {
 		if res.RateLimitHits > 0 {
-			fmt.Printf("Note: %d request(s) were rate limited (HTTP 429) — results may be incomplete. Try --rate-limit N or --stealth.\n", res.RateLimitHits)
+			fmt.Fprintf(w, "Note: %d request(s) were rate limited (HTTP 429) — results may be incomplete. Try --rate-limit N or --stealth.\n", res.RateLimitHits)
 		}
 
-		fmt.Println()
+		fmt.Fprintln(w)
 		if verbose {
 			for _, c := range comps {
 				for _, v := range c.vulns {
-					sev := severityColor(v.Rating)
+					sev := severityColor(sevClass(v.Rating))
 					cve := v.CVE
 					if cve == "" {
 						cve = v.ID
 					}
-					fmt.Printf("[%s] [%s:%s:%s] %s (%s)\n",
+					fmt.Fprintf(w, "[%s] [%s:%s:%s] %s (%s)\n",
 						sev, c.f.Type, c.f.Slug, c.f.InstalledVersion, v.Title, cve)
 				}
 			}
@@ -173,42 +182,46 @@ func PrintTable(res *scanner.Result, verbose bool, minSeverity string) {
 						worst = v
 					}
 				}
-				worstSev := severityColor(worst.Rating)
-				fmt.Printf("[%s] [%s:%s:%s] %d vulnerabilities (worst: %s)\n",
+				worstSev := severityColor(sevClass(worst.Rating))
+				fmt.Fprintf(w, "[%s] [%s:%s:%s] %d vulnerabilities (worst: %s)\n",
 					worstSev, c.f.Type, c.f.Slug, c.f.InstalledVersion, len(c.vulns), worst.Title)
 			}
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	if len(res.Nuclei) > 0 {
-		fmt.Println("Nuclei verification:")
+		// Nuclei fields come from parsing external JSON output (template
+		// metadata echoes target responses), so strip control characters
+		// and cap length before printing.
+		fmt.Fprintln(w, "Nuclei verification:")
 		for _, n := range res.Nuclei {
-			id := n.CVE
+			id := sanitize.Text(n.CVE, 200)
 			if id == "" {
-				id = n.TemplateID
+				id = sanitize.Text(n.TemplateID, 200)
 			}
-			fmt.Printf("  [%s] [%s] %s (matched at %s)\n",
-				severityColor(n.Severity), strings.ToLower(id), n.Name, n.MatchedAt)
+			fmt.Fprintf(w, "  [%s] [%s] %s (matched at %s)\n",
+				severityColor(sevClass(n.Severity)), strings.ToLower(id),
+				sanitize.Text(n.Name, 200), sanitize.Text(n.MatchedAt, 200))
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	if len(res.PoCs) > 0 {
-		fmt.Println("PoC references (from CVE-PoC-Tracker):")
+		fmt.Fprintln(w, "PoC references (from CVE-PoC-Tracker):")
 		lastCVE := ""
 		for _, p := range res.PoCs {
 			if p.CVE != lastCVE {
 				if lastCVE != "" {
-					fmt.Println()
+					fmt.Fprintln(w)
 				}
-				fmt.Printf("  %s:\n", p.CVE)
+				fmt.Fprintf(w, "  %s:\n", p.CVE)
 				lastCVE = p.CVE
 			}
-			fmt.Printf("    \u2b50 %-5d %s\n", p.Stars, p.URL)
+			fmt.Fprintf(w, "    \u2b50 %-5d %s\n", p.Stars, p.URL)
 		}
-		fmt.Printf("more: %s\n", pocs.TrackerURL)
-		fmt.Println()
+		fmt.Fprintf(w, "more: %s\n", pocs.TrackerURL)
+		fmt.Fprintln(w)
 	}
 }
 
@@ -228,14 +241,28 @@ func severityRank(rating string) int {
 	}
 }
 
+// sevClass maps a vulnerability rating onto the closed set of severity
+// labels rendered by the report formats ({critical,high,medium,low,info}).
+// Anything else — including markup, formulas or feed garbage that slipped
+// past the load-time whitelist — collapses to "unknown", so neither the
+// CSS class attribute nor the cell text can carry attacker-controlled
+// content. Mirrors db's ratingWhitelist; informational aliases to info.
+func sevClass(rating string) string {
+	switch strings.ToLower(rating) {
+	case "critical", "high", "medium", "low":
+		return strings.ToLower(rating)
+	case "info", "informational":
+		return "info"
+	default:
+		return "unknown"
+	}
+}
+
 // csvHeader is the CSV column order for --format csv output.
 var csvHeader = []string{
 	"slug", "type", "installed_version", "cve", "severity", "title", "affected_versions",
 }
 
-// WriteCSV writes res as CSV to w: one row per vulnerability with the
-// columns slug,type,installed_version,cve,severity,title,affected_versions.
-// Values containing commas (or quotes/newlines) are quoted by encoding/csv.
 // csvSafe neutralizes spreadsheet formula injection: a field that starts
 // with =, +, - or @ (or a tab/CR that Excel also treats as formula start)
 // gets a leading single quote so opening the CSV in Excel/Sheets cannot
@@ -252,6 +279,12 @@ func csvSafe(s string) string {
 	return s
 }
 
+// WriteCSV writes res as CSV to w: one row per vulnerability with the
+// columns slug,type,installed_version,cve,severity,title,affected_versions.
+// Values containing commas (or quotes/newlines) are quoted by encoding/csv.
+// Target-controlled fields make this reachable in practice; severity and
+// CVE are feed-controlled too, so they pass through sevClass/csvSafe as
+// well.
 func WriteCSV(w io.Writer, res *scanner.Result) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
@@ -260,14 +293,18 @@ func WriteCSV(w io.Writer, res *scanner.Result) error {
 	for i := range res.Findings {
 		f := &res.Findings[i]
 		for _, v := range f.Vulnerabilities {
+			// AffectedLabels: join first, then csvSafe — spreadsheet
+			// formula execution only triggers on the first character of
+			// the whole cell, so neutralizing the joined field once is
+			// sufficient.
 			if err := cw.Write([]string{
 				csvSafe(f.Slug),
 				f.Type,
 				csvSafe(f.InstalledVersion),
-				v.CVE,
-				strings.ToLower(v.Rating),
+				csvSafe(v.CVE),
+				csvSafe(sevClass(v.Rating)),
 				csvSafe(v.Title),
-				strings.Join(v.AffectedLabels, "; "),
+				csvSafe(strings.Join(v.AffectedLabels, "; ")),
 			}); err != nil {
 				return err
 			}

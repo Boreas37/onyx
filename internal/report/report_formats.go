@@ -58,7 +58,7 @@ func WriteMarkdown(w io.Writer, res *scanner.Result) {
 				cve = "-"
 			}
 			fmt.Fprintf(w, "| %s | %s | %s |\n",
-				strings.ToLower(v.Rating), mdCell(cve), mdCell(v.Title))
+				mdCell(sevClass(v.Rating)), mdCell(cve), mdCell(v.Title))
 		}
 		fmt.Fprint(w, "\n")
 	}
@@ -112,7 +112,9 @@ func WriteHTML(w io.Writer, res *scanner.Result) error {
 			fmt.Fprintf(&b, "<h3><span class=\"slug\">%s</span> — %d</h3>\n<table>\n<tr><th>Severity</th><th>CVE</th><th>Title</th></tr>\n",
 				esc(f.Type+"/"+f.Slug+"@"+f.InstalledVersion), len(f.Vulnerabilities))
 			for _, v := range f.Vulnerabilities {
-				sev := strings.ToLower(v.Rating)
+				// sevClass whitelists both the CSS class and the cell
+				// text: a hostile rating can never reach the attribute.
+				sev := sevClass(v.Rating)
 				fmt.Fprintf(&b, "<tr><td class=\"sev-%s\">%s</td><td>%s</td><td>%s</td></tr>\n",
 					sev, sev, esc(v.CVE), esc(v.Title))
 			}

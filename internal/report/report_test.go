@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Boreas37/onyx/internal/nuclei"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
 
@@ -96,6 +97,40 @@ func TestPrintTableShowsAuthStatus(t *testing.T) {
 	out := captureStdout(t, func() { PrintTable(res, false, "") })
 	if !strings.Contains(out, "REST auth: authenticated") {
 		t.Errorf("table output missing auth status:\n%s", out)
+	}
+}
+
+// TestWriteTableSanitizesNucleiOutput verifies the nuclei section strips
+// control characters and ANSI escapes from parsed JSON fields and routes
+// severity through the whitelist mapping.
+func TestWriteTableSanitizesNucleiOutput(t *testing.T) {
+	res := &scanner.Result{
+		IsWordPress: true,
+		Target:      "https://example.test",
+		Nuclei: []nuclei.NucleiResult{{
+			TemplateID: "CVE-2026-1111",
+			MatchedAt:  "https://example.test/wp\x1b[31m-admin\r\n/login",
+			Severity:   "critical\x1b[0m<script>",
+			Name:       "\x1b[31mEvil\x07 Name\nwith control chars",
+		}},
+	}
+	var buf bytes.Buffer
+	writeTable(&buf, res, true, "")
+	out := buf.String()
+
+	for _, bad := range []string{"\x1b", "\x07", "\r", "<script>"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("table output contains %q after sanitization:\n%q", bad, out)
+		}
+	}
+	if !strings.Contains(out, "[unknown]") {
+		t.Errorf("hostile severity not collapsed to whitelisted word:\n%s", out)
+	}
+	if !strings.Contains(out, "[cve-2026-1111]") {
+		t.Errorf("template id line missing/lowercased wrong:\n%s", out)
+	}
+	if !strings.Contains(out, "[31mEvil Name") || !strings.Contains(out, "(matched at https://example.test/wp[31m-admin") {
+		t.Errorf("sanitized name/matched-at text missing (control chars must be stripped, text kept):\n%s", out)
 	}
 }
 
@@ -304,5 +339,109 @@ func TestPrintSummaryNilSummaryPrintsNothing(t *testing.T) {
 	out := captureStdout(t, func() { PrintSummary(sampleResult()) })
 	if out != "" {
 		t.Errorf("nil summary must print nothing, got:\n%s", out)
+	}
+}
+
+// hostileEncoderResult carries markup-bearing fields through the
+// encoder-based formats (JSONL/SARIF): those rely on encoding/json
+// escaping, so the contract to verify is clean decoding, not rewriting.
+func hostileEncoderResult() *scanner.Result {
+	res := sampleResult()
+	res.Findings[0].Vulnerabilities[0].Rating = `high"><script>alert(1)</script>`
+	res.Findings[0].Vulnerabilities[0].Title = `T "&'<script>`
+	return res
+}
+
+// TestPrintJSONLHostileFieldsDecodeCleanly verifies the JSONL encoder
+// escapes hostile ratings/titles: every line stays valid JSON that
+// unmarshals back into scanner.Finding.
+func TestPrintJSONLHostileFieldsDecodeCleanly(t *testing.T) {
+	out := captureStdout(t, func() { PrintJSONL(hostileEncoderResult()) })
+
+	sc := bufio.NewScanner(strings.NewReader(out))
+	lines := 0
+	hostileSeen := false
+	for sc.Scan() {
+		lines++
+		var f scanner.Finding
+		if err := json.Unmarshal(sc.Bytes(), &f); err != nil {
+			t.Fatalf("line %d does not decode: %v\n%s", lines, err, sc.Text())
+		}
+		if f.Slug != "elementor" {
+			continue
+		}
+		hostileSeen = true
+		if len(f.Vulnerabilities) > 0 &&
+			f.Vulnerabilities[0].Rating != `high"><script>alert(1)</script>` {
+			t.Fatalf("rating did not round-trip verbatim: %q", f.Vulnerabilities[0].Rating)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !hostileSeen {
+		t.Fatal("hostile finding missing from JSONL output")
+	}
+	if lines != 2 {
+		t.Fatalf("expected 2 JSON lines, got %d", lines)
+	}
+}
+
+// TestPrintSARIFHostileFieldsDecodeCleanly verifies the SARIF encoder keeps
+// hostile feed-controlled fields structurally valid JSON with a whitelisted
+// level for the bogus rating.
+func TestPrintSARIFHostileFieldsDecodeCleanly(t *testing.T) {
+	out := captureStdout(t, func() { PrintSARIF("0.1.0", hostileEncoderResult()) })
+
+	var doc struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Results []struct {
+				Level   string `json:"level"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("sarif output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(doc.Runs) != 1 || len(doc.Runs[0].Results) != 2 {
+		t.Fatalf("sarif structure broken: %d runs / %d results",
+			len(doc.Runs), len(doc.Runs[0].Results))
+	}
+	r := doc.Runs[0].Results[0]
+	if r.Level != "none" {
+		t.Errorf("hostile rating level = %q, want whitelisted %q", r.Level, "none")
+	}
+	if want := `T "&'<script>`; r.Message.Text != want {
+		t.Errorf("message text = %q, want verbatim %q", r.Message.Text, want)
+	}
+}
+
+// TestPrintCycloneDXHostileMarkupDecodesCleanly verifies the BOM stays
+// valid JSON when component names carry markup and control characters.
+func TestPrintCycloneDXHostileMarkupDecodesCleanly(t *testing.T) {
+	res := &scanner.Result{
+		Target: `https://evil"/><script>`,
+		Detected: []scanner.Detected{{
+			Slug:    "\x1b[31mplug\x01in\"&'<x>",
+			Type:    "plugin",
+			Version: "1.\"0<>&",
+		}},
+	}
+	out := captureStdout(t, func() { PrintCycloneDX("dev", res) })
+
+	var doc cdxDoc
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("cyclonedx output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(doc.Components) != 1 {
+		t.Fatalf("got %d components, want 1:\n%s", len(doc.Components), out)
+	}
+	name, _ := doc.Components[0]["name"].(string)
+	if strings.ContainsAny(name, "\x1b\x01") {
+		t.Errorf("control characters survived into component name %q", name)
 	}
 }
