@@ -62,7 +62,7 @@ func FuzzParseDetectedList(f *testing.F) {
 		if isPlugin {
 			typ = "plugin"
 		}
-		for _, d := range parseDetectedList(body, typ) {
+		for _, d := range parseDetectedList(body, typ, "auth-rest") {
 			if len(d.Slug) > maxSlugLen || len(d.Name) > maxNameLen || len(d.Version) > maxVersionLen {
 				t.Fatalf("unsanitized detected entry: %+v", d)
 			}

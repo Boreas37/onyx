@@ -50,7 +50,7 @@ func TestSanitizeTextCapsRunes(t *testing.T) {
 
 func TestParseDetectedListSanitizesFields(t *testing.T) {
 	body := []byte(`[{"plugin":"evil/plugin.php","version":"1.0\u000b\u001b[31mred","name":"<script>\u001b]0;x"}]`)
-	got := parseDetectedList(body, "plugin")
+	got := parseDetectedList(body, "plugin", "rest")
 	if len(got) != 1 {
 		t.Fatalf("expected 1 detected, got %d", len(got))
 	}

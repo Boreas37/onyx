@@ -227,8 +227,8 @@ func TestScanPassiveVerDetectionWithoutExtraRequests(t *testing.T) {
 		bySlug[det.Slug] = det
 	}
 	for slug, wantVer := range map[string]string{
-		"elementor":         "3.24.0",
-		"twentytwentyfour":  "1.1",
+		"elementor":        "3.24.0",
+		"twentytwentyfour": "1.1",
 	} {
 		det, ok := bySlug[slug]
 		if !ok {

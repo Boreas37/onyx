@@ -508,6 +508,8 @@ func TestUsersFromAPISkipsPHPNoticePrefix(t *testing.T) {
 
 // TestUsersFromAPIUnparseableBody verifies a body with no JSON payload at
 // all is reported as unparseable instead of silently yielding no users.
+// Both REST URL forms are tried, so the errors must name every path
+// attempted.
 func TestUsersFromAPIUnparseableBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("<html><body>not json</body></html>"))
@@ -523,8 +525,19 @@ func TestUsersFromAPIUnparseableBody(t *testing.T) {
 	if len(users) != 0 {
 		t.Errorf("users = %+v, want none for an unparseable body", users)
 	}
-	if len(errs) != 1 || !strings.Contains(errs[0], "unparseable") {
-		t.Errorf("errors = %+v, want one unparseable error", errs)
+	if len(errs) == 0 {
+		t.Fatal("expected unparseable errors")
+	}
+	for _, e := range errs {
+		if !strings.Contains(e, "unparseable") {
+			t.Errorf("error %q does not mention the unparseable body", e)
+		}
+	}
+	joined := strings.Join(errs, "; ")
+	for _, want := range []string{"/wp-json/wp/v2/users", "/?rest_route=/wp/v2/users"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("errors = %+v, want every tried path including %q named", errs, want)
+		}
 	}
 }
 
@@ -1070,7 +1083,11 @@ func TestXMLRPCNotEnabledOnUnavailableEndpoint(t *testing.T) {
 	}
 }
 
-// backupServer serves a wp-config backup and a too-small decoy.
+// backupServer serves a wp-config backup carrying genuine PHP-config
+// markers, plus decoys that must stay unflagged under the authenticity
+// rule: a too-small body and a LONG homepage-HTML body (front-controller
+// rewrite installs land missing-file probes on exactly such pages, so
+// length alone must never count as exposure).
 func backupServer() *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1084,10 +1101,10 @@ func backupServer() *httptest.Server {
 		_, _ = w.Write([]byte(`{"name":"fake"}`))
 	})
 	mux.HandleFunc("/wp-config.php.bak", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(strings.Repeat("define('DB_PASSWORD', 'x');\n", 10)))
+		_, _ = w.Write([]byte("<?php\ndefine('DB_NAME', 'wordpress');\n\ndefine('DB_PASSWORD', 'x');\n"))
 	})
 	mux.HandleFunc("/wp-config.php.old", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("tiny"))
+		_, _ = w.Write([]byte("<html><body>" + strings.Repeat("rewritten homepage filler ", 20) + "</body></html>"))
 	})
 	return httptest.NewServer(mux)
 }
@@ -1347,7 +1364,7 @@ func interestingServer() *httptest.Server {
 		_, _ = w.Write([]byte(`<html><head><title>Index of /wp-content/uploads/</title></head><body><a href="../">Parent Directory</a></body></html>`))
 	})
 	mux.HandleFunc("/wp-config.php.bak", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("define('DB_PASSWORD', 'secret');"))
+		_, _ = w.Write([]byte("<?php\ndefine('DB_NAME', 'wordpress');\ndefine('DB_PASSWORD', 'secret');"))
 	})
 	mux.HandleFunc("/wp-includes/version.php", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("$wp_version = '6.4.2';"))
@@ -1612,19 +1629,17 @@ func TestCacheNegativeResponses(t *testing.T) {
 }
 
 // TestScanSummaryCounters verifies the summary statistics built by Scan():
-// the requests counter matches the number of fetch() calls issued (every
-// GET the server saw), the severity counts match the findings, and the
-// derived fields mirror the result.
+// the requests counter matches every HTTP request the server saw (GETs and
+// the XML-RPC ping POST alike), the severity counts match the findings,
+// and the derived fields mirror the result.
 func TestScanSummaryCounters(t *testing.T) {
 	mux := fakeWordPressMux()
 	var mu sync.Mutex
-	var gets int
+	var reqs int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			mu.Lock()
-			gets++
-			mu.Unlock()
-		}
+		mu.Lock()
+		reqs++
+		mu.Unlock()
 		mux.ServeHTTP(w, r)
 	}))
 	defer srv.Close()
@@ -1645,10 +1660,10 @@ func TestScanSummaryCounters(t *testing.T) {
 		t.Fatal("expected a summary, got nil")
 	}
 	mu.Lock()
-	wantReqs := gets
+	wantReqs := reqs
 	mu.Unlock()
 	if res.Summary.Requests != wantReqs {
-		t.Errorf("summary requests = %d, want %d (one per fetch call)", res.Summary.Requests, wantReqs)
+		t.Errorf("summary requests = %d, want %d (one per outbound HTTP request)", res.Summary.Requests, wantReqs)
 	}
 	if res.Summary.Detected != len(res.Detected) {
 		t.Errorf("summary detected = %d, want %d", res.Summary.Detected, len(res.Detected))
@@ -1710,5 +1725,510 @@ func TestScanNoSummarySkipsSummary(t *testing.T) {
 	}
 	if res.Summary != nil {
 		t.Errorf("summary = %+v, want nil with NoSummary", res.Summary)
+	}
+}
+
+// TestCacheGetEvictsStaleEntry verifies a cache entry past the TTL is not
+// served again AND its file is removed from the cache directory.
+func TestCacheGetEvictsStaleEntry(t *testing.T) {
+	sc := &Scanner{cacheDir: t.TempDir(), opts: Options{CacheTTL: time.Hour}}
+	u := "https://example.test/wp-login.php"
+	sc.cachePut(u, http.StatusOK, []byte("cached body"))
+	path := filepath.Join(sc.cacheDir, cacheKey(u))
+	if _, _, ok := sc.cacheGet(u); !ok {
+		t.Fatal("fresh entry should be served from cache")
+	}
+
+	stale := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(path, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if code, body, ok := sc.cacheGet(u); ok {
+		t.Errorf("stale entry served from cache: code=%d body=%q", code, body)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stale entry file still present after get: %v", err)
+	}
+}
+
+// TestInterestingVersionPHPRequiresBody pins the version.php false
+// positive: stock WordPress answers 200 with an EMPTY body for
+// /wp-includes/version.php and must not be flagged; only a non-empty body
+// counts as an exposed file.
+func TestInterestingVersionPHPRequiresBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"stock empty 200", "", false},
+		{"exposed with content", "$wp_version = '6.4.2';", true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+			})
+			mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+			})
+			mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"name":"fake"}`))
+			})
+			mux.HandleFunc("/wp-includes/version.php", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			d, _ := db.Load(minimalFeed(t))
+			sc, err := NewScanner(d, srv.URL, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := sc.Scan()
+			if err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+			found := false
+			for _, item := range res.Interesting {
+				if item == "wp-includes/version.php exposed" {
+					found = true
+				}
+			}
+			if found != tc.want {
+				t.Errorf("version.php flagged = %v, want %v (Interesting=%+v)", found, tc.want, res.Interesting)
+			}
+		})
+	}
+}
+
+// TestScanSummaryRequestsIncludesAuthorAndXMLRPC extends the request-
+// accounting coverage: Summary.Requests must include author-enumeration
+// redirects (fetchNoRedirect) and the xmlrpc.php ping (checkXMLRPC), which
+// previously bypassed s.requests. The counter must equal every request the
+// server saw.
+func TestScanSummaryRequestsIncludesAuthorAndXMLRPC(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query().Get("author"); q != "" {
+			w.Header().Set("Location", "/author/admin/")
+			w.WriteHeader(http.StatusMovedPermanently)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+	})
+	mux.HandleFunc("/wp-login.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("<input name='log' id='user_login' />"))
+	})
+	mux.HandleFunc("/wp-json/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"name":"fake","url":"http://example"}`))
+	})
+	mux.HandleFunc("/wp-json/wp/v2/users", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"id":1,"name":"Administrator","slug":"admin"}]`))
+	})
+	mux.HandleFunc("/xmlrpc.php", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<?xml version="1.0"?><methodResponse><params><param><value><array><data><value><string>system.listMethods</string></value></data></array></value></param></params></methodResponse>`))
+	})
+	var mu sync.Mutex
+	var seen int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen++
+		mu.Unlock()
+		mux.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	d, err := db.Load(minimalFeed(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := NewScanner(d, srv.URL, Options{Enumerate: "u"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	// Prove both request kinds actually happened during the scan.
+	if len(res.Users) == 0 {
+		t.Fatalf("expected author-enumerated users, got %+v", res.Users)
+	}
+	if !res.XMLRPC {
+		t.Fatal("expected the xmlrpc.php ping to run")
+	}
+	mu.Lock()
+	want := seen
+	mu.Unlock()
+	if res.Summary == nil {
+		t.Fatal("expected a summary, got nil")
+	}
+	if res.Summary.Requests != want {
+		t.Errorf("summary requests = %d, want %d (author redirects + xmlrpc ping must be counted)", res.Summary.Requests, want)
+	}
+}
+
+// fcHomepage is the trap page served for every missing path on
+// frontControllerServer: besides the generator meta it embeds
+// line-starting "Stable tag:"/"Version:" lines, so the bare regex
+// extractors fire on any rewritten body — exactly the live-lab WordPress
+// 7.x/Apache shape that produced false positives before the scanJob
+// authenticity guard existed.
+const fcHomepage = `<!DOCTYPE html>
+<html><head><meta name="generator" content="WordPress 7.1" /></head>
+<body>
+Stable tag: 9.9.9
+Version: 8.8.8
+</body></html>`
+
+// frontControllerServer mimics an install whose front-controller rewrites
+// answer every MISSING file with a 301 landing on the 200 homepage HTML;
+// only "/" itself is served directly.
+func frontControllerServer() *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(fcHomepage))
+			return
+		}
+		http.Redirect(w, r, "/", http.StatusMovedPermanently)
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestScanJobGuardRejectsRewrittenHomepage pins the front-controller false
+// positive: aggressive enumeration of bogus plugin AND theme slugs gets a
+// 301->200 rewritten homepage whose HTML carries line-starting "Stable
+// tag:"/"Version:" lines. Without the scanJob authenticity guard every
+// nonexistent slug would surface as installed; none may appear here.
+func TestScanJobGuardRejectsRewrittenHomepage(t *testing.T) {
+	// Sanity: the fixture really is a trap — both extractors fire on it.
+	if v, ok := ExtractVersionFromReadme(fcHomepage); !ok || v != "9.9.9" {
+		t.Fatalf("fixture broken: readme extractor got %q,%v want 9.9.9,true", v, ok)
+	}
+	if v, ok := ExtractVersionFromStyleCSS(fcHomepage); !ok || v != "8.8.8" {
+		t.Fatalf("fixture broken: style extractor got %q,%v want 8.8.8,true", v, ok)
+	}
+
+	srv := frontControllerServer()
+	defer srv.Close()
+
+	d, err := db.Load(minimalFeed(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := NewScanner(d, srv.URL, Options{
+		DetectionMode: "aggressive",
+		PluginsList:   writeList(t, "totally-bogus-plugin"),
+		ThemesList:    writeList(t, "totally-bogus-theme"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(res.Detected) != 0 {
+		t.Errorf("rewritten homepage must not produce detections, got %+v", res.Detected)
+	}
+	if len(res.Findings) != 0 {
+		t.Errorf("rewritten homepage must not produce findings, got %+v", res.Findings)
+	}
+}
+
+// TestScanJobRealReadmeStillDetected proves the scanJob authenticity guard
+// keeps working detection intact: a genuine readme.txt (=== heading,
+// Contributors, Stable tag) enumerated aggressively still yields the
+// component and its parsed version.
+func TestScanJobRealReadmeStillDetected(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+	})
+	mux.HandleFunc("/wp-content/plugins/realplug/readme.txt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`=== RealPlug ===
+Contributors: realplugteam
+Tags: real
+Requires at least: 5.0
+Stable tag: 1.2.3
+
+RealPlug does real things.
+`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{
+		DetectionMode: "aggressive",
+		PluginsList:   writeList(t, "realplug"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := sc.Scan()
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	found := false
+	for _, det := range res.Detected {
+		if det.Slug == "realplug" {
+			found = true
+			if det.Version != "1.2.3" {
+				t.Errorf("realplug version = %q, want 1.2.3", det.Version)
+			}
+			if det.Source != "readme" {
+				t.Errorf("realplug source = %q, want readme", det.Source)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected realplug detection, got %+v", res.Detected)
+	}
+}
+
+// TestScanJobStyleCSSRequiresThemeHeader pins the theme-side half of the
+// scanJob guard: a style.css answering 200 with a Version line is only
+// believed when it also carries the mandatory WordPress "Theme Name:"
+// header; headerless CSS (or a rewritten homepage carrying a stray
+// "Version:") must not be reported.
+func TestScanJobStyleCSSRequiresThemeHeader(t *testing.T) {
+	cases := []struct {
+		name    string
+		css     string
+		wantVer string // empty = must NOT be reported at all
+	}{
+		{
+			name:    "genuine theme stylesheet detected",
+			css:     "/*\nTheme Name: Probe Theme\nAuthor: someone\nVersion: 2.0\n*/\nbody { margin: 0; }\n",
+			wantVer: "2.0",
+		},
+		{
+			name:    "headerless css with version line rejected",
+			css:     "/* Minified custom css */\nbody { margin: 0 }\nVersion: 2.0\n",
+			wantVer: "",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Sanity: the extractor must fire on every fixture, so any
+			// rejection below is provably the authenticity guard's doing.
+			if _, ok := ExtractVersionFromStyleCSS(tc.css); !ok {
+				t.Fatalf("fixture broken: extractor must fire on %q", tc.css)
+			}
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = w.Write([]byte(`<html><head><meta name="generator" content="WordPress 6.4.2" /></head><body></body></html>`))
+			})
+			mux.HandleFunc("/wp-content/themes/probe-theme/style.css", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.css))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			d, _ := db.Load(minimalFeed(t))
+			sc, err := NewScanner(d, srv.URL, Options{
+				DetectionMode: "aggressive",
+				ThemesList:    writeList(t, "probe-theme"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := sc.Scan()
+			if err != nil {
+				t.Fatalf("Scan: %v", err)
+			}
+			if tc.wantVer == "" {
+				if len(res.Detected) != 0 {
+					t.Errorf("style.css without Theme Name header must not be reported, got %+v", res.Detected)
+				}
+				return
+			}
+			found := false
+			for _, det := range res.Detected {
+				if det.Slug == "probe-theme" {
+					found = true
+					if det.Version != tc.wantVer {
+						t.Errorf("probe-theme version = %q, want %q", det.Version, tc.wantVer)
+					}
+					if det.Source != "style.css" {
+						t.Errorf("probe-theme source = %q, want style.css", det.Source)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("expected probe-theme detection, got %+v", res.Detected)
+			}
+		})
+	}
+}
+
+// TestInterestingWpConfigBakRequiresPHPConfig drives interestingFinders
+// against bodies that all answer 200 and pins the exposure rule: only a
+// body shaped like a genuine PHP config dump (<?php plus DB constants /
+// table_prefix) is flagged; long homepage HTML, PHP without config
+// constants and config constants without the PHP tag are not.
+func TestInterestingWpConfigBakRequiresPHPConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "php config dump flagged",
+			body: "<?php\ndefine('DB_NAME', 'wordpress');\ndefine('DB_PASSWORD', 'secret');\n$table_prefix = 'wp_';\n",
+			want: true,
+		},
+		{
+			name: "rewritten homepage html not flagged",
+			body: "<html><head><meta name=\"generator\" content=\"WordPress 7.1\" /></head>\n<body>" +
+				strings.Repeat("long enough padding ", 20) + "</body></html>",
+			want: false,
+		},
+		{
+			name: "php tag without config constants not flagged",
+			body: "<?php\n// some other php file\n",
+			want: false,
+		},
+		{
+			name: "config constants without php tag not flagged",
+			body: "define('DB_NAME', 'wordpress'); define('DB_PASSWORD', 'x'); $table_prefix = 'wp_';",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("<html><body>plain site</body></html>"))
+			})
+			mux.HandleFunc("/wp-config.php.bak", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			d, _ := db.Load(minimalFeed(t))
+			sc, err := NewScanner(d, srv.URL, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := sc.interestingFinders()
+			found := false
+			for _, item := range got {
+				if item == "wp-config.php.bak exposed" {
+					found = true
+				}
+			}
+			if found != tc.want {
+				t.Errorf("wp-config.php.bak exposed = %v (finders=%+v), want %v", found, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUsersFromAPIRestRouteFallback verifies the plain-permalink REST
+// fallback: installs without pretty permalinks answer /wp-json/wp/v2/users
+// with a 404 while /?rest_route=/wp/v2/users serves the very same JSON.
+// usersFromAPI must walk both URL forms and return the users error-free.
+func TestUsersFromAPIRestRouteFallback(t *testing.T) {
+	var mu sync.Mutex
+	var prettyHits, restHits int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/wp-json/wp/v2/users", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		prettyHits++
+		mu.Unlock()
+		http.NotFound(w, r) // plain permalinks: the pretty REST path 404s
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("rest_route") == "/wp/v2/users" {
+			mu.Lock()
+			restHits++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`[{"id":1,"name":"Administrator","slug":"admin"},{"id":2,"name":"Editor","slug":"editor"}]`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, errs := sc.usersFromAPI()
+	if len(errs) != 0 {
+		t.Fatalf("usersFromAPI errors = %+v, want none", errs)
+	}
+	if len(users) != 2 || users[0].Slug != "admin" || users[1].Slug != "editor" {
+		t.Fatalf("users = %+v, want admin + editor", users)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if prettyHits != 1 || restHits != 1 {
+		t.Errorf("hits pretty=%d rest_route=%d, want 1/1 (fallback must actually be exercised)", prettyHits, restHits)
+	}
+}
+
+// TestAPIPluginsRestRouteFallback mirrors the users fallback for the
+// plugin listing: /wp-json/wp/v2/plugins 404s, /?rest_route=/wp/v2/plugins
+// answers with the inventory, and apiPlugins must surface it error-free.
+func TestAPIPluginsRestRouteFallback(t *testing.T) {
+	var mu sync.Mutex
+	var prettyHits, restHits int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/wp-json/wp/v2/plugins", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		prettyHits++
+		mu.Unlock()
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("rest_route") == "/wp/v2/plugins" {
+			mu.Lock()
+			restHits++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`[{"plugin":"elementor/elementor.php","status":"active","version":"3.24.0","name":"Elementor"}]`))
+			return
+		}
+		http.NotFound(w, r)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	detected, errs := sc.apiPlugins()
+	if len(errs) != 0 {
+		t.Fatalf("apiPlugins errors = %+v, want none", errs)
+	}
+	if len(detected) != 1 || detected[0].Slug != "elementor" || detected[0].Version != "3.24.0" {
+		t.Fatalf("detected = %+v, want elementor 3.24.0", detected)
+	}
+	if detected[0].Source != "rest" {
+		t.Errorf("source = %q, want rest", detected[0].Source)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if prettyHits != 1 || restHits != 1 {
+		t.Errorf("hits pretty=%d rest_route=%d, want 1/1 (fallback must actually be exercised)", prettyHits, restHits)
 	}
 }

@@ -157,9 +157,9 @@ func TestDiscoverViaSitemapIndexToChildPages(t *testing.T) {
 	}
 
 	wantVers := map[string]string{
-		"elementor":         "3.20.0",
-		"hello-dolly":       "1.6", // html-entity ampersand tolerated
-		"twentytwentyfour":  "1.1",
+		"elementor":        "3.20.0",
+		"hello-dolly":      "1.6", // html-entity ampersand tolerated
+		"twentytwentyfour": "1.1",
 	}
 	for slug, want := range wantVers {
 		if got := sc.sitemapVersions[slug]; got != want {

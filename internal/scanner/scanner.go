@@ -930,7 +930,6 @@ func (s *Scanner) noteRateLimited(h http.Header) time.Duration {
 		}
 	}
 	wait := s.rlBackoff
-	hinted := false
 	if ra, ok := retryAfter(h, time.Now()); ok {
 		// Clamp to [1s, 60s]: never spin faster than a second against an
 		// explicit hint, and never let one stall the scan forever.
@@ -941,7 +940,6 @@ func (s *Scanner) noteRateLimited(h http.Header) time.Duration {
 			ra = time.Second
 		}
 		wait = ra
-		hinted = true
 	}
 	s.cooldownUntil = time.Now().Add(wait)
 	if s.rateHits >= rateAbortMinHits {
@@ -950,7 +948,6 @@ func (s *Scanner) noteRateLimited(h http.Header) time.Duration {
 			s.abortRateLimited.Store(true)
 		}
 	}
-	_ = hinted // reserved for richer progress rendering
 	return wait
 }
 
@@ -1030,6 +1027,7 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 		if err != nil {
 			return 0, nil, nil, err
 		}
+		s.requests.Add(1)
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, nil, err
@@ -1074,11 +1072,20 @@ func cacheKey(u string) string {
 // cacheGet serves u from the disk cache when a fresh (within TTL) response
 // is stored. The cached status code is returned alongside the body so
 // callers can treat negative (404/403) hits the same as fresh ones. ok is
-// false on any miss or read error.
+// false on any miss or read error. Entries past the TTL are evicted
+// (best-effort unlink) so a long-lived cache directory does not grow
+// without bound.
 func (s *Scanner) cacheGet(u string) (int, []byte, bool) {
 	path := filepath.Join(s.cacheDir, cacheKey(u))
 	fi, err := os.Stat(path)
-	if err != nil || time.Since(fi.ModTime()) > s.opts.CacheTTL {
+	if err != nil {
+		return 0, nil, false
+	}
+	if time.Since(fi.ModTime()) > s.opts.CacheTTL {
+		// Stale: drop the entry so it cannot be served again and does not
+		// accumulate. Removal failures are silent — the cache is an
+		// optimization, never a scan error.
+		_ = os.Remove(path)
 		return 0, nil, false
 	}
 	data, err := os.ReadFile(path)
@@ -1111,7 +1118,9 @@ func (s *Scanner) cachePut(u string, code int, body []byte) {
 }
 
 // checkXMLRPC pings POST /xmlrpc.php with a system.listMethods call and
-// reports whether the server answered with a methodResponse payload.
+// reports whether the server answered with a methodResponse payload. The
+// request shares the scan-wide pacing: 429 cooldown gate, adaptive send
+// slot and the request counter.
 func (s *Scanner) checkXMLRPC() bool {
 	s.lim.wait()
 	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
@@ -1122,6 +1131,9 @@ func (s *Scanner) checkXMLRPC() bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "text/xml")
+	s.rateLimitGate()
+	s.claimSendSlot()
+	s.requests.Add(1)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return false
@@ -1137,8 +1149,65 @@ func (s *Scanner) checkXMLRPC() bool {
 	return strings.Contains(string(body), "methodResponse")
 }
 
+// Response-authenticity helpers.
+//
+// Live-lab verified on WordPress 7.x/Apache: servers with front-controller
+// rewrites answer requests for MISSING files with a redirect that lands on
+// 200 + full homepage HTML. A 200 status therefore proves nothing about
+// what was actually fetched — every helper below inspects the body for
+// markers only the genuine artifact carries, keeping rewritten homepages
+// from being misread as exposed config backups or fingerprintable
+// components.
+
+// looksLikePHPConfig reports whether body carries the unmistakable shape of
+// a WordPress wp-config.php dump: a PHP open tag plus one of the canonical
+// WordPress configuration constants (DB_NAME, DB_PASSWORD or table_prefix).
+// Homepage HTML served by front-controller rewrites never carries this
+// combination — which is exactly what defeated the old len(body)>100 rule:
+// a redirected homepage is always long enough but never a config dump.
+func looksLikePHPConfig(body []byte) bool {
+	b := string(body)
+	if !strings.Contains(b, "<?php") {
+		return false
+	}
+	return strings.Contains(b, "DB_NAME") ||
+		strings.Contains(b, "DB_PASSWORD") ||
+		strings.Contains(b, "table_prefix")
+}
+
+// looksLikeReadme reports whether body has the structural markers of a real
+// WordPress readme.txt: the "===" heading style plus at least one field
+// only readmes carry (matched case-insensitively). A stray line-starting
+// "Stable tag:" inside rewritten homepage HTML is not enough.
+func looksLikeReadme(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	if !strings.Contains(lower, "===") {
+		return false
+	}
+	for _, marker := range []string{
+		"contributors:", "donate link:", "tags:", "requires at least", "stable tag",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeThemeCSS reports whether body looks like a WordPress theme
+// stylesheet: every theme style.css carries the "Theme Name:" header
+// mandated by the WordPress theme handbook; plain CSS files and rewritten
+// homepage HTML do not.
+func looksLikeThemeCSS(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "theme name:")
+}
+
 // configBackupFinder probes every wp-config backup name at the site root.
-// A 200 response with more than 100 bytes of content counts as a hit.
+// A hit requires a 200 response whose body actually looks like PHP config
+// (see looksLikePHPConfig): on front-controller rewrite installs missing
+// files land on the 200 homepage HTML, which always exceeds 100 bytes, so
+// the former size-only rule flagged every stock install behind such
+// rewrites.
 func (s *Scanner) configBackupFinder() []string {
 	var found []string
 	for _, f := range configBackupFiles {
@@ -1146,7 +1215,7 @@ func (s *Scanner) configBackupFinder() []string {
 		if err != nil {
 			continue
 		}
-		if code == http.StatusOK && len(body) > 100 {
+		if code == http.StatusOK && looksLikePHPConfig(body) {
 			found = append(found, "/"+f)
 		}
 	}
@@ -1215,46 +1284,78 @@ func (s *Scanner) interestingFinders() []string {
 		}
 	}
 
-	try("/wp-config.php.bak", "", "wp-config.php.bak exposed")
-	try("/wp-includes/version.php", "", "wp-includes/version.php exposed")
+	// wp-config.php.bak is special-cased like version.php below: on
+	// front-controller rewrite installs the probe lands on the 200 homepage
+	// HTML, so exposure requires a body that really looks like PHP config,
+	// not just any non-empty 200.
+	code, body, err = s.fetch("/wp-config.php.bak")
+	if err == nil && code == http.StatusOK && looksLikePHPConfig(body) {
+		out = append(out, "wp-config.php.bak exposed")
+	}
+	// version.php is special-cased: stock WordPress answers 200 with an
+	// empty body for this path (the PHP file produces no output), so a
+	// non-empty body is required before calling it exposed.
+	code, body, err = s.fetch("/wp-includes/version.php")
+	if err == nil && code == http.StatusOK && len(body) > 0 {
+		out = append(out, "wp-includes/version.php exposed")
+	}
 	return out
 }
 
-// extracts id/slug/name for each account.
+// restPath lists the URL forms under which a WordPress REST route answers:
+// pretty-permalink installs expose /wp-json<path>, while sites running
+// WITHOUT rewrite rules serve REST only through the rest_route query
+// parameter (their /wp-json/* paths 404 even though the API itself works).
+// Callers try the candidates in order until one yields usable data.
+func restPath(path string) []string {
+	return []string{"/wp-json" + path, "/?rest_route=" + path}
+}
+
+// usersFromAPI queries the REST users endpoint, trying the pretty
+// /wp-json/wp/v2/users form first and the plain-permalink
+// /?rest_route=/wp/v2/users fallback second. The first candidate returning
+// a parseable JSON user list wins; auth rejections, wrong status codes and
+// unparseable bodies fall through to the next form. The returned errors
+// name every path actually tried.
 func (s *Scanner) usersFromAPI() ([]User, []string) {
 	var errs []string
-	code, body, err := s.fetch("/wp-json/wp/v2/users")
-	if err != nil {
-		errs = append(errs, "wp-json/wp/v2/users: "+err.Error())
-		return nil, errs
-	}
-	if code == http.StatusUnauthorized || code == http.StatusForbidden {
-		errs = append(errs, "wp-json/wp/v2/users requires authentication (skipped)")
-		return nil, errs
-	}
-	if code != http.StatusOK {
-		return nil, errs
-	}
-	// WordPress can prepend PHP Deprecated/Warning notices to the JSON
-	// payload; skip everything before the first '[' or '{' so the JSON
-	// decoder never sees the noise.
-	start := -1
-	for i, b := range body {
-		if b == '[' || b == '{' {
-			start = i
-			break
+	for _, path := range restPath("/wp/v2/users") {
+		code, body, err := s.fetch(path)
+		if err != nil {
+			errs = append(errs, path+": "+err.Error())
+			continue
 		}
+		if code == http.StatusUnauthorized || code == http.StatusForbidden {
+			// A hardening plugin may only cover one URL spelling, so note
+			// the rejection and let the other form answer before giving up.
+			errs = append(errs, path+" requires authentication (skipped)")
+			continue
+		}
+		if code != http.StatusOK {
+			continue // e.g. 404 on the pretty form: the fallback may still work
+		}
+		// WordPress can prepend PHP Deprecated/Warning notices to the JSON
+		// payload; skip everything before the first '[' or '{' so the JSON
+		// decoder never sees the noise.
+		start := -1
+		for i, b := range body {
+			if b == '[' || b == '{' {
+				start = i
+				break
+			}
+		}
+		if start < 0 {
+			errs = append(errs, path+" returned unparseable data")
+			continue
+		}
+		users := usersFromJSON(body[start:])
+		if users == nil {
+			errs = append(errs, path+" returned unparseable data")
+			continue
+		}
+		return users, nil
 	}
-	if start < 0 {
-		errs = append(errs, "wp-json/wp/v2/users returned unparseable data")
-		return nil, errs
-	}
-	users := usersFromJSON(body[start:])
-	if users == nil {
-		errs = append(errs, "wp-json/wp/v2/users returned unparseable data")
-		return nil, errs
-	}
-	return users, nil
+	return nil, errs
 }
 
 // usersFromJSON decodes a wp-json users payload into sanitized User entries.
@@ -1452,48 +1553,36 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 	return coreVersion, evidence, nil
 }
 
-// apiPlugins queries the authenticated plugin listing endpoint. Unauthenticated
-// servers return 401/403; that is expected and swallowed.
+// apiPlugins queries the plugin listing endpoint, trying the pretty
+// /wp-json/wp/v2/plugins URL first and the plain-permalink
+// /?rest_route=/wp/v2/plugins fallback second: installs without rewrite
+// rules 404 the pretty form even though REST works. The first candidate
+// returning a usable plugin list wins. Unauthenticated servers return
+// 401/403; that is expected and swallowed as a skip note naming the actual
+// path that rejected us.
 func (s *Scanner) apiPlugins() ([]Detected, []string) {
-	var out []Detected
 	var errs []string
-	code, body, err := s.fetch("/wp-json/wp/v2/plugins")
-	if err != nil {
-		errs = append(errs, "wp-json/wp/v2/plugins: "+err.Error())
-		return nil, errs
-	}
-	if code == 401 || code == 403 {
-		errs = append(errs, "wp-json/wp/v2/plugins requires authentication (skipped)")
-		return nil, errs
-	}
-	if code != 200 {
-		return nil, errs
-	}
-	var items []struct {
-		Plugin  string `json:"plugin"`
-		Version string `json:"version"`
-		Name    string `json:"name"`
-	}
-	if err := json.Unmarshal(body, &items); err != nil || len(items) == 0 {
-		errs = append(errs, "wp-json/wp/v2/plugins returned no usable plugin list")
-		return nil, errs
-	}
-	for _, it := range items {
-		slug := it.Plugin
-		if i := strings.IndexByte(slug, '/'); i >= 0 {
-			slug = slug[:i]
-		}
-		slug = sanitizeText(slug, maxSlugLen)
-		if slug == "" {
+	for _, path := range restPath("/wp/v2/plugins") {
+		code, body, err := s.fetch(path)
+		if err != nil {
+			errs = append(errs, path+": "+err.Error())
 			continue
 		}
-		ver := sanitizeVersion(it.Version)
-		if ver == "" {
-			ver = "unknown"
+		if code == 401 || code == 403 {
+			errs = append(errs, path+" requires authentication (skipped)")
+			continue
 		}
-		out = append(out, Detected{Slug: slug, Name: sanitizeText(it.Name, maxNameLen), Type: "plugin", Version: ver, Source: "rest"})
+		if code != 200 {
+			continue
+		}
+		out := parseDetectedList(body, "plugin", "rest")
+		if len(out) == 0 {
+			errs = append(errs, path+" returned no usable plugin list")
+			continue
+		}
+		return out, nil
 	}
-	return out, nil
+	return nil, errs
 }
 
 // job is one brute-force enumeration request.
@@ -1673,6 +1762,20 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 
 // scanJob performs one enumeration request, fingerprinting the installed
 // version and matching it against the database.
+//
+// A 200 status alone does not prove the probe hit a real readme.txt /
+// style.css: servers with front-controller rewrites answer requests for
+// MISSING files with a redirect that lands on 200 + full homepage HTML.
+// When that HTML happens to contain a line-starting "Stable tag:" or
+// "Version:" line, the bare regex extractors fire on it and EVERY
+// nonexistent slug would be reported as installed with a bogus version.
+// The extracted version therefore ALSO requires the body to pass the
+// response-authenticity check for its artifact type (looksLikeReadme /
+// looksLikeThemeCSS). Anything failing that gate — including a genuine 200
+// body without a parseable version — returns NO detection at all: guessing
+// "unknown" from untrusted markup pollutes the inventory with rewritten
+// homepages. A non-200 answer keeps its historical behaviour of returning
+// nothing as well.
 func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 	code, body, err := s.fetch(j.path)
 	if err != nil {
@@ -1688,15 +1791,16 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 	switch j.kind {
 	case "plugin":
 		ver, found = ExtractVersionFromReadme(string(body))
+		found = found && looksLikeReadme(body)
 	case "theme":
 		ver, found = ExtractVersionFromStyleCSS(string(body))
 		source = "style.css"
+		found = found && looksLikeThemeCSS(body)
 	}
-	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: "unknown", Source: source}}
 	if !found {
-		return detected, nil
+		return nil, nil
 	}
-	detected[0].Version = ver
+	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: ver, Source: source}}
 	f := s.matchDatabase(j.slug, j.kind, ver)
 	if len(f.Vulnerabilities) > 0 {
 		return detected, []Finding{f}
