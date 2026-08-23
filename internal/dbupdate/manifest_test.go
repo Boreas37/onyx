@@ -80,6 +80,38 @@ func TestFetchManifestBadJSON(t *testing.T) {
 	}
 }
 
+// TestParseManifest covers the shared parser behind FetchManifest.
+func TestParseManifest(t *testing.T) {
+	t.Run("valid document", func(t *testing.T) {
+		m, err := ParseManifest([]byte(`{
+		  "generated_at": "2026-08-21T04:00:00Z",
+		  "full": {"sha256": "abc", "size": 5, "path": "f.json.gz"},
+		  "deltas": [{"from_sha256": "def", "path": "d.json.gz"}]
+		}`))
+		if err != nil {
+			t.Fatalf("ParseManifest: %v", err)
+		}
+		if m.GeneratedAt != "2026-08-21T04:00:00Z" || m.Full.Sha256 != "abc" || len(m.Deltas) != 1 || m.Deltas[0].FromSha256 != "def" {
+			t.Fatalf("parsed = %+v", m)
+		}
+	})
+	t.Run("garbage input errors", func(t *testing.T) {
+		if _, err := ParseManifest([]byte("}not json{")); err == nil ||
+			!strings.Contains(err.Error(), "parsing manifest") {
+			t.Fatalf("err = %v, want parsing manifest error", err)
+		}
+	})
+	t.Run("empty deltas tolerated", func(t *testing.T) {
+		m, err := ParseManifest([]byte(`{"generated_at":"t","full":{"sha256":"s"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(m.Deltas) != 0 {
+			t.Fatalf("deltas = %+v, want empty", m.Deltas)
+		}
+	})
+}
+
 func TestFetchManifestConnectionError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close() // shut down immediately: connection refused

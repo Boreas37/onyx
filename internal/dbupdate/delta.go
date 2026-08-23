@@ -187,9 +187,15 @@ func GenerateDelta(oldPath, newPath string, outPath string) (DeltaStats, error) 
 //
 // Verification performed:
 //
-//   - header.base_sha256 must equal the streamed sha256 of basePath,
-//     otherwise ApplyDelta fails with "base file hash mismatch" before any
-//     output is written;
+//   - header.base_sha256 must equal the sha256 of the complete base file.
+//     The base is opened exactly once: a single streaming pass copies
+//     untouched records while feeding every raw byte through the hasher,
+//     and the digest is compared to header.base_sha256 at the end of that
+//     pass — before any op-derived record reaches the writer. This closes
+//     a TOCTOU gap where a second open could observe different content
+//     than the hash check did. Because writeFileAtomic writes to a temp
+//     file and renames only on success, a mismatch aborts cleanly and no
+//     output appears;
 //   - the number of parsed operation lines must equal header.records
 //     (catches truncated deltas);
 //   - every operation must apply cleanly: update/remove ids must exist in
@@ -205,11 +211,6 @@ func GenerateDelta(oldPath, newPath string, outPath string) (DeltaStats, error) 
 // the feed the delta was generated from.
 func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 	var stats DeltaStats
-
-	baseSHA, err := fileSHA256(basePath)
-	if err != nil {
-		return stats, fmt.Errorf("hashing base feed: %w", err)
-	}
 
 	df, err := os.Open(deltaPath)
 	if err != nil {
@@ -234,9 +235,6 @@ func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 	}
 	if header.Format != DeltaFormat {
 		return stats, fmt.Errorf("delta %s: unsupported format %q (want %q)", deltaPath, header.Format, DeltaFormat)
-	}
-	if header.BaseSHA256 != baseSHA {
-		return stats, errors.New("base file hash mismatch")
 	}
 
 	// Parse all operations up front. Deltas are tiny relative to feeds, and
@@ -277,6 +275,19 @@ func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 
 	applied := make(map[string]bool, len(ops))
 
+	// Single open of the base feed: every raw byte flows through the
+	// tee'd hasher exactly once while records stream to the writer. The
+	// digest is validated after the pass completes but before pass 2
+	// emits any op-derived entries, so a mutated/mismatched base can
+	// never produce accepted output (the atomic temp+rename discards it).
+	bf, err := os.Open(basePath)
+	if err != nil {
+		return stats, fmt.Errorf("opening base feed: %w", err)
+	}
+	defer bf.Close()
+	baseHash := sha256.New()
+	baseBr := bufio.NewReaderSize(bf, 1<<20)
+
 	err = writeFileAtomic(outPath, func(w io.Writer) error {
 		if _, err := io.WriteString(w, "{\n"); err != nil {
 			return err
@@ -303,8 +314,9 @@ func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 			return err
 		}
 
-		// Pass 1: stream the base, copying untouched records verbatim.
-		if err := streamFeed(basePath, func(id string, raw json.RawMessage) error {
+		// Pass 1: stream the base, hashing its raw bytes and copying
+		// untouched records verbatim.
+		if err := streamFeedReader(io.TeeReader(baseBr, baseHash), basePath, func(id string, raw json.RawMessage) error {
 			stats.BaseRecords++
 			op, tracked := ops[id]
 			if !tracked {
@@ -325,6 +337,14 @@ func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 			}
 		}); err != nil {
 			return err
+		}
+		// Drain bytes the JSON decoder never consumed (trailing
+		// whitespace/newlines) so the digest covers the whole file.
+		if _, err := io.Copy(baseHash, baseBr); err != nil {
+			return err
+		}
+		if got := hex.EncodeToString(baseHash.Sum(nil)); got != header.BaseSHA256 {
+			return errors.New("base file hash mismatch")
 		}
 
 		// Pass 2: append adds in operation order; report update/remove ops
@@ -374,25 +394,34 @@ func loadFeed(path string) (map[string][]byte, error) {
 	return m, nil
 }
 
-// streamFeed walks a feed object, invoking fn for every record with its
-// outer key and raw JSON value. It mirrors db.Load's streaming approach:
-// dec.Token() opens the object, dec.More() iterates entries, values are
-// captured as json.RawMessage so callers see the original bytes.
-//
-// An empty or whitespace-only file is tolerated as a zero-record feed
-// (useful when bootstrapping deltas from a missing snapshot); any other
-// malformed input is an error.
+// streamFeed walks the feed file at path, invoking fn for every record
+// with its outer key and raw JSON value. See streamFeedReader for the
+// parsing rules.
 func streamFeed(path string, fn func(id string, raw json.RawMessage) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	return streamFeedReader(bufio.NewReaderSize(f, 1<<20), path, fn)
+}
 
-	dec := json.NewDecoder(bufio.NewReaderSize(f, 1<<20))
+// streamFeedReader is streamFeed's core over an arbitrary reader. It
+// mirrors db.Load's streaming approach: dec.Token() opens the object,
+// dec.More() iterates entries, values are captured as json.RawMessage so
+// callers see the original bytes.
+//
+// An empty or whitespace-only input is tolerated as a zero-record feed
+// (useful when bootstrapping deltas from a missing snapshot); any other
+// malformed input is an error. Note that bytes after the closing brace —
+// and any read-ahead left in r — are NOT consumed; callers that need to
+// account for every byte (e.g. hashers behind a TeeReader) must drain r
+// themselves.
+func streamFeedReader(r io.Reader, path string, fn func(id string, raw json.RawMessage) error) error {
+	dec := json.NewDecoder(r)
 	tok, err := dec.Token()
 	if errors.Is(err, io.EOF) {
-		return nil // empty file = empty feed
+		return nil // empty input = empty feed
 	}
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", path, err)

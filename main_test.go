@@ -13,11 +13,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Boreas37/onyx/internal/dbupdate"
 	"github.com/Boreas37/onyx/internal/nuclei"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
@@ -1223,4 +1225,153 @@ func TestVersionPlainKeepsFormat(t *testing.T) {
 	}); out != "onyx "+onyxVersion+"\n" {
 		t.Errorf("plain version output = %q, want %q", out, "onyx "+onyxVersion+"\n")
 	}
+}
+
+// ---- updateViaDelta: manifest dedupe + freshness (downgrade) guard ----
+
+// manifestDoc builds a minimal manifest.json body for the guard tests.
+func manifestDoc(generatedAt, fullSHA string, deltas ...string) string {
+	doc := fmt.Sprintf(`{"generated_at":%q,"full":{"sha256":%q,"size":1,"path":"f.json.gz"}`, generatedAt, fullSHA)
+	if len(deltas) == 0 {
+		return doc + `,"deltas":[]}`
+	}
+	entries := make([]string, 0, len(deltas))
+	for _, sha := range deltas {
+		entries = append(entries, fmt.Sprintf(`{"from_sha256":%q,"path":"delta-%s.json.gz","records":{"added":0,"removed":0,"updated":0,"result":0}}`, sha, sha))
+	}
+	return doc + fmt.Sprintf(`,"deltas":[%s]}`, strings.Join(entries, ","))
+}
+
+func TestDedupeManifestDeltas(t *testing.T) {
+	m := &dbupdate.Manifest{Deltas: []dbupdate.DeltaEntry{
+		{FromSha256: "aa", Path: "a.gz"},
+		{FromSha256: "aa", Path: "a.gz"}, // exact duplicate: first wins
+		{FromSha256: "bb", Path: "b.gz"},
+		{FromSha256: "bb", Path: "b2.gz"}, // different pair: both kept
+	}}
+	dedupeManifestDeltas(m)
+	want := []dbupdate.DeltaEntry{
+		{FromSha256: "aa", Path: "a.gz"},
+		{FromSha256: "bb", Path: "b.gz"},
+		{FromSha256: "bb", Path: "b2.gz"},
+	}
+	if !reflect.DeepEqual(m.Deltas, want) {
+		t.Fatalf("deduped = %+v, want %+v", m.Deltas, want)
+	}
+
+	// First occurrence wins when a later entry repeats a pair.
+	m2 := &dbupdate.Manifest{Deltas: []dbupdate.DeltaEntry{
+		{FromSha256: "cc", Path: "first.gz"},
+		{FromSha256: "dd", Path: "x.gz"},
+		{FromSha256: "dd", Path: "x.gz"},
+	}}
+	dedupeManifestDeltas(m2)
+	if len(m2.Deltas) != 2 || m2.Deltas[1].Path != "x.gz" {
+		t.Fatalf("deduped = %+v, want first occurrence kept", m2.Deltas)
+	}
+
+	dedupeManifestDeltas(nil) // must not panic
+}
+
+func TestUpdateViaDeltaDowngradeGuard(t *testing.T) {
+	const localSHA = "1111111111111111111111111111111111111111111111111111111111111111"
+
+	newer := "2026-08-22T04:00:00Z"
+	older := "2026-08-21T04:00:00Z"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(manifestDoc(older, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "feed.json")
+	if err := os.WriteFile(dst+".sha256", []byte(localSHA+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Previously accepted a NEWER manifest: serving an older one is a
+	// downgrade and the delta fast-path must refuse.
+	if err := os.WriteFile(dst+".manifest-ts", []byte(newer+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("ONYX_MANIFEST_URL", srv.URL)
+	done, err := updateViaDelta(dst)
+	if done || err == nil || !strings.Contains(err.Error(), "downgrade blocked") {
+		t.Fatalf("done=%v err=%v, want downgrade blocked error", done, err)
+	}
+
+	// The bypass env var lets it proceed past the guard (it then fails on
+	// delta lookup, proving the guard itself passed).
+	t.Setenv("ONYX_ALLOW_OLDER_MANIFEST", "1")
+	_, err = updateViaDelta(dst)
+	if err == nil || strings.Contains(err.Error(), "downgrade blocked") {
+		t.Fatalf("err = %v, want non-downgrade error after bypass", err)
+	}
+}
+
+func TestUpdateViaDeltaGuardSkipsUnparseableTimestamps(t *testing.T) {
+	const localSHA = "2222222222222222222222222222222222222222222222222222222222222222"
+
+	// Mirror reports an up-to-date full snapshot with an unparseable
+	// generated_at: the guard must skip silently, not fail.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(manifestDoc("", localSHA)))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "feed.json")
+	if err := os.WriteFile(dst+".sha256", []byte(localSHA+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst+".manifest-ts", []byte("not-a-time\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("ONYX_MANIFEST_URL", srv.URL)
+	var done bool
+	var err error
+	out := captureStdout(t, func() { done, err = updateViaDelta(dst) })
+	if !done || err != nil {
+		t.Fatalf("done=%v err=%v, want up-to-date success with unparseable stamps", done, err)
+	}
+	if !strings.Contains(out, "already up to date") {
+		t.Fatalf("output = %q, want already-up-to-date notice", out)
+	}
+}
+
+func TestAcceptManifestTimestampKeepsMax(t *testing.T) {
+	dir := t.TempDir()
+	tsPath := filepath.Join(dir, "feed.manifest-ts")
+
+	// No baseline yet: new stamp written as-is.
+	acceptManifestTimestamp(tsPath, "2026-08-20T00:00:00Z")
+	if got := readTs(t, tsPath); got != "2026-08-20T00:00:00Z" {
+		t.Fatalf("ts = %q, want 2026-08-20T00:00:00Z", got)
+	}
+	// Older incoming stamp must not roll the baseline back.
+	acceptManifestTimestamp(tsPath, "2026-08-10T00:00:00Z")
+	if got := readTs(t, tsPath); got != "2026-08-20T00:00:00Z" {
+		t.Fatalf("ts = %q, want max kept (2026-08-20)", got)
+	}
+	// Newer stamp replaces it.
+	acceptManifestTimestamp(tsPath, "2026-08-25T00:00:00Z")
+	if got := readTs(t, tsPath); got != "2026-08-25T00:00:00Z" {
+		t.Fatalf("ts = %q, want 2026-08-25T00:00:00Z", got)
+	}
+	// Unparseable input leaves the baseline untouched.
+	acceptManifestTimestamp(tsPath, "garbage")
+	if got := readTs(t, tsPath); got != "2026-08-25T00:00:00Z" {
+		t.Fatalf("ts = %q, want unchanged after garbage input", got)
+	}
+}
+
+func readTs(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(b))
 }

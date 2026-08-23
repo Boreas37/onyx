@@ -29,10 +29,14 @@ const maxManifestSize = 4 << 20 // 4MiB
 //	  ]
 //	}
 //
-// full.sha256 is the digest of the artifact at full.path (after
-// decompression for .gz feeds). Each delta's from_sha256 pins it to the
-// exact base snapshot it patches — the same value a delta file carries in
-// its own header as base_sha256.
+// full.sha256 is the digest of the GZIPPED artifact bytes at full.path —
+// the same value a client stores in its dst+".sha256" sidecar after a
+// download, making that sidecar an upstream artifact pointer rather than
+// a digest of the local decompressed database. Each delta's from_sha256
+// pins it to the exact base snapshot it patches, keyed by the same
+// compressed-artifact digest; the delta file itself separately carries
+// base_sha256 = sha256 of the DECOMPRESSED base feed, which ApplyDelta
+// enforces.
 type Manifest struct {
 	GeneratedAt string       `json:"generated_at"`
 	Full        FullEntry    `json:"full"`
@@ -64,6 +68,18 @@ type DeltaCounts struct {
 	Result  int `json:"result"`
 }
 
+// ParseManifest decodes a Manifest document from raw JSON bytes. It is
+// the shared parser behind FetchManifest and is exported so callers with
+// the body already in hand (tests, cached copies) reuse identical
+// validation.
+func ParseManifest(data []byte) (*Manifest, error) {
+	var m Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
+	return &m, nil
+}
+
 // FetchManifest GETs url and decodes the Manifest document. A nil client
 // gets a default one with a 30s timeout. Any non-200 status or malformed
 // body is an error; the response body is size-capped defensively.
@@ -83,9 +99,5 @@ func FetchManifest(client *http.Client, url string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
 	}
-	var m Manifest
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, fmt.Errorf("parsing manifest: %w", err)
-	}
-	return &m, nil
+	return ParseManifest(body)
 }

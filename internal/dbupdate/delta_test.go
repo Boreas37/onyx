@@ -564,3 +564,157 @@ func TestGenerateDeltaIdenticalFilesZeroOps(t *testing.T) {
 		t.Fatalf("identical inputs produced ops: %+v", stats)
 	}
 }
+
+// TestApplyDeltaTruncatedGzipFuzzStyle chops every byte offset of a valid
+// multi-op delta's compressed payload and asserts ApplyDelta always
+// rejects it and never leaves output behind.
+func TestApplyDeltaTruncatedGzipFuzzStyle(t *testing.T) {
+	const (
+		idA = "11111111-1111-1111-1111-111111111111"
+		idB = "22222222-2222-2222-2222-222222222222"
+		idC = "33333333-3333-3333-3333-333333333333"
+	)
+	recA := rec(idA, "Plugin A < 1.0.0", "CVE-2026-0001", 8.1, "2026-01-01T00:00:00+00:00", false)
+	recB := rec(idB, "Plugin B < 2.0.0", "CVE-2026-0002", 7.5, "2026-02-02T00:00:00+00:00", false)
+	recC := recC(idC)
+
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base.json")
+	writeFile(t, basePath, feedJSON([2]string{idA, recA}, [2]string{idB, recB}))
+	baseSHA, err := fileSHA256(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fullPath := filepath.Join(dir, "full.gz")
+	writeTestDelta(t, fullPath,
+		deltaHeader{Format: DeltaFormat, BaseSHA256: baseSHA, ResultRecords: 2, Records: 2},
+		[]deltaOp{
+			{Op: opUpdate, ID: idA, Record: json.RawMessage(recA)},
+			{Op: opAdd, ID: idC, Record: json.RawMessage(recC)},
+		})
+	blob, err := os.ReadFile(fullPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for cut := 1; cut < len(blob); cut += 3 {
+		p := filepath.Join(t.TempDir(), "cut.gz")
+		if wErr := os.WriteFile(p, blob[:len(blob)-cut], 0o644); wErr != nil {
+			t.Fatal(wErr)
+		}
+		outPath := filepath.Join(t.TempDir(), "out.json")
+		if _, aErr := ApplyDelta(basePath, p, outPath); aErr == nil {
+			t.Fatalf("cut %d/%d: ApplyDelta accepted a truncated delta", cut, len(blob))
+		}
+		if _, statErr := os.Stat(outPath); statErr == nil {
+			t.Fatalf("cut %d/%d: failed apply left an output file behind", cut, len(blob))
+		}
+	}
+}
+
+// recC is defined separately from the table fixtures above.
+func recC(id string) string {
+	return rec(id, "Plugin C < 3.0.0", "CVE-2026-0003", 6.1, "2026-03-03T00:00:00+00:00", true)
+}
+
+// TestApplyDeltaBaseHashSingleOpenGuard pins the TOCTOU fix semantics:
+// the base hash is computed from the SAME single streaming pass that
+// produces the output, so a base whose bytes differ from header
+// base_sha256 can never yield accepted output.
+func TestApplyDeltaBaseHashSingleOpenGuard(t *testing.T) {
+	const (
+		idA = "11111111-1111-1111-1111-111111111111"
+		idB = "22222222-2222-2222-2222-222222222222"
+	)
+	recA := rec(idA, "Plugin A < 1.0.0", "CVE-2026-0001", 8.1, "2026-01-01T00:00:00+00:00", false)
+	recB := rec(idB, "Plugin B < 2.0.0", "CVE-2026-0002", 7.5, "2026-02-02T00:00:00+00:00", false)
+
+	dir := t.TempDir()
+	feedA := feedJSON([2]string{idA, recA})
+	feedB := feedJSON([2]string{idA, recA}, [2]string{idB, recB})
+	pathA := filepath.Join(dir, "a.json")
+	writeFile(t, pathA, feedA)
+	shaA, err := fileSHA256(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		base      []byte // file ApplyDelta actually reads
+		headerSHA string // base_sha256 the delta header claims
+	}{
+		{
+			// Header claims one snapshot's hash but a different base
+			// (mutated between signing and apply) is presented: must fail.
+			name:      "mutated base cannot bypass header check",
+			base:      feedB,
+			headerSHA: shaA,
+		},
+		{
+			// Explicit wrong base_sha256 in a crafted delta.
+			name:      "crafted wrong base_sha256 rejected",
+			base:      feedA,
+			headerSHA: "deadbeef",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deltaPath := filepath.Join(t.TempDir(), "d.gz")
+			writeTestDelta(t, deltaPath,
+				deltaHeader{Format: DeltaFormat, BaseSHA256: tt.headerSHA, ResultRecords: 1, Records: 1},
+				[]deltaOp{{Op: opRemove, ID: idB}})
+
+			basePath := filepath.Join(t.TempDir(), "base.json")
+			writeFile(t, basePath, tt.base)
+			outPath := filepath.Join(t.TempDir(), "out.json")
+			_, err := ApplyDelta(basePath, deltaPath, outPath)
+			if err == nil || !strings.Contains(err.Error(), "base file hash mismatch") {
+				t.Fatalf("err = %v, want base file hash mismatch", err)
+			}
+			if _, statErr := os.Stat(outPath); statErr == nil {
+				t.Fatal("mismatched base produced an output file")
+			}
+		})
+	}
+}
+
+// TestApplyDeltaBaseWithoutTrailingNewline proves the single-pass hasher
+// accounts for bytes after the JSON decoder stops (the drain step): a
+// base file with no trailing newline must still match its full-file
+// digest and apply cleanly.
+func TestApplyDeltaBaseWithoutTrailingNewline(t *testing.T) {
+	const (
+		idA = "11111111-1111-1111-1111-111111111111"
+		idB = "22222222-2222-2222-2222-222222222222"
+	)
+	recA := rec(idA, "Plugin A < 1.0.0", "CVE-2026-0001", 8.1, "2026-01-01T00:00:00+00:00", false)
+	recB := rec(idB, "Plugin B < 2.0.0", "CVE-2026-0002", 7.5, "2026-02-02T00:00:00+00:00", false)
+
+	dir := t.TempDir()
+	newPath := filepath.Join(dir, "new.json")
+	basePath := filepath.Join(dir, "base.json") // no trailing newline
+	deltaPath := filepath.Join(dir, "d.gz")
+
+	// Base and delta-generation input must be byte-identical; trimming
+	// the trailing newline proves the hasher accounts for bytes after
+	// the JSON decoder stops.
+	baseBytes := bytes.TrimSuffix(feedJSON([2]string{idA, recA}), []byte("\n"))
+	writeFile(t, basePath, baseBytes)
+	oldPath := filepath.Join(dir, "old.json")
+	writeFile(t, oldPath, baseBytes)
+	writeFile(t, newPath, feedJSON([2]string{idA, recA}, [2]string{idB, recB}))
+	if _, gErr := GenerateDelta(oldPath, newPath, deltaPath); gErr != nil {
+		t.Fatalf("GenerateDelta: %v", gErr)
+	}
+
+	outPath := filepath.Join(dir, "out.json")
+	stats, err := ApplyDelta(basePath, deltaPath, outPath)
+	if err != nil {
+		t.Fatalf("ApplyDelta on newline-less base: %v", err)
+	}
+	if stats.ResultRecords != 2 || stats.Added != 1 || stats.BaseRecords != 1 {
+		t.Fatalf("stats = %+v", stats)
+	}
+}

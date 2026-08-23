@@ -708,6 +708,8 @@ Update flags:
   --db PATH          destination database file (default: %s)
   --feed F           feed to fetch: production (default) or scanner
   --force            skip the checksum check and rewrite the database even when unchanged
+   ONYX_MANIFEST_URL  override the update manifest URL (mirror overrides/testing)
+   ONYX_ALLOW_OLDER_MANIFEST=1  accept a manifest older than the last accepted one (disables the delta-path downgrade guard)
 `, defaultDB, defaultDB)
 }
 
@@ -1462,9 +1464,84 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
-// manifestURL is where the mirror publishes its update manifest; deltas
-// are keyed by the sha256 of the local file they patch.
-const manifestURL = "https://raw.githubusercontent.com/" + productionRepo + "/main/manifest.json"
+// defaultManifestURL is where the mirror publishes its update manifest.
+const defaultManifestURL = "https://raw.githubusercontent.com/" + productionRepo + "/main/manifest.json"
+
+// manifestURL returns the update manifest location. $ONYX_MANIFEST_URL
+// overrides the default (for mirror overrides and testing). Deltas listed
+// in the manifest are keyed by the sha256 of the GZIPPED artifact a
+// client last downloaded — the value stored in dst+".sha256", which is an
+// upstream artifact pointer, not a hash of the local decompressed file.
+func manifestURL() string {
+	if v := os.Getenv("ONYX_MANIFEST_URL"); v != "" {
+		return v
+	}
+	return defaultManifestURL
+}
+
+// dedupeManifestDeltas collapses manifest delta entries sharing the same
+// from_sha256+path pair, keeping the first occurrence, so a mirror bug
+// that published duplicate rows cannot cause repeated lookups.
+func dedupeManifestDeltas(m *dbupdate.Manifest) {
+	if m == nil || len(m.Deltas) < 2 {
+		return
+	}
+	seen := make(map[string]bool, len(m.Deltas))
+	kept := m.Deltas[:0]
+	for _, d := range m.Deltas {
+		key := d.FromSha256 + "\x00" + d.Path
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		kept = append(kept, d)
+	}
+	m.Deltas = kept
+}
+
+// checkManifestFreshness implements the downgrade guard for the delta
+// fast-path: when dst+".manifest-ts" holds an RFC3339 timestamp from a
+// previously accepted manifest and the new manifest's generated_at is
+// STRICTLY older, the mirror has regressed and applying its deltas would
+// downgrade the database — return an error so the caller falls back to
+// the full-download path. Missing or unparseable timestamps on either
+// side skip the guard silently; ONYX_ALLOW_OLDER_MANIFEST=1 bypasses it.
+func checkManifestFreshness(tsPath, generatedAt string) error {
+	raw, err := os.ReadFile(tsPath)
+	if err != nil {
+		return nil // no baseline recorded yet
+	}
+	stored, err := time.Parse(time.RFC3339, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil // unparseable baseline: skip the guard
+	}
+	newT, err := time.Parse(time.RFC3339, generatedAt)
+	if err != nil {
+		return nil // empty/unparseable generated_at: skip the guard
+	}
+	if newT.Before(stored) {
+		return fmt.Errorf("manifest is older than the last accepted one (downgrade blocked); set ONYX_ALLOW_OLDER_MANIFEST=1 to override")
+	}
+	return nil
+}
+
+// acceptManifestTimestamp records an accepted manifest's generated_at in
+// dst+".manifest-ts", keeping the LATER of any existing stamp and the new
+// value (RFC3339). Unparseable input leaves any existing stamp untouched;
+// nothing is fatal — the stamp only feeds the freshness guard.
+func acceptManifestTimestamp(tsPath, generatedAt string) {
+	newT, err := time.Parse(time.RFC3339, generatedAt)
+	if err != nil {
+		return
+	}
+	best := newT
+	if raw, rErr := os.ReadFile(tsPath); rErr == nil {
+		if stored, pErr := time.Parse(time.RFC3339, strings.TrimSpace(string(raw))); pErr == nil && stored.After(best) {
+			best = stored
+		}
+	}
+	_ = os.WriteFile(tsPath, []byte(best.UTC().Format(time.RFC3339)+"\n"), 0o644)
+}
 
 // updateViaDelta tries the incremental update path: read the local
 // checksum, fetch the mirror manifest, and when a delta exists for the
@@ -1472,6 +1549,16 @@ const manifestURL = "https://raw.githubusercontent.com/" + productionRepo + "/ma
 // database was updated (or already current per the manifest), false when
 // a full download should proceed. The result's checksum is taken from the
 // manifest so subsequent runs keep chaining deltas.
+//
+// The local checksum is read from dst+".sha256", which stores the sha256
+// of the GZIPPED artifact as published upstream — exactly the key the
+// manifest's delta entries are indexed by. It is NOT a digest of the
+// local decompressed database.
+//
+// Guards applied before any delta is trusted: duplicate manifest entries
+// are collapsed (first wins), and a manifest strictly older than the last
+// accepted one (dst+".manifest-ts") is rejected as a downgrade so the
+// caller falls back to the full download.
 func updateViaDelta(dst string) (bool, error) {
 	prevBytes, err := os.ReadFile(dst + ".sha256")
 	if err != nil || strings.TrimSpace(string(prevBytes)) == "" {
@@ -1479,12 +1566,22 @@ func updateViaDelta(dst string) (bool, error) {
 	}
 	localSHA := strings.TrimSpace(string(prevBytes))
 
-	m, err := dbupdate.FetchManifest(http.DefaultClient, manifestURL)
+	m, err := dbupdate.FetchManifest(http.DefaultClient, manifestURL())
 	if err != nil {
 		return false, fmt.Errorf("manifest: %w", err)
 	}
+	dedupeManifestDeltas(m)
+
+	tsPath := dst + ".manifest-ts"
+	if os.Getenv("ONYX_ALLOW_OLDER_MANIFEST") != "1" {
+		if err := checkManifestFreshness(tsPath, m.GeneratedAt); err != nil {
+			return false, err
+		}
+	}
+
 	if m.Full.Sha256 == localSHA {
 		fmt.Printf("update: already up to date — %s\n", dst)
+		acceptManifestTimestamp(tsPath, m.GeneratedAt)
 		return true, nil
 	}
 	var entry *dbupdate.DeltaEntry
@@ -1532,6 +1629,7 @@ func updateViaDelta(dst string) (bool, error) {
 	} else {
 		_ = os.WriteFile(dst+".feedtype", []byte(feedProduction+"\n"), 0o644)
 	}
+	acceptManifestTimestamp(tsPath, m.GeneratedAt)
 	fmt.Printf("update: applied delta (+%d -%d ~%d) — %s\n", st.Added, st.Removed, st.Updated, dst)
 	return true, nil
 }
