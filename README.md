@@ -290,7 +290,18 @@ to the full download with a warning, so updates never get *worse*.
 For supply-chain hardening, point `ONYX_DB_PUBKEY` at a minisign public
 key; update then verifies the feed signature (`<asset>.minisig`) after
 every download and refuses to bless a database that fails verification —
-a missing or bad signature is a hard error, not a warning.
+a missing or bad signature is a hard error, not a warning. Public keys and
+signatures interoperate with minisign 0.12 in both directions, including
+its default pre-hashed `ED` signatures; the trusted-comment binding uses
+minisign's raw-64-byte construction with a legacy fallback for previously
+published onyx artifacts. Secret keys are onyx-specific plaintext files,
+not interchangeable with minisign's scrypt-encrypted boxes.
+
+The delta fast-path also carries a downgrade guard: `onyx update` refuses
+a `manifest.json` whose `generated_at` is older than the last accepted one
+(`dst + ".manifest-ts"`) and falls back to the full download. Set
+`ONYX_ALLOW_OLDER_MANIFEST=1` to bypass, or `ONYX_MANIFEST_URL` to point
+the updater at a different mirror for testing.
 
 ## Roadmap
 
