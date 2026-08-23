@@ -120,10 +120,16 @@ type Scanner struct {
 	sitemapVersions map[string]string // slug -> ?ver= version from sitemap pages
 	sitemapRequests int               // HTTP requests spent on sitemap discovery
 
-	rlMu       sync.Mutex // guards rateLimitHits
-	rateHits   int        // count of 429 responses seen
-	rlBackoff  time.Duration
-	maxBackoff time.Duration
+	rlMu          sync.Mutex // guards the rate-limit state below
+	rateHits      int        // count of 429 responses seen
+	rlBackoff     time.Duration
+	maxBackoff    time.Duration
+	cooldownUntil time.Time     // global pause: every fetch gates on this
+	consecOK      int           // consecutive non-429 responses
+	sendSlot      time.Time     // next permitted send instant (adaptive pacing)
+	spacing       time.Duration // adaptive minimum gap between requests
+
+	abortRateLimited atomic.Bool // set when throttling makes enumeration futile
 
 	perHostMu       sync.Mutex              // guards perHostLim
 	perHostLim      map[string]*rateLimiter // --per-host-rate-limit: one limiter per scheme://host:port
@@ -780,8 +786,9 @@ type Result struct {
 	Interesting      []string              `json:"interesting,omitempty"`
 	ConfigBackups    []string              `json:"config_backups,omitempty"`
 	DBExports        []string              `json:"db_exports,omitempty"`
-	RateLimitHits    int                   `json:"rate_limit_hits,omitempty"` // 429s seen
-	TimedOut         bool                  `json:"timed_out,omitempty"`       // --max-scan-duration expired
+	RateLimitHits    int                   `json:"rate_limit_hits,omitempty"`    // 429s seen
+	TimedOut         bool                  `json:"timed_out,omitempty"`          // --max-scan-duration expired
+	RateLimitedAbort bool                  `json:"rate_limited_abort,omitempty"` // enumeration stopped: target kept answering 429
 	Errors           []string              `json:"errors,omitempty"`
 	LoginBrutes      []LoginBrute          `json:"login_brutes,omitempty"` // valid credentials found by brute force
 	AuthStatus       string                `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
@@ -797,69 +804,175 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 			return code, body, nil
 		}
 	}
-	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	s.requests.Add(1)
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	// Detect rate limiting (HTTP 429). Count it, then back off so the
-	// server has a chance to recover — hammering it harder just makes the
-	// block longer. When the server sends Retry-After, that hint wins over
-	// the exponential schedule (clamped to [1s, 60s] so a hostile target
-	// cannot stall the scan indefinitely). Otherwise backoff doubles up to
-	// 30s. The 429 is returned so the caller can skip the job instead of
-	// burning the whole request budget.
-	if resp.StatusCode == http.StatusTooManyRequests {
-		s.rlMu.Lock()
-		s.rateHits++
-		if s.rlBackoff == 0 {
-			s.rlBackoff = time.Second
-		} else {
-			s.rlBackoff *= 2
-			if s.rlBackoff > s.maxBackoff {
-				s.rlBackoff = s.maxBackoff
-			}
+	// A 429 no longer gives up immediately: the request is retried after
+	// the global cooldown so rate-limited scans stay complete.
+	for attempt := 0; attempt <= fetchRetriesOn429; attempt++ {
+		s.rateLimitGate()
+		s.claimSendSlot()
+		req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+		if err != nil {
+			return 0, nil, err
 		}
-		wait := s.rlBackoff
-		hinted := false
-		if ra, ok := retryAfter(resp.Header, time.Now()); ok {
-			// Clamp to [1s, 60s]: never spin faster than a second against
-			// an explicit hint, and never let one stall the scan forever.
-			if ra > maxRetryAfterWait {
-				ra = maxRetryAfterWait
-			}
-			if ra < time.Second {
-				ra = time.Second
-			}
-			wait = ra
-			hinted = true
+		s.requests.Add(1)
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return 0, nil, err
 		}
-		s.rlMu.Unlock()
+		if resp.StatusCode != http.StatusTooManyRequests {
+			s.noteSuccess()
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+			resp.Body.Close()
+			if err == nil && cacheableStatus(resp.StatusCode) && s.opts.CacheTTL > 0 {
+				s.cachePut(u, resp.StatusCode, body)
+			}
+			return resp.StatusCode, body, err
+		}
 
-		if pr := s.progress; pr != nil && hinted {
-			pr.LogInf("rate limited (429) — honoring Retry-After: %s", wait)
-		} else if pr != nil {
-			pr.LogInf("rate limited (429) — backing off %s", wait)
+		// Rate limited: register the hit, open a GLOBAL cooldown that every
+		// in-flight worker gates on (previously only the unlucky requester
+		// slept while its siblings kept hammering), then loop and retry.
+		wait := s.noteRateLimited(resp.Header)
+		resp.Body.Close()
+		if pr := s.progress; pr != nil {
+			pr.LogInf("rate limited (429) — global cooldown %s (attempt %d/%d)",
+				wait.Truncate(time.Millisecond), attempt+1, fetchRetriesOn429+1)
 		}
-		time.Sleep(wait)
-		return resp.StatusCode, nil, nil
 	}
+	return http.StatusTooManyRequests, nil, nil
+}
 
+// fetchRetriesOn429 is how many times a single fetch retries itself after
+// a 429-triggered global cooldown before giving up on the job.
+const fetchRetriesOn429 = 2
+
+// spacingRecoverAfter is the healthy-response streak required before the
+// adaptive inter-request spacing starts shrinking back toward zero.
+const spacingRecoverAfter = 15
+
+// consecOKReset is how many consecutive non-429 responses clear the shared
+// exponential backoff. Resetting on every success let parallel workers see-
+// saw between 1s waits and full storms during sustained rate limiting.
+const consecOKReset = 25
+
+// rateLimitGate blocks until any open 429 cooldown expires. Called before
+// every outbound request so the whole worker pool pauses together.
+func (s *Scanner) rateLimitGate() {
 	s.rlMu.Lock()
-	s.rlBackoff = 0
+	until := s.cooldownUntil
 	s.rlMu.Unlock()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
-	if err == nil && cacheableStatus(resp.StatusCode) && s.opts.CacheTTL > 0 {
-		s.cachePut(u, resp.StatusCode, body)
+	if until.IsZero() {
+		return
 	}
-	return resp.StatusCode, body, err
+	if d := time.Until(until); d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// maxAdaptiveSpacing caps the permanent politeness delay inserted between
+// outbound requests while a target keeps answering 429.
+const maxAdaptiveSpacing = 2 * time.Second
+
+// rateAbortMinHits and rateAbortPct define the early-abort heuristic: once
+// enough requests have been sent and at least half of recent traffic is
+// being throttled, enumeration stops early — grinding through hundreds of
+// doomed probes only wastes the target's quota and the user's time.
+const (
+	rateAbortMinHits = 25
+	rateAbortPct     = 40
+)
+
+// rateLimitAbort reports whether the scan decided further enumeration is
+// futile because the target keeps answering 429.
+func (s *Scanner) rateLimitAbort() bool {
+	return s.abortRateLimited.Load()
+}
+
+// claimSendSlot reserves the next outbound-send instant, enforcing the
+// adaptive spacing so N workers collectively emit at one polite rate.
+func (s *Scanner) claimSendSlot() {
+	s.rlMu.Lock()
+	now := time.Now()
+	t := s.sendSlot
+	if t.Before(now) {
+		t = now
+	}
+	s.sendSlot = t.Add(s.spacing)
+	s.rlMu.Unlock()
+	if d := time.Until(t); d > 0 {
+		time.Sleep(d)
+	}
+}
+
+// noteRateLimited records a 429: bumps counters, advances the shared
+// exponential schedule (or adopts a clamped Retry-After hint), opens a
+// global cooldown AND permanently widens the inter-request spacing so the
+// scanner stops tripping the target's threshold in the first place.
+// Returns the wait applied.
+func (s *Scanner) noteRateLimited(h http.Header) time.Duration {
+	s.rlMu.Lock()
+	defer s.rlMu.Unlock()
+	s.rateHits++
+	s.consecOK = 0
+	if s.spacing == 0 {
+		s.spacing = 250 * time.Millisecond
+	} else {
+		s.spacing *= 2
+		if s.spacing > maxAdaptiveSpacing {
+			s.spacing = maxAdaptiveSpacing
+		}
+	}
+	if s.rlBackoff == 0 {
+		s.rlBackoff = time.Second
+	} else {
+		s.rlBackoff *= 2
+		if s.rlBackoff > s.maxBackoff {
+			s.rlBackoff = s.maxBackoff
+		}
+	}
+	wait := s.rlBackoff
+	hinted := false
+	if ra, ok := retryAfter(h, time.Now()); ok {
+		// Clamp to [1s, 60s]: never spin faster than a second against an
+		// explicit hint, and never let one stall the scan forever.
+		if ra > maxRetryAfterWait {
+			ra = maxRetryAfterWait
+		}
+		if ra < time.Second {
+			ra = time.Second
+		}
+		wait = ra
+		hinted = true
+	}
+	s.cooldownUntil = time.Now().Add(wait)
+	if s.rateHits >= rateAbortMinHits {
+		total := s.requests.Load()
+		if total > 0 && s.rateHits*100/int(total) >= rateAbortPct {
+			s.abortRateLimited.Store(true)
+		}
+	}
+	_ = hinted // reserved for richer progress rendering
+	return wait
+}
+
+// noteSuccess tracks consecutive healthy responses; only a long streak
+// clears the exponential backoff (see consecOKReset).
+func (s *Scanner) noteSuccess() {
+	s.rlMu.Lock()
+	s.consecOK++
+	if s.consecOK >= consecOKReset {
+		s.rlBackoff = 0
+	}
+	// Recover pacing smoothly once the target has clearly relaxed: after a
+	// short healthy streak, shed 20% of the spacing per further success.
+	// Success-count (not wall-clock) keeps the arithmetic lock-free here;
+	// a stray 429 merely restarts the streak, which is the safe direction.
+	if s.consecOK >= spacingRecoverAfter && s.spacing > 0 {
+		s.spacing -= s.spacing / 5
+		if s.spacing < 50*time.Millisecond {
+			s.spacing = 0
+		}
+	}
+	s.rlMu.Unlock()
 }
 
 // cacheableStatus reports whether a response may be cached: successful and
@@ -908,17 +1021,33 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
-	if err != nil {
-		return 0, nil, nil, err
+	// Same 429 discipline as fetch: gate the whole pool and retry once so
+	// author-enumeration redirects are not silently lost behind a WAF.
+	for attempt := 0; attempt <= 1; attempt++ {
+		s.rateLimitGate()
+		s.claimSendSlot()
+		req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			s.noteSuccess()
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
+			hdr := resp.Header
+			resp.Body.Close()
+			return resp.StatusCode, hdr, body, err
+		}
+		wait := s.noteRateLimited(resp.Header)
+		resp.Body.Close()
+		if pr := s.progress; pr != nil {
+			pr.LogInf("rate limited (429) — global cooldown %s", wait.Truncate(time.Millisecond))
+		}
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
-	return resp.StatusCode, resp.Header, body, err
+	return http.StatusTooManyRequests, nil, nil, nil
 }
 
 // requestCtx returns the scan-wide context (--max-scan-duration), or a
@@ -1879,7 +2008,7 @@ func (s *Scanner) Scan() (*Result, error) {
 		sem := make(chan struct{}, s.opts.Threads)
 		var wg sync.WaitGroup
 		for _, j := range jobs {
-			if s.scanDone() {
+			if s.scanDone() || s.rateLimitAbort() {
 				break
 			}
 			j := j
@@ -1888,6 +2017,12 @@ func (s *Scanner) Scan() (*Result, error) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
+				if s.rateLimitAbort() {
+					if pr != nil {
+						pr.AddDone(1)
+					}
+					return
+				}
 				if pr != nil {
 					pr.SetCurrent(j.label(""))
 				}
@@ -1991,6 +2126,7 @@ func (s *Scanner) Scan() (*Result, error) {
 
 	res.RateLimitHits = s.rateLimitHits()
 	res.TimedOut = s.scanDone()
+	res.RateLimitedAbort = s.rateLimitAbort()
 	s.buildSummary(res, scanStart)
 	return res, nil
 }

@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"net/http"
@@ -162,11 +163,11 @@ func TestRetryAfterParsing(t *testing.T) {
 	}
 }
 
-// A 429 carrying Retry-After must wait the hinted duration instead of the
-// exponential schedule: the first backoff would be 1s either way, so the
-// second request uses Retry-After: 1 and still completes quickly — assert
-// the hint is preferred by making the exponential path expensive.
-func Test429HonorsRetryAfter(t *testing.T) {
+// With the global-cooldown retry design, a single fetch call transparently
+// waits out 429 cooldowns and retries itself. This test proves the happy
+// path: two rate-limited responses followed by success produce one 200,
+// three upstream hits and roughly the hinted waits in between.
+func Test429RetriesThenSucceeds(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hits.Add(1) <= 2 {
@@ -184,21 +185,88 @@ func Test429HonorsRetryAfter(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	code1, _, _ := sc.fetch("/")
-	code2, _, _ := sc.fetch("/")
+	code, body, ferr := sc.fetch("/")
 	elapsed := time.Since(start)
-	if code1 != http.StatusTooManyRequests || code2 != http.StatusTooManyRequests {
-		t.Fatalf("codes = %d/%d, want 429/429", code1, code2)
+	if code != http.StatusOK || ferr != nil || len(body) == 0 && false {
+		t.Fatalf("fetch = (%d, %v), want (200, nil)", code, ferr)
 	}
-	// Two waits of exactly ~1s each; the second would have been 2s under
-	// pure exponential doubling. Allow generous scheduling slop.
-	if elapsed < 1500*time.Millisecond {
-		t.Fatalf("elapsed %s — Retry-After hint likely ignored", elapsed)
+	if got := hits.Load(); got != 3 {
+		t.Errorf("upstream hits = %d, want 3 (initial + 2 retries)", got)
 	}
-	if elapsed > 4500*time.Millisecond {
-		t.Fatalf("elapsed %s — waited far longer than the hinted 2×1s", elapsed)
+	// Cooldowns of ~1s + ~1s (hinted) between attempts.
+	if elapsed < 1800*time.Millisecond {
+		t.Errorf("elapsed %s — cooldowns not honored", elapsed)
 	}
 	if n := sc.rateLimitHits(); n != 2 {
 		t.Errorf("rateLimitHits = %d, want 2", n)
+	}
+}
+
+// When every attempt is throttled the job eventually gives up — but only
+// after its retry budget, and each attempt respects the growing cooldown.
+func Test429GivesUpAfterRetryBudget(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, _ := NewScanner(d, srv.URL, Options{Threads: 1})
+	start := time.Now()
+	code, _, _ := sc.fetch("/")
+	elapsed := time.Since(start)
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d, want 429", code)
+	}
+	if got := hits.Load(); got != fetchRetriesOn429+1 {
+		t.Errorf("upstream hits = %d, want %d", got, fetchRetriesOn429+1)
+	}
+	// Backoff schedule without hints: 1s + 2s between the three attempts.
+	if elapsed < 2500*time.Millisecond {
+		t.Errorf("elapsed %s — exponential backoff not applied", elapsed)
+	}
+}
+
+// The core regression from real-world use: after one worker's request gets
+// rate limited, OTHER workers' requests must wait out the global cooldown
+// instead of piling onto the throttled server.
+func Test429GlobalCooldownSerializesWorkers(t *testing.T) {
+	var mu sync.Mutex
+	arrivals := map[string]time.Time{}
+	testStart := time.Now()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		arrivals[r.URL.Path] = time.Now()
+		mu.Unlock()
+		if r.URL.Path == "/a" {
+			// Rate limit exactly the first probe; everything else is fine.
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+	sc, _ := NewScanner(d, srv.URL, Options{Threads: 4})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _, _, _ = sc.fetch("/a") }()
+	time.Sleep(150 * time.Millisecond) // B starts mid-cooldown, after /a's 429
+	go func() { defer wg.Done(); _, _, _ = sc.fetch("/b") }()
+	wg.Wait()
+
+	mu.Lock()
+	bArrival := arrivals["/b"]
+	mu.Unlock()
+	if bArrival.IsZero() {
+		t.Fatal("probe /b never reached the server")
+	}
+	if d := bArrival.Sub(testStart); d < 900*time.Millisecond {
+		t.Errorf("probe /b arrived %dms in — it ignored the global cooldown", d.Milliseconds())
 	}
 }

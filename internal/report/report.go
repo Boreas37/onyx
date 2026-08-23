@@ -289,6 +289,11 @@ func PrintSummary(res *scanner.Result) {
 	if res.Summary == nil {
 		return
 	}
+	if res.RateLimitedAbort {
+		fmt.Println("\n[!] Target enforces aggressive rate limiting — enumeration stopped early.")
+		fmt.Println("    Results may be incomplete. Retry politely, e.g.:")
+		fmt.Println("    onyx scan <target> --stealth --rate-limit 0.5 --max-requests 100 --max-scan-duration 10m")
+	}
 	s := res.Summary
 	line := func(label, value string) {
 		fmt.Printf("  %-12s %s\n", label+":", value)
