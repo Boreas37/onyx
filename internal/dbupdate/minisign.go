@@ -2,14 +2,11 @@ package dbupdate
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"testing"
 )
 
 // Minisign/signify format constants. Both file types are two-or-more
@@ -17,13 +14,31 @@ import (
 // binary blob.
 //
 //	public key blob (42 bytes): "Ed" [2] || keynum [8] || pubkey [32]
-//	signature blob  (74 bytes): "Ed" [2] || keynum [8] || sig    [64]
+//	signature blob  (74 bytes): alg  [2] || keynum [8] || sig    [64]
+//
+// Two signature algorithms exist in the wild and both are accepted for
+// verification:
+//
+//	"Ed" — legacy/unhashed: the signature covers the data directly.
+//	       minisign's "-l" mode and every previously published onyx
+//	       artifact use it.
+//	"ED" — pre-hashed (minisign 0.12 default): the signature covers
+//	       BLAKE2b-512(data) instead of the raw bytes.
+//
+// Public-key files always carry "Ed", matching real minisign output.
 //
 // keynum is an advisory 8-byte key identifier; verification relies on the
 // embedded Ed25519 public key alone, so a mismatched keynum is not an
 // error (matching minisign's lenient behaviour).
+//
+// Compatibility statement: PUBLIC KEYS and SIGNATURES produced here are
+// wire-compatible with minisign 0.12 in both directions. Secret keys are
+// NOT: real minisign stores scrypt-encrypted key boxes with a KDF/checksum
+// header, while onyx writes plain (unencrypted) seed files — they cannot
+// be read by minisign and vice versa.
 const (
-	minisignAlg         = "Ed"
+	minisignAlg         = "Ed" // legacy/unhashed signature algorithm
+	minisignAlgHashed   = "ED" // pre-hashed (SHA-512) signature algorithm
 	pubKeyBlobLen       = 2 + 8 + ed25519.PublicKeySize // 42
 	sigBlobLen          = 2 + 8 + ed25519.SignatureSize // 74
 	trustedCommentLine  = "trusted comment: "
@@ -32,26 +47,29 @@ const (
 	untrustedCommentSec = "untrusted comment: onyx minisign secret key"
 )
 
-// VerifyMinisign verifies the minisign/signify Ed25519 signature at
-// sigPath over the data at dataPath against the public key at
-// pubKeyPath. A nil return means the signature is valid.
+// VerifyMinisign verifies a minisign 0.12-compatible Ed25519 signature at
+// sigPath over the data at dataPath against the public key at pubKeyPath.
+// A nil return means the signature is valid.
 //
 // Checks performed:
 //
-//  1. ed25519.Verify(pubkey, data, sig) for the main signature blob; and
-//  2. when the signature file carries a trusted comment (line 3) plus its
-//     global signature (line 4): ed25519.Verify(pubkey,
-//     sigBlob||trustedComment, globalSig), where sigBlob is the full
-//     decoded line-2 blob (alg||keynum||sig) and trustedComment is the
-//     text after the "trusted comment: " prefix, without trailing
-//     newline. This mirrors minisign's second detached signature, which
-//     binds the trusted comment so it cannot be silently rewritten.
+//  1. Main signature: for alg "ED" (minisign's default pre-hashed mode)
+//     ed25519.Verify(pubkey, BLAKE2b-512(data), sig); for legacy "Ed" the
+//     raw data itself is verified. Both algorithms are accepted.
+//  2. Global/comment signature, when the file carries a trusted comment
+//     (line 3) plus its global signature (line 4): the message is the
+//     64-byte raw signature || trusted-comment text — exactly minisign
+//     0.12's construction, which binds the trusted comment so it cannot
+//     be silently rewritten. If that fails AND the algorithm is legacy
+//     "Ed", verification falls back to the historical onyx construction
+//     (full 74-byte blob || trusted comment) so previously published
+//     artifacts keep verifying; success of either attempt is sufficient,
+//     and both failing yields "trusted comment verification failed".
 //
 // A two-line signature file without a trusted comment is accepted and
 // only check 1 runs. Any structural problem — wrong line count, bad
-// base64, wrong blob length, unknown algorithm ("Ed" is the only one this
-// package implements; pre-hashed "ED" signatures are rejected) — fails
-// with a descriptive error before any cryptographic work.
+// base64, wrong blob length, unknown algorithm — fails with a descriptive
+// error before any cryptographic work.
 func VerifyMinisign(pubKeyPath, sigPath, dataPath string) error {
 	pub, err := readPublicKeyFile(pubKeyPath)
 	if err != nil {
@@ -66,75 +84,40 @@ func VerifyMinisign(pubKeyPath, sigPath, dataPath string) error {
 		return fmt.Errorf("reading signed data: %w", err)
 	}
 
-	if !ed25519.Verify(pub, data, sigBlob[2+8:]) {
+	alg := string(sigBlob[:2])
+	mainMsg := []byte(data)
+	if alg == minisignAlgHashed {
+		// minisign 0.12 pre-hashes with BLAKE2b (libsodium's
+		// crypto_generichash, outlen=64) before signing.
+		mainMsg = blake2b512(data)
+	}
+	if !ed25519.Verify(pub, mainMsg, sigBlob[2+8:]) {
 		return errors.New("minisign: signature verification failed")
 	}
 	if hasGlobal {
-		msg := make([]byte, 0, len(sigBlob)+len(trustedComment))
-		msg = append(msg, sigBlob...)
+		// Minisign 0.12 binds only the raw 64-byte signature to the
+		// trusted comment.
+		msg := make([]byte, 0, sigBlobLen+len(trustedComment))
+		msg = append(msg, sigBlob[2+8:]...)
 		msg = append(msg, trustedComment...)
-		if !ed25519.Verify(pub, msg, globalSig) {
+		ok := ed25519.Verify(pub, msg, globalSig)
+		if !ok && alg == minisignAlg {
+			// Legacy fallback: artifacts signed by older onyx releases
+			// covered the full alg||keynum||sig blob instead.
+			msg = append(msg[:0], sigBlob...)
+			msg = append(msg, trustedComment...)
+			ok = ed25519.Verify(pub, msg, globalSig)
+		}
+		if !ok {
 			return errors.New("minisign: trusted comment verification failed")
 		}
 	}
 	return nil
 }
 
-// GenerateTestKeypair writes a fresh minisign-format keypair into dir and
-// returns the public and secret key paths. It exists so tests (and only
-// tests) can exercise VerifyMinisign end-to-end without an external
-// minisign binary.
-//
-// Secret-key blob layout (74 bytes): "Ed" [2] || keynum [8] || seed [32]
-// || checksum-sk [32], where seed derives the full private key via
-// ed25519.NewKeyFromSeed and the final 32 bytes store the derived public
-// half, matching minisign's on-disk secret format.
-func GenerateTestKeypair(t testing.TB, dir string) (pubPath, privPath string) {
-	t.Helper()
-
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("creating key directory: %v", err)
-	}
-	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
-		t.Fatalf("generating seed: %v", err)
-	}
-	keynum := make([]byte, 8)
-	if _, err := rand.Read(keynum); err != nil {
-		t.Fatalf("generating keynum: %v", err)
-	}
-	priv := ed25519.NewKeyFromSeed(seed)
-	pub := priv.Public().(ed25519.PublicKey)
-
-	pubBlob := make([]byte, 0, pubKeyBlobLen)
-	pubBlob = append(pubBlob, minisignAlg...)
-	pubBlob = append(pubBlob, keynum...)
-	pubBlob = append(pubBlob, pub...)
-
-	secBlob := make([]byte, 0, 2+8+ed25519.SeedSize+ed25519.PublicKeySize)
-	secBlob = append(secBlob, minisignAlg...)
-	secBlob = append(secBlob, keynum...)
-	secBlob = append(secBlob, seed...)
-	secBlob = append(secBlob, pub...) // sign-sk half: the derived public key
-
-	pubPath = filepath.Join(dir, "onyx_test.pub")
-	privPath = filepath.Join(dir, "onyx_test.sec")
-	writeKeyFile(t, pubPath, untrustedCommentPub, pubBlob, 0o644)
-	writeKeyFile(t, privPath, untrustedCommentSec, secBlob, 0o600)
-	return pubPath, privPath
-}
-
-// writeKeyFile writes a two-line minisign-style key file.
-func writeKeyFile(t testing.TB, path, comment string, blob []byte, mode os.FileMode) {
-	t.Helper()
-	body := comment + "\n" + base64.StdEncoding.EncodeToString(blob) + "\n"
-	if err := os.WriteFile(path, []byte(body), mode); err != nil {
-		t.Fatalf("writing %s: %v", path, err)
-	}
-}
-
 // readPublicKeyFile parses a minisign public key file into its 32-byte
-// Ed25519 public key.
+// Ed25519 public key. Real minisign always writes "Ed" here, even for
+// keys used to produce pre-hashed "ED" signatures.
 func readPublicKeyFile(path string) (ed25519.PublicKey, error) {
 	lines, err := readMinisignLines(path)
 	if err != nil {
@@ -159,9 +142,9 @@ func readPublicKeyFile(path string) (ed25519.PublicKey, error) {
 }
 
 // readSignatureFile parses a minisign signature file. It returns the full
-// decoded signature blob (alg||keynum||sig), the trusted-comment payload
-// (empty if absent), the decoded global signature, and whether a global
-// signature was present.
+// decoded signature blob (alg||keynum||sig) — with alg being either "Ed"
+// or "ED" — the trusted-comment payload (empty if absent), the decoded
+// global signature, and whether a global signature was present.
 func readSignatureFile(path string) (sigBlob, trustedComment, globalSig []byte, hasGlobal bool, err error) {
 	lines, err := readMinisignLines(path)
 	if err != nil {
@@ -177,8 +160,10 @@ func readSignatureFile(path string) (sigBlob, trustedComment, globalSig []byte, 
 	if len(sigBlob) != sigBlobLen {
 		return nil, nil, nil, false, fmt.Errorf("malformed signature %s: bad length %d (want %d)", path, len(sigBlob), sigBlobLen)
 	}
-	if string(sigBlob[:2]) != minisignAlg {
-		return nil, nil, nil, false, fmt.Errorf("unsupported signature algorithm %q in %s (want %q)", sigBlob[:2], path, minisignAlg)
+	switch string(sigBlob[:2]) {
+	case minisignAlg, minisignAlgHashed:
+	default:
+		return nil, nil, nil, false, fmt.Errorf("unsupported signature algorithm %q in %s (want %q or %q)", sigBlob[:2], path, minisignAlg, minisignAlgHashed)
 	}
 	if len(lines) == 2 {
 		return sigBlob, nil, nil, false, nil // comment-less variant: main sig only

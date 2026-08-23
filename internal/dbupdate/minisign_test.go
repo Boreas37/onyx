@@ -13,7 +13,10 @@ import (
 // signTestFile produces a minisign-format signature file over dataPath
 // using the secret key at privPath, exercising the same format rules
 // VerifyMinisign parses: base64(alg||keynum||sig), trusted comment line,
-// base64 global signature over sigBlob||trustedComment.
+// base64 global signature. It reproduces the HISTORICAL onyx signer
+// construction — global signature over the full 74-byte blob — so every
+// test using it now exercises VerifyMinisign's legacy-comment-binding
+// fallback path; current Sign() emits minisign's raw-64-byte binding.
 func signTestFile(t testing.TB, privPath, dataPath, dir, trustedComment string) string {
 	t.Helper()
 
@@ -293,14 +296,27 @@ func TestMinisignMalformedFiles(t *testing.T) {
 			name: "signature wrong algorithm",
 			sig: func() string {
 				blob := make([]byte, sigBlobLen)
-				copy(blob, "ED") // pre-hashed variant is not supported here
+				copy(blob, "ES") // plausible-looking but unknown algorithm
 				p := filepath.Join(dir, "algsig.minisig")
 				writeFile(t, p, []byte("untrusted comment: s\n"+base64.StdEncoding.EncodeToString(blob)+"\n"))
 				return p
 			}(),
 			pub:     pub,
 			data:    dataPath,
-			wantErr: `unsupported signature algorithm "ED"`,
+			wantErr: `unsupported signature algorithm "ES"`,
+		},
+		{
+			name: "pre-hashed ED blob with garbage sig fails",
+			sig: func() string {
+				blob := make([]byte, sigBlobLen)
+				copy(blob, "ED") // pre-hashed alg accepted, but sig bytes are zeros
+				p := filepath.Join(dir, "edzerosig.minisig")
+				writeFile(t, p, []byte("untrusted comment: s\n"+base64.StdEncoding.EncodeToString(blob)+"\n"))
+				return p
+			}(),
+			pub:     pub,
+			data:    dataPath,
+			wantErr: "signature verification failed",
 		},
 		{
 			name: "trusted comment without global signature line",

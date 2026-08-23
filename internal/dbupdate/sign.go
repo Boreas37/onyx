@@ -10,10 +10,16 @@ import (
 	"time"
 )
 
-// GenerateKeypair writes a fresh minisign-format keypair into dir using
-// the given comment for the public-key header. Returns the public and
-// secret key paths. This is the non-test counterpart of
-// GenerateTestKeypair; the on-disk formats are identical.
+// GenerateKeypair writes a fresh onyx minisign-format keypair into dir
+// using the given comment for the public-key header. Returns the public
+// and secret key paths.
+//
+// Compatibility: the PUBLIC key file is wire-compatible with minisign 0.12
+// ("Ed" || keynum || pubkey, base64 under an untrusted-comment line) and
+// signatures made from this keypair verify with both implementations. The
+// SECRET key file is NOT minisign-compatible: real minisign stores
+// scrypt-encrypted boxes with a KDF header, while onyx writes a plain,
+// unencrypted seed file (alg || keynum || seed || pubkey).
 func GenerateKeypair(dir, comment string) (pubPath, secPath string, err error) {
 	if comment == "" {
 		comment = untrustedCommentPub
@@ -61,8 +67,16 @@ func GenerateKeypair(dir, comment string) (pubPath, secPath string, err error) {
 // dataPath+".minisig" (e.g. feed.json.gz → feed.json.gz.minisig), matching
 // minisign's own naming convention.
 //
-// The trusted comment binds a timestamp and the file name into the global
-// signature so signatures cannot be replayed across files undetected.
+// onyx signs legacy-"Ed" (unhashed) signatures: the main Ed25519 signature
+// covers the raw data bytes, so the output verifies with real minisign's
+// "-l" acceptance path and with VerifyMinisign directly.
+//
+// The global/comment signature uses minisign 0.12's binding: the message
+// is the 64-byte raw signature || trusted comment (not the full 74-byte
+// alg||keynum||sig blob), so comments cannot be rewritten without
+// detection by either implementation.
+// The trusted comment itself carries a timestamp and the file name so
+// signatures cannot be replayed across files undetected.
 func Sign(secPath, dataPath string) (sigPath string, err error) {
 	seed, keynum, err := readSecretKeyFile(secPath)
 	if err != nil {
@@ -81,7 +95,7 @@ func Sign(secPath, dataPath string) (sigPath string, err error) {
 	sigBlob = append(sigBlob, ed25519.Sign(priv, data)...)
 
 	trustedComment := fmt.Sprintf("timestamp:%d\tfile:%s", time.Now().Unix(), filepath.Base(dataPath))
-	globalSig := ed25519.Sign(priv, append(append([]byte{}, sigBlob...), trustedComment...))
+	globalSig := ed25519.Sign(priv, append(append([]byte{}, sigBlob[2+8:]...), trustedComment...))
 
 	sigPath = dataPath + ".minisig"
 	body := untrustedCommentSig + "\n" +
@@ -95,7 +109,9 @@ func Sign(secPath, dataPath string) (sigPath string, err error) {
 }
 
 // readSecretKeyFile parses an onyx minisign secret key file into its seed
-// and key identifier. Layout: "Ed" [2] || keynum [8] || seed [32] || pub [32].
+// and key identifier. Layout: "Ed" [2] || keynum [8] || seed [32] || pub
+// [32]. This plain format is onyx-specific; minisign's scrypt-encrypted
+// secret keys are not readable here and vice versa.
 func readSecretKeyFile(path string) (seed, keynum []byte, err error) {
 	lines, lErr := readMinisignLines(path)
 	if lErr != nil {
@@ -115,8 +131,7 @@ func readSecretKeyFile(path string) (seed, keynum []byte, err error) {
 	return blob[10 : 10+ed25519.SeedSize], blob[2:10], nil
 }
 
-// writeKeyFilePlain writes a two-line minisign-style key file without a
-// testing handle.
+// writeKeyFilePlain writes a two-line minisign-style key file.
 func writeKeyFilePlain(path, comment string, blob []byte, mode os.FileMode) error {
 	body := comment + "\n" + base64.StdEncoding.EncodeToString(blob) + "\n"
 	return os.WriteFile(path, []byte(body), mode)

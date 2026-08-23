@@ -1,7 +1,8 @@
 // Command onyx-minisign generates onyx minisign keypairs and signs files
-// with them. Signatures are minisign/signify-compatible Ed25519 detached
-// signatures; the public keys verify both with this tool and with the
-// onyx client's database verification ($ONYX_DB_PUBKEY).
+// with them. Public keys and signatures are wire-compatible with minisign
+// 0.12 in both directions; onyx emits legacy-"Ed" (unhashed) signatures.
+// Secret keys are onyx-specific plaintext (minisign encrypts its secret
+// keys with scrypt) and cannot be exchanged between the two tools.
 //
 // Usage:
 //
