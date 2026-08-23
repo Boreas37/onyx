@@ -34,8 +34,8 @@ const (
 // software. Wordfence always includes structured from/to fields; when they
 // are absent the human-readable label is parsed instead.
 type AffectedVersion struct {
-	Label         string
-	Ranges        []version.Range
+	Label  string
+	Ranges []version.Range
 }
 
 type rawAffectedVersion struct {
@@ -66,14 +66,14 @@ type CVSS struct {
 
 // Vuln is one Wordfence vulnerability record.
 type Vuln struct {
-	ID          string     `json:"id"`
-	Title       string     `json:"title"`
-	Software    []Software `json:"software"`
-	Informational bool     `json:"informational"`
-	Description string     `json:"description"`
-	CVE         string     `json:"cve"`
-	CVSS        CVSS       `json:"cvss"`
-	PublishedAt string     `json:"published_at"`
+	ID            string     `json:"id"`
+	Title         string     `json:"title"`
+	Software      []Software `json:"software"`
+	Informational bool       `json:"informational"`
+	Description   string     `json:"description"`
+	CVE           string     `json:"cve"`
+	CVSS          CVSS       `json:"cvss"`
+	PublishedAt   string     `json:"published_at"`
 }
 
 // DB is an indexed view of the Wordfence feed.
@@ -186,6 +186,32 @@ func slugify(s string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+// ratingWhitelist is the closed set of CVSS severity labels accepted from
+// the feed after normalization. The mirror is semi-trusted: a poisoned or
+// corrupted record must not smuggle an arbitrary "rating" string into
+// reports, severity tallies or SARIF levels.
+var ratingWhitelist = map[string]bool{
+	"":              true,
+	"critical":      true,
+	"high":          true,
+	"medium":        true,
+	"low":           true,
+	"info":          true,
+	"informational": true,
+	"none":          true,
+}
+
+// normalizeRating lowercases and sanitizes a feed-supplied CVSS rating,
+// mapping anything outside ratingWhitelist to the empty string. Score and
+// vector pass through untouched; only the free-form label is normalized.
+func normalizeRating(rating string) string {
+	rating = sanitize.Text(strings.ToLower(rating), maxLabelLen)
+	if !ratingWhitelist[rating] {
+		return ""
+	}
+	return rating
+}
+
 // Load opens path and streams the feed, building the slug index and the
 // top-slug list.
 func Load(path string) (*DB, error) {
@@ -217,14 +243,14 @@ func Load(path string) (*DB, error) {
 		key, _ := keyTok.(string)
 
 		var raw struct {
-			ID          string           `json:"id"`
-			Title       string           `json:"title"`
-			Software    []json.RawMessage `json:"software"`
-			Informational bool           `json:"informational"`
-			Description string           `json:"description"`
-			CVE         string           `json:"cve"`
-			CVSS        CVSS             `json:"cvss"`
-			PublishedAt string           `json:"published_at"`
+			ID            string            `json:"id"`
+			Title         string            `json:"title"`
+			Software      []json.RawMessage `json:"software"`
+			Informational bool              `json:"informational"`
+			Description   string            `json:"description"`
+			CVE           string            `json:"cve"`
+			CVSS          CVSS              `json:"cvss"`
+			PublishedAt   string            `json:"published_at"`
 		}
 		if err := dec.Decode(&raw); err != nil {
 			db.skipped++
@@ -238,6 +264,10 @@ func Load(path string) (*DB, error) {
 		// corrupted or poisoned mirror cannot forge output lines.
 		raw.Title = sanitize.Text(raw.Title, maxTitleLen)
 		raw.CVE = sanitize.Text(raw.CVE, maxCVENLen)
+		// CONTRACT CHANGE: CVSS ratings are normalized at load time —
+		// lowercased and whitelisted; unknown labels become "" so no
+		// feed-supplied junk ever reaches reports. Score/vector untouched.
+		raw.CVSS.Rating = normalizeRating(raw.CVSS.Rating)
 		rec := Vuln{
 			ID:            raw.ID,
 			Title:         raw.Title,
@@ -270,16 +300,20 @@ func Load(path string) (*DB, error) {
 		}
 		db.Records = append(db.Records, rec)
 
-		// Index non-informational records by slug.
+		// Index non-informational records by slug, pointing at the stored
+		// record rather than the loop-local copy so the index and
+		// db.Records never alias two different structs.
 		if rec.Informational {
 			continue
 		}
-		for i := range rec.Software {
-			s := &rec.Software[i]
-			if s.Slug == "" {
+		idx := len(db.Records) - 1
+		stored := &db.Records[idx]
+		for i := range stored.Software {
+			slug := stored.Software[i].Slug
+			if slug == "" {
 				continue
 			}
-			db.bySlug[s.Slug] = append(db.bySlug[s.Slug], &rec)
+			db.bySlug[slug] = append(db.bySlug[slug], stored)
 		}
 	}
 
@@ -314,24 +348,24 @@ func Load(path string) (*DB, error) {
 // the entry is unusable (e.g. an unparseable version range).
 func decodeSoftware(rm json.RawMessage) (Software, bool) {
 	var raw struct {
-		Type             string                     `json:"type"`
-		Name             string                     `json:"name"`
-		Slug             string                     `json:"slug"`
+		Type             string                        `json:"type"`
+		Name             string                        `json:"name"`
+		Slug             string                        `json:"slug"`
 		AffectedVersions map[string]rawAffectedVersion `json:"affected_versions"`
-		Patched          bool                       `json:"patched"`
-		PatchedVersions  []string                   `json:"patched_versions"`
-		Remediation      string                     `json:"remediation"`
+		Patched          bool                          `json:"patched"`
+		PatchedVersions  []string                      `json:"patched_versions"`
+		Remediation      string                        `json:"remediation"`
 	}
 	if err := json.Unmarshal(rm, &raw); err != nil {
 		return Software{}, true
 	}
 	out := Software{
-		Type:            sanitize.Text(raw.Type, 32),
-		Name:            sanitize.Text(raw.Name, maxNameLen),
-		Slug:            sanitize.Text(raw.Slug, maxSlugLen),
-		Patched:         raw.Patched,
-		PatchedVersions: raw.PatchedVersions,
-		Remediation:     sanitize.Text(raw.Remediation, maxDescriptionLen),
+		Type:             sanitize.Text(raw.Type, 32),
+		Name:             sanitize.Text(raw.Name, maxNameLen),
+		Slug:             sanitize.Text(raw.Slug, maxSlugLen),
+		Patched:          raw.Patched,
+		PatchedVersions:  raw.PatchedVersions,
+		Remediation:      sanitize.Text(raw.Remediation, maxDescriptionLen),
 		AffectedVersions: make(map[string]AffectedVersion, len(raw.AffectedVersions)),
 	}
 	for label, ra := range raw.AffectedVersions {

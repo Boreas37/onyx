@@ -359,3 +359,62 @@ func TestTitleSoftwareSlugify(t *testing.T) {
 		t.Errorf("slug/name = %q/%q, want hello-dolly/Hello Dolly", s.Slug, s.Name)
 	}
 }
+
+// TestLoadNormalizesCVSSRating is a table-driven check of the load-time
+// rating whitelist: ratings are lowercased, whitelisted values pass
+// through, anything else becomes "" and score/vector stay untouched.
+func TestLoadNormalizesCVSSRating(t *testing.T) {
+	cases := []struct {
+		name  string
+		rate  string
+		score float64
+		vec   string
+		want  string
+	}{
+		{"empty", "", 0, "", ""},
+		{"critical", "critical", 9.8, "AV:N/AC:L", "critical"},
+		{"uppercase", "CRITICAL", 9.8, "AV:N/AC:L", "critical"},
+		{"high mixed case", "High", 7.5, "", "high"},
+		{"medium uppercase", "MEDIUM", 5.0, "", "medium"},
+		{"low", "low", 3.1, "", "low"},
+		{"info", "info", 0, "", "info"},
+		{"informational", "Informational", 0, "", "informational"},
+		{"none", "NONE", 0, "", "none"},
+		{"unknown label", "severe", 9.0, "", ""},
+		{"near miss", "critcal", 9.0, "", ""},
+		{"padded junk", " high ", 7.5, "", ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeFeed(t, map[string]Vuln{
+				"55555555-0000-0000-0000-000000000009": {
+					ID:    "55555555-0000-0000-0000-000000000009",
+					Title: "Test Plugin < 2.0.0 - X",
+					CVSS:  CVSS{Vector: tc.vec, Score: tc.score, Rating: tc.rate},
+					Software: []Software{{
+						Type: "plugin", Name: "test-plugin", Slug: "test-plugin",
+						AffectedVersions: map[string]AffectedVersion{},
+					}},
+				},
+			})
+			got, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if got.Count() != 1 {
+				t.Fatalf("Count() = %d, want 1", got.Count())
+			}
+			rec := got.Records[0]
+			if rec.CVSS.Rating != tc.want {
+				t.Errorf("rating = %q, want %q", rec.CVSS.Rating, tc.want)
+			}
+			if rec.CVSS.Score != tc.score {
+				t.Errorf("score = %v, want untouched %v", rec.CVSS.Score, tc.score)
+			}
+			if rec.CVSS.Vector != tc.vec {
+				t.Errorf("vector = %q, want untouched %q", rec.CVSS.Vector, tc.vec)
+			}
+		})
+	}
+}
