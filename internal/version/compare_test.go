@@ -13,8 +13,8 @@ func testVersion(t *testing.T, s string) Version {
 
 func TestParse(t *testing.T) {
 	cases := []struct {
-		in   string
-		ok   bool
+		in    string
+		ok    bool
 		parts []int
 	}{
 		{"1.2.3", true, []int{1, 2, 3}},
@@ -35,6 +35,20 @@ func TestParse(t *testing.T) {
 		{"-1.2", false, nil},
 		{".", false, nil},
 		{"..", false, nil},
+
+		// Trailing-dot versions keep their historical behavior: the empty
+		// final segment is skipped (locked by TestTrailingDotVersions).
+		{"1.", true, []int{1}},
+		{"1.0.", true, []int{1, 0}},
+
+		// Overflow cap: 18 digits per component is accepted, anything
+		// longer fails the whole version (locked by TestParseOverflowCap).
+		{"999999999999999999", true, []int{999999999999999999}},
+		{"1.999999999999999999", true, []int{1, 999999999999999999}},
+		{"1000000000000000000", false, nil},    // 19 digits
+		{"18446744073709551616", false, nil},   // would wrap to 0
+		{"99999999999999999999.1", false, nil}, // 20-digit first component
+		{"1.18446744073709551616", false, nil}, // overflow in SECOND component fails whole version
 	}
 	for _, c := range cases {
 		v, ok := Parse(c.in)
@@ -194,11 +208,130 @@ func TestInAffectedWith4PartVersions(t *testing.T) {
 }
 
 func TestParseRangesErrors(t *testing.T) {
-	bad := []string{"1.0.0 -", "- 3.0", "abc", "[1.0 2.0]", "[*,3.7", ")1.0,2.0(", "<= xyz", "= "}
+	bad := []string{
+		"1.0.0 -", "- 3.0", "abc", "[1.0 2.0]", "[*,3.7", ")1.0,2.0(", "<= xyz", "= ",
+		// Strict bracket bounds: trailing junk after a bound must not be
+		// silently truncated away by Parse.
+		"[1.0, 2.0, junk]", "[1.0, 2.0 , junk]", "[1.0, 2.0, extra]",
+		"[0.1-0.9]",      // dash-digit tail inside a bound reads as a range
+		"[1.0, 2.0-3.0]", // same
+	}
 	for _, s := range bad {
 		if _, err := ParseRanges(s); err == nil {
 			t.Errorf("ParseRanges(%q): expected error, got nil", s)
 		}
+	}
+}
+
+func TestParseOverflowCap(t *testing.T) {
+	// The audit finding: Parse("18446744073709551616") used to wrap to
+	// parts=[0], compare EQUAL to "0", and match ranges "<= 100" and
+	// "*-50". It must now fail to parse entirely (fail closed).
+	if v, ok := Parse("18446744073709551616"); ok {
+		t.Fatalf("Parse(overflowing) = %v, want ok=false", v)
+	}
+	for _, label := range []string{"<= 100", "*-50"} {
+		if InAffected(label, "18446744073709551616") {
+			t.Errorf("InAffected(%q, overflowing version) = true, want false", label)
+		}
+	}
+	zero := testVersion(t, "0")
+	for _, s := range []string{
+		"1000000000000000000",      // smallest 19-digit number
+		"99999999999999999999.1",   // 20 digits in first component
+		"1.1000000000000000000",    // overflow in second component fails whole version
+		"1.2.99999999999999999999", // overflow in third component
+	} {
+		if _, ok := Parse(s); ok {
+			t.Errorf("Parse(%q): expected ok=false", s)
+		}
+		if InAffected("*-50", s) || InAffected("<= 100", s) {
+			t.Errorf("InAffected matches unparseable overflowing version %q", s)
+		}
+	}
+	for _, s := range []string{
+		"999999999999999999",   // exactly 18 digits
+		"1.999999999999999999", // exactly 18 digits in second component
+	} {
+		v, ok := Parse(s)
+		if !ok {
+			t.Errorf("Parse(%q): unexpected failure at the 18-digit cap", s)
+			continue
+		}
+		if c := v.Compare(zero); c <= 0 && s != "" {
+			t.Errorf("Compare(%q, 0) = %d, want > 0", s, c)
+		}
+	}
+}
+
+func TestBracketBoundsStrict(t *testing.T) {
+	// Prerelease-style continuations of a bound remain consistent with
+	// Parse's rules and are accepted.
+	good := []struct {
+		label, installed string
+		want             bool
+	}{
+		{"[1.2.3-beta, 2.0]", "1.5", true},
+		{"[1.0, 2.0-rc1]", "2.0", true},
+		{"[1.0, 2.0b]", "1.5", true},
+		{"[v1.0, 2.0]", "1.5", true},
+	}
+	for _, c := range good {
+		if got := InAffected(c.label, c.installed); got != c.want {
+			t.Errorf("InAffected(%q, %q)=%v want %v", c.label, c.installed, got, c.want)
+		}
+	}
+}
+
+func TestDashStarRange(t *testing.T) {
+	// "1.0-*" / "1.0 - *" mean From=1.0 inclusive with no upper bound,
+	// i.e. the same semantics as "[1.0, *]".
+	cases := []struct {
+		label, installed string
+		want             bool
+	}{
+		{"1.0-*", "0.9", false},
+		{"1.0-*", "1.0", true},
+		{"1.0-*", "99.0", true},
+		{"1.0 - *", "0.9", false},
+		{"1.0 - *", "1.0", true},
+		{"1.0 - *", "99.0", true},
+		// Prerelease dash is untouched: still an exact match.
+		{"1.2.3-beta", "1.2.3", true},
+		{"1.2.3-beta", "1.2.4", false},
+	}
+	for _, c := range cases {
+		if got := InAffected(c.label, c.installed); got != c.want {
+			t.Errorf("InAffected(%q, %q)=%v want %v", c.label, c.installed, got, c.want)
+		}
+	}
+	for _, label := range []string{"1.0-*", "1.0 - *"} {
+		rs, err := ParseRanges(label)
+		if err != nil {
+			t.Fatalf("ParseRanges(%q): %v", label, err)
+		}
+		if len(rs) != 1 || rs[0].From == nil || rs[0].To != nil || !rs[0].FromIncl {
+			t.Errorf("ParseRanges(%q) = %+v, want single range From=1.0 inclusive, To=nil", label, rs)
+		}
+	}
+	// "*-1.37" must keep working after the dash-star change.
+	if !InAffected("*-1.37", "1.37") || InAffected("*-1.37", "1.37.1") {
+		t.Errorf("*-1.37 semantics regressed")
+	}
+}
+
+func TestTrailingDotVersions(t *testing.T) {
+	// Locked decision: a trailing dot yields an empty final segment which
+	// is skipped, so "1." parses as [1] — historical behavior preserved.
+	v, ok := Parse("1.")
+	if !ok || len(v.parts) != 1 || v.parts[0] != 1 {
+		t.Fatalf("Parse(\"1.\") = (%#v, %v), want parts [1]", v, ok)
+	}
+	if w := testVersion(t, "1."); w.Compare(testVersion(t, "1")) != 0 {
+		t.Errorf("\"1.\" should equal \"1\"")
+	}
+	if !InAffected("= 1.", "1.0") {
+		t.Errorf("= 1. should match 1.0")
 	}
 }
 
