@@ -60,7 +60,7 @@ onyx scan https://example.com
 |---|---|
 | `--db PATH` | Use a different database file (default `data/wordfence.json`) |
 | `--threads N` | Concurrent requests (default 5) |
-| `--enumerate M` | What to probe: `p` plugins, `t` themes, `u` users, `m` media — combine letters (default `pt`) |
+| `--enumerate M` | What to probe: `p`/`vp`/`ap` plugins, `t`/`vt`/`at` themes, `u` users, `m` media — comma-separated (default `pt`; `vp`/`vt` probe vulnerable components without the popular-seed lists) |
 | `--detection-mode M` | `passive`, `aggressive`, or `mixed` (default: mixed) |
 | `--min-severity S` | Only show findings >= `critical`/`high`/`medium`/`low` |
 | `--format F` | Output format: `table`, `json`, `jsonl`, `sarif`, `csv`, `cyclonedx`, `markdown`/`md`, `html`, `junit` (default: table) |
@@ -104,6 +104,7 @@ onyx scan https://example.com
 | `--vhost HOST` | Override the Host header (shared-hosting scans) |
 | `--force` | Scan even when the target shows no WordPress fingerprints |
 | `--exclude-vulns LIST` | Drop findings with these vulnerability IDs (comma-separated) |
+| `--wp-version X.Y.Z` | Skip version detection and report this core version (e.g. when meta tags are stripped) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -232,6 +233,16 @@ onyx cache purge                 # delete all cached responses
 The HTTP response cache lives in `~/.cache/onyx/http` (or
 `$ONYX_CACHE_DIR`), uses `0600`/`0700` permissions, and is only active
 with `--cache-ttl`.
+
+## Enumerate tokens
+
+`--enumerate` accepts WPScan-style tokens: `p`/`ap` (plugins, including
+the popular seed lists), `vp` (vulnerable plugins only), and the same
+for themes (`t`/`at`/`vt`), plus `u` (users) and `m` (media). Legacy
+bare-letter forms like `ptum` keep working. When the mirror publishes
+`popular.json` with install counts, detected components report
+`active_installs` in JSON and CycloneDX output. XML-RPC scans now also
+report the advertised method list (`xmlrpc_methods`).
 
 ## Result diffing and config help
 
