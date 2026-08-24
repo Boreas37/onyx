@@ -121,6 +121,20 @@ func (d *DB) Lookup(slug string) []Vuln {
 	return out
 }
 
+// NameFor returns the first known display name for a slug across the
+// loaded records, or "" when the slug is unknown. It is a best-effort
+// helper for report rendering (Detected.Name falls back to the slug).
+func (d *DB) NameFor(slug string) string {
+	for _, r := range d.bySlug[slug] {
+		for i := range r.Software {
+			if r.Software[i].Slug == slug && r.Software[i].Name != "" {
+				return r.Software[i].Name
+			}
+		}
+	}
+	return ""
+}
+
 // SlugType returns the dominant software type ("plugin", "theme", "core")
 // for a slug, or "" when the slug is unknown.
 func (d *DB) SlugType(slug string) string {

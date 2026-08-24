@@ -227,6 +227,28 @@ func TestLookupReturnsCopies(t *testing.T) {
 	}
 }
 
+// TestNameFor verifies the display-name lookup used by the scanner's
+// report rendering: the first non-empty software name for a slug wins,
+// unknown slugs return "".
+func TestNameFor(t *testing.T) {
+	path := writeFeed(t, sampleFeed())
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name := got.NameFor("sometheme"); name != "SomeTheme" {
+		t.Errorf("NameFor(sometheme) = %q, want SomeTheme", name)
+	}
+	// sampleFeed's plugin() helper sets Name = slug, so the fallback value
+	// equals the slug — still a real name, not "".
+	if name := got.NameFor("elementor"); name != "elementor" {
+		t.Errorf("NameFor(elementor) = %q, want elementor", name)
+	}
+	if name := got.NameFor("no-such-slug"); name != "" {
+		t.Errorf("NameFor(unknown) = %q, want empty", name)
+	}
+}
+
 // scannerFeed writes a minimal scanner-feed JSON document (records carry
 // only detection info, no software array).
 func scannerFeed(t *testing.T, body string) string {
