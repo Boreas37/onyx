@@ -169,6 +169,9 @@ func writeTable(w io.Writer, res *scanner.Result, verbose bool, minSeverity stri
 					}
 					fmt.Fprintf(w, "[%s] [%s:%s:%s] %s (%s)\n",
 						sev, c.f.Type, c.f.Slug, c.f.InstalledVersion, v.Title, cve)
+					if v.CVSSVector != "" {
+						fmt.Fprintf(w, "    vector: %s\n", sanitize.Text(v.CVSSVector, 300))
+					}
 					if v.Remediation != "" {
 						fmt.Fprintf(w, "    remediate: %s\n", sanitize.Text(v.Remediation, 300))
 					}

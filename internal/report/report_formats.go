@@ -61,8 +61,12 @@ func WriteMarkdown(w io.Writer, res *scanner.Result) {
 			if cve == "" {
 				cve = "-"
 			}
+			sev := mdCell(sevClass(v.Rating))
+			if v.CVSSVector != "" {
+				sev += " (CVSS: " + mdCell(v.CVSSVector) + ")"
+			}
 			fmt.Fprintf(w, "| %s | %s | %s |\n",
-				mdCell(sevClass(v.Rating)), mdCell(cve), mdCell(v.Title))
+				sev, mdCell(cve), mdCell(v.Title))
 			if v.Remediation != "" {
 				fmt.Fprintf(w, "| Remediation | %s |\n", mdCell(v.Remediation))
 			}
@@ -132,8 +136,12 @@ func WriteHTML(w io.Writer, res *scanner.Result) error {
 				// sevClass whitelists both the CSS class and the cell
 				// text: a hostile rating can never reach the attribute.
 				sev := sevClass(v.Rating)
+				sevCell := sev
+				if v.CVSSVector != "" {
+					sevCell = sev + "<br><code>" + esc(v.CVSSVector) + "</code>"
+				}
 				fmt.Fprintf(&b, "<tr><td class=\"sev-%s\">%s</td><td>%s</td><td>%s</td></tr>\n",
-					sev, sev, esc(v.CVE), esc(v.Title))
+					sev, sevCell, esc(v.CVE), esc(v.Title))
 				if v.Remediation != "" {
 					fmt.Fprintf(&b, "<tr><td>Remediation</td><td colspan=\"2\">%s</td></tr>\n", esc(v.Remediation))
 				}
@@ -205,6 +213,9 @@ func WriteJUnit(w io.Writer, version string, res *scanner.Result) error {
 				cve = "no-cve"
 			}
 			message := strings.ToLower(v.Rating) + ": " + v.Title
+			if v.CVSSVector != "" {
+				message += " | CVSS: " + sanitize.Text(v.CVSSVector, 500)
+			}
 			if v.Remediation != "" {
 				message += " — " + sanitize.Text(v.Remediation, 500)
 			}

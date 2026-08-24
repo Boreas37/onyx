@@ -2,7 +2,7 @@
 <testsuites name="onyx 0.1.0" tests="4" failures="4">
   <testsuite name="plugin/elementor@3.24.0" tests="3" failures="3">
     <testcase name="CVE-2024-0001" classname="https://shop.example.test">
-      <failure message="critical: Elementor &lt; 3.25.0 - SQL Injection — Update to Elementor 3.25.0 or newer">1.0.0 - 3.24.9, Patched in: 3.25.0</failure>
+      <failure message="critical: Elementor &lt; 3.25.0 - SQL Injection | CVSS: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H — Update to Elementor 3.25.0 or newer">1.0.0 - 3.24.9, Patched in: 3.25.0</failure>
     </testcase>
     <testcase name="CVE-2024-0002" classname="https://shop.example.test">
       <failure message="medium: Elementor &lt; 3.23.9 - Stored XSS">1.0.0 - 3.23.8</failure>
@@ -13,7 +13,7 @@
   </testsuite>
   <testsuite name="plugin/akismet@4.0.0" tests="1" failures="1">
     <testcase name="CVE-2024-0003" classname="https://shop.example.test">
-      <failure message="high: Akismet &lt; 5.0 - Comment Spam Bypass">1.0.0 - 4.9.9, Patched in: 5.0</failure>
+      <failure message="high: Akismet &lt; 5.0 - Comment Spam Bypass | CVSS: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N">1.0.0 - 4.9.9, Patched in: 5.0</failure>
     </testcase>
   </testsuite>
 </testsuites>

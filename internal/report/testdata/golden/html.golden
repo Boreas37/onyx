@@ -22,7 +22,7 @@
 <h3><span class="slug">plugin/elementor@3.24.0</span> — 3</h3>
 <table>
 <tr><th>Severity</th><th>CVE</th><th>Title</th></tr>
-<tr><td class="sev-critical">critical</td><td>CVE-2024-0001</td><td>Elementor &lt; 3.25.0 - SQL Injection</td></tr>
+<tr><td class="sev-critical">critical<br><code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H</code></td><td>CVE-2024-0001</td><td>Elementor &lt; 3.25.0 - SQL Injection</td></tr>
 <tr><td>Remediation</td><td colspan="2">Update to Elementor 3.25.0 or newer</td></tr>
 <tr><td class="sev-medium">medium</td><td>CVE-2024-0002</td><td>Elementor &lt; 3.23.9 - Stored XSS</td></tr>
 <tr><td class="sev-low">low</td><td></td><td>Arbitrary file download in Elementor</td></tr>
@@ -32,7 +32,7 @@
 <h3><span class="slug">plugin/akismet@4.0.0</span> — 1</h3>
 <table>
 <tr><th>Severity</th><th>CVE</th><th>Title</th></tr>
-<tr><td class="sev-high">high</td><td>CVE-2024-0003</td><td>Akismet &lt; 5.0 - Comment Spam Bypass</td></tr>
+<tr><td class="sev-high">high<br><code>CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N</code></td><td>CVE-2024-0003</td><td>Akismet &lt; 5.0 - Comment Spam Bypass</td></tr>
 </table>
 <p><strong>Patched in:</strong> 5.0</p>
 </body></html>

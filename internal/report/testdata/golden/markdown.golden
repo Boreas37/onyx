@@ -15,7 +15,7 @@
 
 | Severity | CVE | Title |
 |---|---|---|
-| critical | CVE-2024-0001 | Elementor < 3.25.0 - SQL Injection |
+| critical (CVSS: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H) | CVE-2024-0001 | Elementor < 3.25.0 - SQL Injection |
 | Remediation | Update to Elementor 3.25.0 or newer |
 | medium | CVE-2024-0002 | Elementor < 3.23.9 - Stored XSS |
 | low | - | Arbitrary file download in Elementor |
@@ -27,7 +27,7 @@
 
 | Severity | CVE | Title |
 |---|---|---|
-| high | CVE-2024-0003 | Akismet < 5.0 - Comment Spam Bypass |
+| high (CVSS: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N) | CVE-2024-0003 | Akismet < 5.0 - Comment Spam Bypass |
 
 **Patched in:** 5.0
 

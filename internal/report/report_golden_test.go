@@ -54,6 +54,7 @@ func goldenResult() *scanner.Result {
 				Vulnerabilities: []scanner.Vulnerability{
 					{ID: "aaaaaaaa-0000-0000-0000-000000000001", CVE: "CVE-2024-0001",
 						Title: "Elementor < 3.25.0 - SQL Injection", CVSSScore: 9.1, Rating: "critical",
+						CVSSVector:      "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
 						AffectedLabels:  []string{"1.0.0 - 3.24.9"},
 						Remediation:     "Update to Elementor 3.25.0 or newer",
 						PatchedVersions: []string{"3.25.0"}},
@@ -71,6 +72,7 @@ func goldenResult() *scanner.Result {
 				Vulnerabilities: []scanner.Vulnerability{
 					{ID: "dddddddd-0000-0000-0000-000000000004", CVE: "CVE-2024-0003",
 						Title: "Akismet < 5.0 - Comment Spam Bypass", CVSSScore: 7.5, Rating: "high",
+						CVSSVector:      "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
 						AffectedLabels:  []string{"1.0.0 - 4.9.9"},
 						PatchedVersions: []string{"5.0"}},
 				},

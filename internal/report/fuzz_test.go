@@ -19,19 +19,19 @@ const maxFuzzField = 512
 // that starts with a spreadsheet formula character.
 func FuzzWriteReportSafety(f *testing.F) {
 	seeds := [][]string{
-		{`high"><script>alert(1)</script>`, `=HYPERLINK("http://evil","x")`, `low | injected | col`, `Update to >= 5.4.2`},
-		{"", "", "", ""},
-		{"critical", "Elementor < 3.25.0 - SQL Injection", "elementor", ""},
-		{"\x1b[31mred", "tab\tand\nnewline", "\x01ctl\x7f", `=cmd|' /C calc'!A0`},
-		{"info", "=1+1; -2", "@evil", "patch now"},
+		{`high"><script>alert(1)</script>`, `=HYPERLINK("http://evil","x")`, `low | injected | col`, `Update to >= 5.4.2`, `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H`},
+		{"", "", "", "", ""},
+		{"critical", "Elementor < 3.25.0 - SQL Injection", "elementor", "", `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H" onmouseover="alert(1)`},
+		{"\x1b[31mred", "tab\tand\nnewline", "\x01ctl\x7f", `=cmd|' /C calc'!A0`, "CVSS:3.1/AV:A/AC:H/PR:L/UI:R/S:C/C:L/I:L/A:L"},
+		{"info", "=1+1; -2", "@evil", "patch now", ""},
 	}
 	for _, s := range seeds {
-		f.Add(s[0], s[1], s[2], s[3])
+		f.Add(s[0], s[1], s[2], s[3], s[4])
 	}
 
-	f.Fuzz(func(t *testing.T, rating, title, slug, remediation string) {
+	f.Fuzz(func(t *testing.T, rating, title, slug, remediation, cvssVector string) {
 		if len(rating) > maxFuzzField || len(title) > maxFuzzField ||
-			len(slug) > maxFuzzField || len(remediation) > maxFuzzField {
+			len(slug) > maxFuzzField || len(remediation) > maxFuzzField || len(cvssVector) > maxFuzzField {
 			t.Skip()
 		}
 		v := scanner.Vulnerability{
@@ -40,6 +40,7 @@ func FuzzWriteReportSafety(f *testing.F) {
 			Title:          title,
 			AffectedLabels: []string{title},
 			Remediation:    remediation,
+			CVSSVector:     cvssVector,
 		}
 		if remediation != "" {
 			v.PatchedVersions = []string{remediation}
@@ -59,6 +60,9 @@ func FuzzWriteReportSafety(f *testing.F) {
 		}
 		if strings.Contains(html.String(), "<script>") {
 			t.Fatalf("HTML contains <script> for rating %q", rating)
+		}
+		if strings.Contains(html.String(), ` onmouseover="`) {
+			t.Fatalf("HTML attribute breakout for vector %q", cvssVector)
 		}
 
 		var csvBuf bytes.Buffer
