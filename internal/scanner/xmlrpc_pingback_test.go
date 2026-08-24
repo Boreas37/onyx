@@ -56,7 +56,7 @@ func TestCheckXMLRPCReturnsPingback(t *testing.T) {
 		srv := pingbackServer(t, http.StatusOK, methodsWithPingback)
 		defer srv.Close()
 		sc, _ := NewScanner(d, srv.URL, Options{})
-		enabled, pingback := sc.checkXMLRPC()
+		enabled, pingback, _ := sc.checkXMLRPC()
 		if !enabled {
 			t.Error("enabled = false, want true for a responding xmlrpc.php")
 		}
@@ -69,7 +69,7 @@ func TestCheckXMLRPCReturnsPingback(t *testing.T) {
 		srv := pingbackServer(t, http.StatusOK, methodsWithoutPingback)
 		defer srv.Close()
 		sc, _ := NewScanner(d, srv.URL, Options{})
-		enabled, pingback := sc.checkXMLRPC()
+		enabled, pingback, _ := sc.checkXMLRPC()
 		if !enabled {
 			t.Error("enabled = false, want true")
 		}
@@ -82,7 +82,7 @@ func TestCheckXMLRPCReturnsPingback(t *testing.T) {
 		srv := pingbackServer(t, http.StatusNotFound, "")
 		defer srv.Close()
 		sc, _ := NewScanner(d, srv.URL, Options{})
-		enabled, pingback := sc.checkXMLRPC()
+		enabled, pingback, _ := sc.checkXMLRPC()
 		if enabled || pingback {
 			t.Errorf("404 must report enabled=%v pingback=%v, want false,false", enabled, pingback)
 		}

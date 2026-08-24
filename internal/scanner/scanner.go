@@ -121,11 +121,24 @@ type Options struct {
 	Context context.Context
 
 	FingerprintDB string
+	// CoreVersionOverride pins the reported WordPress core version to the
+	// --wp-version value, skipping the whole version-detection chain
+	// (generator meta, RSS/OPML generators, core asset ?ver= and the
+	// fingerprint table) while still fetching the homepage normally for
+	// passive evidence. Empty when unused.
+	CoreVersionOverride string
 	// PopularSlugs appends the static popular plugin/theme slug seed lists
 	// (popular.go) to aggressive enumeration after the DB top-slug list.
 	// The CLI flag defaults it to true; building Options directly leaves
 	// the zero value (false), which keeps the seed lists off.
 	PopularSlugs bool
+	// PopularThemes appends the static popular theme slug seed list
+	// (popular.go) to aggressive enumeration after the DB top-slug list,
+	// independently of PopularSlugs so the CLI can map the WPScan-style
+	// enumerate tokens onto them ("t" enables popular themes, "vt"/"at"
+	// keep only the vuln-heavy DB themes). The zero value (false) keeps
+	// the theme seeds off, mirroring PopularSlugs.
+	PopularThemes bool
 	// AllowForeignRedirect allows following HTTP redirects whose target
 	// host:port differs from the scanned target's authority. The default
 	// (false) blocks foreign redirects as SSRF hardening, surfacing them as
@@ -144,8 +157,11 @@ type Options struct {
 	// it to true.
 	Discover404 bool
 	// PopularFile is an optional path to a JSON popular-list file
-	// ({"plugins":["slug",...],"themes":["slug",...]}) that replaces the
-	// built-in popular.go seed lists for aggressive enumeration. A missing
+	// ({"plugins":["slug",...],"themes":["slug",...], optionally
+	// "counts_plugins":{"slug":N} and "counts_themes":{"slug":N}}) that
+	// replaces the built-in popular.go seed lists for aggressive
+	// enumeration. The counts maps decorate detected components with
+	// active-install estimates (capped at maxActiveInstalls). A missing
 	// or unparseable file falls back to the built-ins with a one-time
 	// warning, never an error. Empty when unused.
 	PopularFile string
@@ -227,6 +243,12 @@ type Scanner struct {
 	fourohfourVersions map[string]string
 
 	popularOnce sync.Once // guards the --popular-file load (one-time warning)
+	// popularCountsPlugins / popularCountsThemes hold the active-install
+	// counts decoded from the --popular-file counts_plugins / counts_themes
+	// maps (slug -> installs). Both are nil when the file carried no
+	// counts, keeping the plain-shape file behavior unchanged.
+	popularCountsPlugins map[string]int
+	popularCountsThemes  map[string]int
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -522,8 +544,13 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	if enum == "" {
 		enum = "pt"
 	}
+	// The WPScan-style v/a prefixes ("vp", "ap", "vt", "at") are allowed
+	// through: buildJobs derives enumeration from substring presence
+	// (strings.Contains "p"/"t"), so the tokens keep working verbatim. The
+	// semantic validation of those tokens (v/a must pair with p or t, and
+	// their popular-seed mapping) lives in the CLI flag layer, not here.
 	for _, c := range enum {
-		if c != 'p' && c != 't' && c != 'u' && c != 'm' {
+		if c != 'p' && c != 't' && c != 'u' && c != 'm' && c != 'v' && c != 'a' {
 			return nil, fmt.Errorf("invalid --enumerate value %q (use p, t, u and/or m)", opts.Enumerate)
 		}
 	}
@@ -931,6 +958,11 @@ type Detected struct {
 	// reporting; both are omitted when the artifact carries none.
 	TestedUpTo      string `json:"tested_up_to,omitempty"`
 	RequiresAtLeast string `json:"requires_at_least,omitempty"`
+	// ActiveInstalls is the active-install estimate for this slug from the
+	// --popular-file counts maps (counts_plugins / counts_themes, by Type),
+	// capped at maxActiveInstalls. Omitted (0) when the file carried no
+	// count for the slug; the built-in popular lists never carry counts.
+	ActiveInstalls int `json:"active_installs,omitempty"`
 }
 
 // CoreEvidence records one WordPress core version observation together with
@@ -1028,16 +1060,20 @@ type Result struct {
 	Users            []User                `json:"users,omitempty"`
 	XMLRPC           bool                  `json:"xmlrpc,omitempty"`          // xmlrpc.php ping answered
 	XMLRPCPingback   bool                  `json:"xmlrpc_pingback,omitempty"` // pingback.ping exposed (SSRF amplification)
-	Interesting      []string              `json:"interesting,omitempty"`
-	ConfigBackups    []string              `json:"config_backups,omitempty"`
-	DBExports        []string              `json:"db_exports,omitempty"`
-	RateLimitHits    int                   `json:"rate_limit_hits,omitempty"`    // 429s seen
-	TimedOut         bool                  `json:"timed_out,omitempty"`          // --max-scan-duration expired
-	RateLimitedAbort bool                  `json:"rate_limited_abort,omitempty"` // enumeration stopped: target kept answering 429
-	Errors           []string              `json:"errors,omitempty"`
-	LoginBrutes      []LoginBrute          `json:"login_brutes,omitempty"` // valid credentials found by brute force
-	AuthStatus       string                `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
-	Summary          *Summary              `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
+	// XMLRPCMethods lists the methods advertised by system.listMethods,
+	// capped at 20 entries; nil when XML-RPC is disabled or the list
+	// could not be parsed.
+	XMLRPCMethods    []string     `json:"xmlrpc_methods,omitempty"`
+	Interesting      []string     `json:"interesting,omitempty"`
+	ConfigBackups    []string     `json:"config_backups,omitempty"`
+	DBExports        []string     `json:"db_exports,omitempty"`
+	RateLimitHits    int          `json:"rate_limit_hits,omitempty"`    // 429s seen
+	TimedOut         bool         `json:"timed_out,omitempty"`          // --max-scan-duration expired
+	RateLimitedAbort bool         `json:"rate_limited_abort,omitempty"` // enumeration stopped: target kept answering 429
+	Errors           []string     `json:"errors,omitempty"`
+	LoginBrutes      []LoginBrute `json:"login_brutes,omitempty"` // valid credentials found by brute force
+	AuthStatus       string       `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
+	Summary          *Summary     `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
 	// SchemaVersion is the version of the Result JSON shape, so CI
 	// consumers can detect breaking output changes. "1.0" is the first
 	// versioned shape (onyx 0.5.0+); always present.
@@ -1435,20 +1471,56 @@ func (s *Scanner) cachePut(u string, code int, body []byte) {
 	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), data, 0o600)
 }
 
+// maxXMLRPCMethods caps how many method names checkXMLRPC reports from a
+// system.listMethods response, so a chatty method list cannot balloon the
+// result.
+const maxXMLRPCMethods = 20
+
+// xmlrpcMethodRe matches one <string>NAME</string> element of a
+// system.listMethods response and captures the name. Only tokens made of
+// lowercase letters, digits, dots and underscores can look like method
+// names (matched case-insensitively); fault strings, blog names and other
+// prose never match the shape.
+var xmlrpcMethodRe = regexp.MustCompile(`(?i)<string>\s*([a-z0-9_.]+)\s*</string>`)
+
+// extractXMLRPCMethods parses the method names out of a system.listMethods
+// XML-RPC response: every <string>NAME</string> element is a candidate, but
+// only tokens matching ^[a-z0-9_.]+$ with at least one dot look like method
+// names. The names are deduplicated, sorted and capped at maxXMLRPCMethods.
+// A response with no parseable method list returns nil.
+func extractXMLRPCMethods(body string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, m := range xmlrpcMethodRe.FindAllStringSubmatch(body, -1) {
+		name := m[1]
+		if !strings.Contains(name, ".") || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+		if len(out) >= maxXMLRPCMethods {
+			break
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // checkXMLRPC pings POST /xmlrpc.php with a system.listMethods call and
 // reports whether the server answered with a methodResponse payload
-// (enabled) and, separately, whether that payload exposes the pingback.ping
-// method (pingback) — the SSRF amplification primitive. The request shares
-// the scan-wide pacing: 429 cooldown gate, adaptive send slot and the
-// request counter.
-func (s *Scanner) checkXMLRPC() (enabled bool, pingback bool) {
+// (enabled), whether that payload exposes the pingback.ping method
+// (pingback) — the SSRF amplification primitive — and the parsed method
+// inventory (methods, nil when disabled or nothing parseable). The request
+// shares the scan-wide pacing: 429 cooldown gate, adaptive send slot and
+// the request counter.
+func (s *Scanner) checkXMLRPC() (enabled bool, pingback bool, methods []string) {
 	s.lim.wait()
 	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
 	u := s.base + "/xmlrpc.php"
 	s.perHostWait(u)
 	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodPost, u, strings.NewReader(payload))
 	if err != nil {
-		return false, false
+		return false, false, nil
 	}
 	req.Header.Set("Content-Type", "text/xml")
 	s.rateLimitGate()
@@ -1456,21 +1528,22 @@ func (s *Scanner) checkXMLRPC() (enabled bool, pingback bool) {
 	s.requests.Add(1)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return false, false
+		return false, false, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, false
+		return false, false, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	if err != nil {
-		return false, false
+		return false, false, nil
 	}
 	enabled = strings.Contains(string(body), "methodResponse")
 	if enabled {
 		pingback = strings.Contains(strings.ToLower(string(body)), "pingback.ping")
+		methods = extractXMLRPCMethods(string(body))
 	}
-	return enabled, pingback
+	return enabled, pingback, methods
 }
 
 // Response-authenticity helpers.
@@ -1859,20 +1932,41 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 	// Remember the homepage status for the WAF/challenge auto-detection
 	// rule (403/429/503 or challenge markers) evaluated later in Scan().
 	s.homepageCode = code
+	// --wp-version override: the operator pins the core version (e.g. from
+	// out-of-band knowledge), so the whole version-detection chain is
+	// skipped. The homepage still gets fetched and stored above — passive
+	// evidence and IsWordPress need it. A sanitized-to-empty override is
+	// treated as unusable and falls through to the normal detection chain.
+	override := ""
+	if s.opts.CoreVersionOverride != "" {
+		override = sanitizeVersion(s.opts.CoreVersionOverride)
+	}
 	if code == 200 {
 		html := string(body)
 		s.homepage = html
-		if v, ok := ExtractWordPressVersion(html); ok {
-			coreVersion = v
-			evidence = append(evidence, "generator meta tag (WordPress "+v+")")
-			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "meta", Version: v, Confidence: confMetaGenerator})
+		if override != "" {
+			coreVersion = override
+			evidence = append(evidence, "core version overridden via --wp-version")
+			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "override", Version: override, Confidence: 100})
+		} else {
+			if v, ok := ExtractWordPressVersion(html); ok {
+				coreVersion = v
+				evidence = append(evidence, "generator meta tag (WordPress "+v+")")
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "meta", Version: v, Confidence: confMetaGenerator})
+			}
+			if strings.Contains(html, "wp-content") {
+				evidence = append(evidence, "wp-content path present in homepage")
+			}
+			if strings.Contains(html, "wp-json") || strings.Contains(html, "/wp-json/") {
+				evidence = append(evidence, "wp-json REST API referenced")
+			}
 		}
-		if strings.Contains(html, "wp-content") {
-			evidence = append(evidence, "wp-content path present in homepage")
-		}
-		if strings.Contains(html, "wp-json") || strings.Contains(html, "/wp-json/") {
-			evidence = append(evidence, "wp-json REST API referenced")
-		}
+	}
+	// With an override the version detection stops here: every probe below
+	// (RSS/OPML feeds, core asset ?ver=, the fingerprint table and the
+	// wp-login/wp-json evidence fetches) is skipped.
+	if override != "" {
+		return coreVersion, evidence, nil
 	}
 
 	// Multi-source fallbacks, cheapest-first. Each stops the chain as soon
@@ -2150,9 +2244,15 @@ func (s *Scanner) buildJobs() []job {
 			// Ordering is the deterministic list order (the built-in
 			// popular.go lists, or the --popular-file lists when that
 			// option is set); the loop stops as soon as the aggressive
-			// budget is exhausted.
+			// budget is exhausted. Plugin seeds are gated by PopularSlugs
+			// and theme seeds by PopularThemes, so the CLI can map the
+			// WPScan-style enumerate tokens onto them independently
+			// ("p" → plugins popular, "vp"/"ap" → none; "t" → themes
+			// popular, "vt"/"at" → none). The list loads once per scan
+			// (the popularOnce guard inside popularSeedLists), then each
+			// kind's loop is gated below.
+			popP, popT := s.popularSeedLists()
 			if s.opts.PopularSlugs {
-				popP, popT := s.popularSeedLists()
 				for _, slug := range popP {
 					if len(jobs) >= budget {
 						break
@@ -2164,11 +2264,13 @@ func (s *Scanner) buildJobs() []job {
 					jobs = append(jobs, job{kind: "plugin", slug: slug,
 						path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
 				}
+			}
+			if s.enumerateThemes() && s.opts.PopularThemes {
 				for _, slug := range popT {
 					if len(jobs) >= budget {
 						break
 					}
-					if !s.enumerateThemes() || seen["t:"+slug] {
+					if seen["t:"+slug] {
 						continue
 					}
 					seen["t:"+slug] = true
@@ -2185,7 +2287,10 @@ func (s *Scanner) buildJobs() []job {
 // section of aggressive enumeration. By default these are the built-in
 // popular.go lists; when --popular-file is set, a readable JSON file
 // ({"plugins":[...],"themes":[...]}) replaces them entirely, keeping the
-// file's ordering and deduplicating repeated slugs. A missing or
+// file's ordering and deduplicating repeated slugs. The extended file shape
+// adds optional "counts_plugins"/"counts_themes" maps (slug -> active
+// installs) that populate s.popularCountsPlugins / s.popularCountsThemes
+// for result decoration; the plain shape leaves both nil. A missing or
 // unparseable file falls back to the built-ins with a one-time progress
 // warning — a broken list file never aborts a scan. The load runs at most
 // once per scan (popularOnce).
@@ -2203,8 +2308,10 @@ func (s *Scanner) popularSeedLists() (plugins, themes []string) {
 			return
 		}
 		var f struct {
-			Plugins []string `json:"plugins"`
-			Themes  []string `json:"themes"`
+			Plugins       []string       `json:"plugins"`
+			Themes        []string       `json:"themes"`
+			CountsPlugins map[string]int `json:"counts_plugins"`
+			CountsThemes  map[string]int `json:"counts_themes"`
 		}
 		if err := json.Unmarshal(data, &f); err != nil {
 			if pr := s.progress; pr != nil {
@@ -2213,6 +2320,8 @@ func (s *Scanner) popularSeedLists() (plugins, themes []string) {
 			return
 		}
 		plugins, themes = unique(f.Plugins), unique(f.Themes)
+		s.popularCountsPlugins = f.CountsPlugins
+		s.popularCountsThemes = f.CountsThemes
 	})
 	return
 }
@@ -2575,13 +2684,18 @@ func (s *Scanner) Scan() (*Result, error) {
 
 	// XML-RPC ping check (skip with --no-xmlrpc). A positive ping also
 	// reports whether the method list exposes pingback.ping, the SSRF
-	// amplification primitive.
+	// amplification primitive, and captures the advertised method
+	// inventory (capped at maxXMLRPCMethods).
 	if !s.opts.NoXMLRPC {
-		xmlrpcOK, pingback := s.checkXMLRPC()
+		xmlrpcOK, pingback, methods := s.checkXMLRPC()
 		if xmlrpcOK {
 			res.XMLRPC = true
 			if pr != nil {
 				pr.LogInf("XML-RPC is enabled (xmlrpc.php responded)")
+			}
+			if len(methods) > 0 {
+				res.XMLRPCMethods = methods
+				res.Interesting = append(res.Interesting, fmt.Sprintf("XML-RPC exposes %d methods", len(methods)))
 			}
 			if pingback {
 				res.XMLRPCPingback = true
@@ -2881,11 +2995,53 @@ func (s *Scanner) Scan() (*Result, error) {
 	sort.Slice(res.Detected, func(i, j int) bool { return res.Detected[i].Slug < res.Detected[j].Slug })
 	sort.Slice(res.Findings, func(i, j int) bool { return res.Findings[i].Slug < res.Findings[j].Slug })
 
+	// Active-install counts from the --popular-file counts maps: after the
+	// final dedup, decorate each detected component whose slug appears in
+	// the counts map for its type (first match wins; the built-in lists
+	// carry no counts).
+	s.attachActiveInstalls(res.Detected)
+
 	res.RateLimitHits = s.rateLimitHits()
 	res.TimedOut = s.scanDone()
 	res.RateLimitedAbort = s.rateLimitAbort()
 	s.buildSummary(res, scanStart)
 	return res, nil
+}
+
+// maxActiveInstalls caps the active-install count stored on Detected
+// entries: the --popular-file counts are trusted input, and the JSON
+// int sanity cap keeps absurd or hostile values from leaking into reports.
+const maxActiveInstalls = 1 << 31
+
+// attachActiveInstalls decorates each detected component with the
+// active-install estimate from the --popular-file counts maps, looked up by
+// slug in the map matching the component's type (plugin vs theme). Unknown
+// slugs, type mismatches (a plugin slug listed under counts_themes) and
+// scans without a counts-bearing popular file all leave the field at 0.
+// Stored counts are capped at maxActiveInstalls.
+func (s *Scanner) attachActiveInstalls(detected []Detected) {
+	if s.popularCountsPlugins == nil && s.popularCountsThemes == nil {
+		return
+	}
+	for i := range detected {
+		d := &detected[i]
+		var counts map[string]int
+		switch d.Type {
+		case "plugin":
+			counts = s.popularCountsPlugins
+		case "theme":
+			counts = s.popularCountsThemes
+		}
+		if counts == nil {
+			continue
+		}
+		if n, ok := counts[d.Slug]; ok {
+			if n > maxActiveInstalls {
+				n = maxActiveInstalls
+			}
+			d.ActiveInstalls = n
+		}
+	}
 }
 
 // buildSummary fills res.Summary with scan-wide statistics gathered from
