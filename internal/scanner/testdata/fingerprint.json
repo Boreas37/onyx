@@ -1,0 +1,10 @@
+{
+  "files": {
+    "wp-includes/js/wp-emoji-release.min.js": {
+      "e7aa5f688646b1a822e3026e8fc4ba92": ["6.1", "6.2"]
+    },
+    "wp-includes/js/dist/vendor/wp-polyfill.min.js": {
+      "00000000000000000000000000000000": ["6.0"]
+    }
+  }
+}

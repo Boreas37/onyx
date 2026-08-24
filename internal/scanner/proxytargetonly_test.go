@@ -46,7 +46,9 @@ func TestProxyTargetOnlySocks5(t *testing.T) {
 
 	proxyAddr, plog := fakeSocks5Proxy(t, false, "", "")
 	d, _ := db.Load(minimalFeed(t))
-	sc, err := NewScanner(d, target.URL, Options{Proxy: "socks5://" + proxyAddr, ProxyTargetOnly: true, Enumerate: "p"})
+	// The homepage redirect crosses to a second host, so the SSRF redirect
+	// guard must be opted out of for this proxy-routing test.
+	sc, err := NewScanner(d, target.URL, Options{Proxy: "socks5://" + proxyAddr, ProxyTargetOnly: true, Enumerate: "p", AllowForeignRedirect: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +105,7 @@ func TestProxyTargetOnlyHTTP(t *testing.T) {
 	defer proxy.Close()
 
 	d, _ := db.Load(minimalFeed(t))
-	sc, err := NewScanner(d, target.URL, Options{Proxy: proxy.URL, ProxyTargetOnly: true, Enumerate: "p"})
+	sc, err := NewScanner(d, target.URL, Options{Proxy: proxy.URL, ProxyTargetOnly: true, Enumerate: "p", AllowForeignRedirect: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +149,10 @@ func TestProxyTargetOnlyDirectWithoutFlag(t *testing.T) {
 
 	proxyAddr, plog := fakeSocks5Proxy(t, false, "", "")
 	d, _ := db.Load(minimalFeed(t))
-	sc, err := NewScanner(d, target.URL, Options{Proxy: "socks5://" + proxyAddr, Enumerate: "p"})
+	// The redirect guard is opted out of here too: this test proves the
+	// proxy relays the foreign redirect target, which only happens if the
+	// redirect is followed in the first place.
+	sc, err := NewScanner(d, target.URL, Options{Proxy: "socks5://" + proxyAddr, Enumerate: "p", AllowForeignRedirect: true})
 	if err != nil {
 		t.Fatal(err)
 	}

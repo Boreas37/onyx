@@ -417,3 +417,82 @@ func onOff(on bool) string {
 	}
 	return ""
 }
+
+func TestExtractVersionFromChangelog(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+		ok   bool
+	}{
+		{
+			name: "classic heading",
+			body: "=== My Plugin ===\nStable tag: 2.0\n\n== Changelog ==\n\n= 3.1.4 =\n* Fixed things\n",
+			want: "3.1.4", ok: true,
+		},
+		{
+			name: "markdown heading",
+			body: "## Changelog\n\n### 4.2.0\n\n* release notes\n",
+			want: "4.2.0", ok: true,
+		},
+		{
+			name: "bare version dash first line",
+			body: "== Changelog ==\n\n1.2.3 - Initial release\n\n* notes\n",
+			want: "1.2.3", ok: true,
+		},
+		{
+			name: "first heading wins",
+			body: "== Changelog ==\n= 9.9.9 =\n= 8.8.8 =\n",
+			want: "9.9.9", ok: true,
+		},
+		{
+			name: "heading before changelog ignored",
+			body: "= 0.0.1 =\n\n== Changelog ==\n= 3.0.0 =\n",
+			want: "3.0.0", ok: true,
+		},
+		{
+			name: "no changelog section",
+			body: "=== My Plugin ===\nStable tag: 1.0\n",
+			want: "", ok: false,
+		},
+		{
+			name: "changelog with no version heading",
+			body: "== Changelog ==\n\n* Just notes, no version headings.\n",
+			want: "", ok: false,
+		},
+		{
+			name: "empty body",
+			body: "",
+			want: "", ok: false,
+		},
+		{
+			name: "v prefix tolerated",
+			body: "== Changelog ==\n= v1.4.0 =\n",
+			want: "v1.4.0", ok: true,
+		},
+		{
+			name: "non-heading version mention not matched",
+			body: "== Changelog ==\n\nSome notes mention 1.5.0 inside a sentence.\n",
+			want: "", ok: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := ExtractVersionFromChangelog(c.body)
+			if ok != c.ok || got != c.want {
+				t.Errorf("ExtractVersionFromChangelog = (%q, %v), want (%q, %v)", got, ok, c.want, c.ok)
+			}
+		})
+	}
+}
+
+// TestExtractVersionFromChangelogHostileVersionRejected verifies a hostile
+// changelog heading whose version overflows the numeric parse (a segment
+// longer than 18 digits) is REJECTED outright — fail-closed, never
+// truncated into a plausible-looking version string.
+func TestExtractVersionFromChangelogHostileVersionRejected(t *testing.T) {
+	body := "== Changelog ==\n= 1." + strings.Repeat("9", 10000) + " =\n"
+	if v, ok := ExtractVersionFromChangelog(body); ok {
+		t.Fatalf("hostile overflowing version must be rejected, got %q", v)
+	}
+}

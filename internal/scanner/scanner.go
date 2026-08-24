@@ -40,6 +40,11 @@ var ErrOutOfScope = errors.New("target out of scope")
 // --exclude-content-based (WAF or error page).
 var ErrBlocked = errors.New("blocked by WAF or error page")
 
+// ErrRedirectBlocked is wrapped by the redirect guard when a Location would
+// cross the scanned target's host:port authority or exceed the hop limit.
+// It is not a transport failure, so it is never retried by sendRequest.
+var ErrRedirectBlocked = errors.New("redirect blocked")
+
 // maxBodySize caps response bodies (readme.txt / style.css are small).
 const maxBodySize = 1 << 20
 
@@ -98,6 +103,27 @@ type Options struct {
 	WPAuth        string // --wp-auth USER:PASS: Basic auth for the REST inventory
 	NoBrute       bool   // --no-brute: disable credential brute force (login + XML-RPC)
 	NoSummary     bool   // --no-summary: skip gathering scan summary statistics
+
+	// FingerprintDB is an optional path to a JSON core-fingerprint table
+	// ("{"files": {path: {md5hex: [versions]}}}") used as a final core
+	// version fallback when meta/RSS/OPML sources all fail. A missing or
+	// unparseable table is silently skipped. Disabled when empty.
+	FingerprintDB string
+	// PopularSlugs appends the static popular plugin/theme slug seed lists
+	// (popular.go) to aggressive enumeration after the DB top-slug list.
+	// The CLI flag defaults it to true; building Options directly leaves
+	// the zero value (false), which keeps the seed lists off.
+	PopularSlugs bool
+	// AllowForeignRedirect allows following HTTP redirects whose target
+	// host:port differs from the scanned target's authority. The default
+	// (false) blocks foreign redirects as SSRF hardening, surfacing them as
+	// fetch errors.
+	AllowForeignRedirect bool
+	// MaxRetries is how many times a transient transport error (a non-HTTP
+	// failure from the transport layer) is retried with exponential backoff
+	// plus jitter before giving up. The CLI flag defaults it to 2; 0
+	// disables retries entirely.
+	MaxRetries int
 }
 
 // Scanner drives one scan against a single target.
@@ -158,6 +184,10 @@ type Scanner struct {
 	loginBrute      bool         // wp-login brute force requested
 	xmlrpcBrute     bool         // XML-RPC multicall attack requested
 	requests        atomic.Int64 // total HTTP requests issued through fetch()
+
+	fingerprintOnce sync.Once
+	fingerprintTab  *fingerprintTable
+	fingerprintErr  error
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -543,6 +573,25 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		Timeout:   opts.RequestTimeout,
 		Transport: tr,
 	}
+	// Cross-host redirect restriction (SSRF hardening): allow a redirect
+	// only when it stays on the scanned target's host:port authority (or
+	// --allow-foreign-redirect opts in), and never more than 9 hops.
+	// Rejected redirects surface as errors from fetch-like helpers instead
+	// of silently following an attacker-chosen Location. fetchNoRedirect
+	// copies the client and swaps this hook for ErrUseLastResponse, so the
+	// author-enumeration redirect chain is unaffected.
+	targetAuth := targetAuthority(u)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("%w: stopped after 10 redirects", ErrRedirectBlocked)
+		}
+		if !opts.AllowForeignRedirect &&
+			!sameAuthority(normalizeAuthority(req.URL.Host, req.URL.Scheme), targetAuth) {
+			return fmt.Errorf("%w: redirect to %q (scanned authority %s; use --allow-foreign-redirect to follow)",
+				ErrRedirectBlocked, req.URL.Host, targetAuth)
+		}
+		return nil
+	}
 	if opts.UserAgent != "" || opts.RandomUA {
 		client.Transport = &uaTransport{
 			base:      client.Transport,
@@ -689,26 +738,114 @@ func (s *Scanner) enumerateUsers() bool { return strings.Contains(s.enum, "u") }
 // enumerateMedia reports whether media upload presence should be checked.
 func (s *Scanner) enumerateMedia() bool { return strings.Contains(s.enum, "m") }
 
+// Confidence scores attached to Detected/CoreEvidence entries, mapping each
+// detection source onto a rough reliability estimate (100 = highest). These
+// are assigned at the call sites that consume the extraction helpers, never
+// inside the extractors themselves (which stay pure).
+const (
+	confReadmeStableTag = 95 // plugin readme.txt "Stable tag:" line
+	confReadmeChangelog = 70 // plugin readme.txt Changelog heading
+	confStyleCSS        = 90 // theme style.css "Version:" header
+	confComposer        = 75 // plugin composer.json "version" field
+	confMetaGenerator   = 90 // core generator meta tag
+	confRSSGenerator    = 85 // core RSS feed generator element
+	confOPMLGenerator   = 80 // core wp-links-opml.php generator attribute
+	confPassiveVer      = 60 // passive asset ?ver= query string
+	confREST            = 100
+	confAuthREST        = 100
+	confFingerprint     = 85 // core asset md5 fingerprint table
+)
+
+// sourceConfidence maps a Detected/CoreEvidence source onto its canonical
+// confidence score. Unknown sources default to 0.
+func sourceConfidence(source string) int {
+	switch source {
+	case "readme":
+		return confReadmeStableTag
+	case "readme-changelog":
+		return confReadmeChangelog
+	case "style.css":
+		return confStyleCSS
+	case "composer":
+		return confComposer
+	case "meta":
+		return confMetaGenerator
+	case "rss":
+		return confRSSGenerator
+	case "opml":
+		return confOPMLGenerator
+	case "passive-ver":
+		return confPassiveVer
+	case "rest":
+		return confREST
+	case "auth-rest":
+		return confAuthREST
+	case "fingerprint":
+		return confFingerprint
+	}
+	return 0
+}
+
+// sourcePriority ranks Detected sources for dedup tie-breaking when two
+// entries for the same slug carry the same confidence: the unauthenticated
+// REST listing outranks the authenticated inventory, everything else is
+// equal.
+func sourcePriority(source string) int {
+	switch source {
+	case "rest":
+		return 0
+	case "auth-rest":
+		return 1
+	}
+	return 2
+}
+
+// preferDetected reports whether a should replace b in a per-slug dedup
+// when both entries carry the same slug. A version-known entry beats an
+// unknown one; among version-known entries the higher confidence wins
+// (so a passive ?ver= hint, confidence 60, never overrides a readme,
+// confidence 95, and an unauthenticated REST listing, 100, wins a tie
+// against the equally-scored auth-rest listing).
+func preferDetected(a, b Detected) bool {
+	aKnown := a.Version != "unknown" && a.Version != ""
+	bKnown := b.Version != "unknown" && b.Version != ""
+	if aKnown != bKnown {
+		return aKnown
+	}
+	if a.Confidence != b.Confidence {
+		return a.Confidence > b.Confidence
+	}
+	return sourcePriority(a.Source) < sourcePriority(b.Source)
+}
+
 // Detected is a plugin/theme/core component whose presence and version were
 // identified on the target. Source records how it was found: "passive"
 // (slug referenced in page HTML), "passive-ver" (asset ?ver= query string),
-// "readme" (plugin readme.txt probe), "style.css" (theme stylesheet probe),
-// "rest" (unauthenticated wp-json listing) or "auth-rest" (authenticated
-// wp-json inventory).
+// "readme" (plugin readme.txt "Stable tag:" probe), "readme-changelog"
+// (plugin readme.txt Changelog section heading), "composer" (plugin
+// composer.json "version" field), "style.css" (theme stylesheet probe),
+// "rest" (unauthenticated wp-json listing), "auth-rest" (authenticated
+// wp-json inventory) or "fingerprint" (core asset md5 table). Confidence is
+// the 0..100 reliability estimate assigned to the detection source (see
+// sourceConfidence); it is omitted from JSON output when zero.
 type Detected struct {
-	Slug    string `json:"slug"`
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Version string `json:"installed_version"`
-	Source  string `json:"source,omitempty"`
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Version    string `json:"installed_version"`
+	Source     string `json:"source,omitempty"`
+	Confidence int    `json:"confidence,omitempty"`
 }
 
 // CoreEvidence records one WordPress core version observation together with
 // the source that produced it: "meta" (generator meta tag), "rss" (feed
-// generator element) or "opml" (wp-links-opml.php generator attribute).
+// generator element), "opml" (wp-links-opml.php generator attribute) or
+// "fingerprint" (core asset md5 table). Confidence carries the same 0..100
+// reliability score used by Detected.
 type CoreEvidence struct {
-	Source  string `json:"source"`
-	Version string `json:"version"`
+	Source     string `json:"source"`
+	Version    string `json:"version"`
+	Confidence int    `json:"confidence,omitempty"`
 }
 
 // Vulnerability is one matched database record.
@@ -795,6 +932,53 @@ type Result struct {
 	Summary          *Summary              `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
 }
 
+// sendRequest issues one HTTP request through client, re-running the full
+// pacing sequence (429 gate, send-slot claim, request build, Do) on each
+// retry. Transient transport errors (a non-nil error from Do that is not a
+// context cancellation, a deadline expiry or a redirect rejection) are
+// retried up to s.opts.MaxRetries times with exponential backoff
+// (200ms*2^attempt) plus uniform 0..150ms jitter. HTTP status responses are
+// never retried here — a 4xx/5xx is a valid answer, not an error. The
+// request counter is bumped once per actual attempt.
+func (s *Scanner) sendRequest(client *http.Client, makeReq func() (*http.Request, error)) (*http.Response, error) {
+	maxRetries := s.opts.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+	for attempt := 0; ; attempt++ {
+		s.rateLimitGate()
+		s.claimSendSlot()
+		req, err := makeReq()
+		if err != nil {
+			return nil, err // request-build/parse failure: not retryable
+		}
+		s.requests.Add(1)
+		resp, err := client.Do(req)
+		if err == nil || attempt >= maxRetries || !retryableNetworkError(err) {
+			return resp, err
+		}
+		backoff := time.Duration(200*(1<<uint(attempt))) * time.Millisecond
+		jitter := time.Duration(rand.IntN(151)) * time.Millisecond
+		time.Sleep(backoff + jitter)
+	}
+}
+
+// retryableNetworkError reports whether err is a transient transport error
+// worth retrying: a real network failure rather than a context cancellation
+// or deadline expiry, and not a redirect rejection from the SSRF guard.
+func retryableNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRedirectBlocked) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
+}
+
 func (s *Scanner) fetch(path string) (int, []byte, error) {
 	s.lim.wait()
 	u := s.base + path
@@ -807,14 +991,9 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 	// A 429 no longer gives up immediately: the request is retried after
 	// the global cooldown so rate-limited scans stay complete.
 	for attempt := 0; attempt <= fetchRetriesOn429; attempt++ {
-		s.rateLimitGate()
-		s.claimSendSlot()
-		req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
-		if err != nil {
-			return 0, nil, err
-		}
-		s.requests.Add(1)
-		resp, err := s.client.Do(req)
+		resp, err := s.sendRequest(s.client, func() (*http.Request, error) {
+			return http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+		})
 		if err != nil {
 			return 0, nil, err
 		}
@@ -1021,14 +1200,9 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	// Same 429 discipline as fetch: gate the whole pool and retry once so
 	// author-enumeration redirects are not silently lost behind a WAF.
 	for attempt := 0; attempt <= 1; attempt++ {
-		s.rateLimitGate()
-		s.claimSendSlot()
-		req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
-		if err != nil {
-			return 0, nil, nil, err
-		}
-		s.requests.Add(1)
-		resp, err := client.Do(req)
+		resp, err := s.sendRequest(&client, func() (*http.Request, error) {
+			return http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+		})
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -1503,7 +1677,7 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 		if v, ok := ExtractWordPressVersion(html); ok {
 			coreVersion = v
 			evidence = append(evidence, "generator meta tag (WordPress "+v+")")
-			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "meta", Version: v})
+			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "meta", Version: v, Confidence: confMetaGenerator})
 		}
 		if strings.Contains(html, "wp-content") {
 			evidence = append(evidence, "wp-content path present in homepage")
@@ -1524,7 +1698,7 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 			if v, ok := ExtractRSSVersion(string(body)); ok {
 				coreVersion = v
 				evidence = append(evidence, "RSS feed generator tag (WordPress "+v+")")
-				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "rss", Version: v})
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "rss", Version: v, Confidence: confRSSGenerator})
 				break
 			}
 		}
@@ -1534,8 +1708,19 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 			if v, ok := ExtractOPMLVersion(string(body)); ok {
 				coreVersion = v
 				evidence = append(evidence, "wp-links-opml.php generator (WordPress "+v+")")
-				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "opml", Version: v})
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "opml", Version: v, Confidence: confOPMLGenerator})
 			}
+		}
+	}
+
+	// Final core-version fallback: the optional --fingerprint-db md5 table.
+	// Only consulted when every cheaper source came up empty and a table was
+	// configured; it adds up to maxFingerprintProbes requests.
+	if coreVersion == "" && s.opts.FingerprintDB != "" {
+		if v, ok := s.fingerprintCore(); ok {
+			coreVersion = v
+			evidence = append(evidence, "core asset md5 fingerprint (WordPress "+v+")")
+			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "fingerprint", Version: v, Confidence: confFingerprint})
 		}
 	}
 
@@ -1712,6 +1897,35 @@ func (s *Scanner) buildJobs() []job {
 						path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
 				}
 			}
+			// Popular slug seeds (--popular, default true): after the DB
+			// top list, append well-known slugs not already queued so
+			// popular-but-not-vulnerable components still get probed.
+			// Ordering is the deterministic popular.go list order; the loop
+			// stops as soon as the aggressive budget is exhausted.
+			if s.opts.PopularSlugs {
+				for _, slug := range popularPlugins {
+					if len(jobs) >= budget {
+						break
+					}
+					if !s.enumeratePlugins() || seen["p:"+slug] {
+						continue
+					}
+					seen["p:"+slug] = true
+					jobs = append(jobs, job{kind: "plugin", slug: slug,
+						path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
+				}
+				for _, slug := range popularThemes {
+					if len(jobs) >= budget {
+						break
+					}
+					if !s.enumerateThemes() || seen["t:"+slug] {
+						continue
+					}
+					seen["t:"+slug] = true
+					jobs = append(jobs, job{kind: "theme", slug: slug,
+						path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
+				}
+			}
 		}
 	}
 	return jobs
@@ -1777,35 +1991,74 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 // homepages. A non-200 answer keeps its historical behaviour of returning
 // nothing as well.
 func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
-	code, body, err := s.fetch(j.path)
-	if err != nil {
-		return nil, nil
-	}
-	if code != http.StatusOK {
-		return nil, nil
-	}
-
 	var ver string
 	var found bool
 	source := "readme"
 	switch j.kind {
 	case "plugin":
-		ver, found = ExtractVersionFromReadme(string(body))
-		found = found && looksLikeReadme(body)
+		code, body, err := s.fetch(j.path)
+		if err == nil && code == http.StatusOK {
+			ver, found = ExtractVersionFromReadme(string(body))
+			if !found {
+				// Readme with no "Stable tag:" line: fall back to the first
+				// version heading in its Changelog section.
+				if clVer, ok := ExtractVersionFromChangelog(string(body)); ok {
+					ver, found = clVer, true
+					source = "readme-changelog"
+				}
+			}
+			found = found && looksLikeReadme(body)
+		}
+		if !found {
+			// Readme missing or versionless: the plugin's composer.json
+			// carries the version too. This costs one extra request per
+			// readme-less plugin (counted through s.fetch).
+			if v, ok := s.composerVersion(j.slug); ok {
+				ver, found = v, true
+				source = "composer"
+			}
+		}
 	case "theme":
-		ver, found = ExtractVersionFromStyleCSS(string(body))
-		source = "style.css"
-		found = found && looksLikeThemeCSS(body)
+		code, body, err := s.fetch(j.path)
+		if err == nil && code == http.StatusOK {
+			ver, found = ExtractVersionFromStyleCSS(string(body))
+			source = "style.css"
+			found = found && looksLikeThemeCSS(body)
+		}
 	}
 	if !found {
 		return nil, nil
 	}
-	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: ver, Source: source}}
+	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: ver, Source: source, Confidence: sourceConfidence(source)}}
 	f := s.matchDatabase(j.slug, j.kind, ver)
 	if len(f.Vulnerabilities) > 0 {
 		return detected, []Finding{f}
 	}
 	return detected, nil
+}
+
+// composerVersion fetches <pluginsDir>/<slug>/composer.json and returns its
+// "version" field when present. A non-200 response, an unparseable body
+// (which also rejects front-controller rewrites landing on homepage HTML)
+// or a missing version yields found=false. Themes are not probed: their
+// version lives in style.css.
+func (s *Scanner) composerVersion(slug string) (string, bool) {
+	path := "/" + s.pluginsDir + "/" + slug + "/composer.json"
+	code, body, err := s.fetch(path)
+	if err != nil || code != http.StatusOK {
+		return "", false
+	}
+	var doc struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return "", false
+	}
+	v := sanitizeVersion(doc.Version)
+	if v == "" {
+		return "", false
+	}
+	return v, true
 }
 
 // fetchHeaders GETs path like fetch() but also returns the response
@@ -1817,12 +2070,9 @@ func (s *Scanner) fetchHeaders(path string) (int, http.Header, []byte, error) {
 	s.lim.wait()
 	u := s.base + path
 	s.perHostWait(u)
-	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	s.requests.Add(1)
-	resp, err := s.client.Do(req)
+	resp, err := s.sendRequest(s.client, func() (*http.Request, error) {
+		return http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
+	})
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -1886,15 +2136,15 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 		}
 		ver := versions[slug]
 		if i, ok := index[slug]; ok {
-			if res.Detected[i].Version != "unknown" {
-				continue // probed version wins
+			passive := Detected{Slug: slug, Name: slug, Type: t, Version: ver, Source: "passive-ver", Confidence: confPassiveVer}
+			if !preferDetected(passive, res.Detected[i]) {
+				continue // a probed/known version wins over the passive hint
 			}
-			res.Detected[i].Version = ver
-			res.Detected[i].Source = "passive-ver"
+			res.Detected[i] = passive
 		} else {
 			index[slug] = len(res.Detected)
 			res.Detected = append(res.Detected, Detected{
-				Slug: slug, Name: slug, Type: t, Version: ver, Source: "passive-ver",
+				Slug: slug, Name: slug, Type: t, Version: ver, Source: "passive-ver", Confidence: confPassiveVer,
 			})
 		}
 		if f := s.matchDatabase(slug, t, ver); len(f.Vulnerabilities) > 0 {
@@ -2172,6 +2422,31 @@ func (s *Scanner) Scan() (*Result, error) {
 			}
 		}
 		res.Users = normalizeUsers(apiUsers, authorUsers)
+		// Login-error username oracle: when REST and author enumeration came
+		// up empty, wp-login.php's #login_error message can still confirm
+		// accounts. Candidates come from the --usernames wordlist when
+		// provided, otherwise the common default set. Skipped with
+		// --no-brute, capped at maxAuthorChecks probes.
+		if len(res.Users) == 0 && !s.opts.NoBrute {
+			candidates := s.usernames
+			if len(candidates) == 0 {
+				candidates = []string{"admin", "administrator"}
+			}
+			if len(candidates) > maxAuthorChecks {
+				candidates = candidates[:maxAuthorChecks]
+			}
+			if pr != nil {
+				pr.SetCurrent("user:wp-login oracle")
+			}
+			found := s.loginOracleUsernames(candidates)
+			res.Users = normalizeUsers(res.Users, usersFromNames(found))
+			if pr != nil {
+				pr.AddDone(int64(len(candidates)))
+			}
+			if pr != nil && len(res.Users) > 0 {
+				pr.LogInf("login oracle confirmed %d user(s)", len(res.Users))
+			}
+		}
 		if pr != nil && len(res.Users) > 0 {
 			pr.LogInf("found %d user(s)", len(res.Users))
 		}
@@ -2211,11 +2486,14 @@ func (s *Scanner) Scan() (*Result, error) {
 		}
 	}
 
-	// Deduplicate detected components, keeping the first (version-known) entry.
+	// Deduplicate detected components, keeping the highest-confidence
+	// version-known entry per slug: a passive ?ver= hint (confidence 60)
+	// never overrides a readme (95), and an unauthenticated REST listing
+	// (100) wins ties against the equally-scored auth-rest inventory.
 	bySlug := make(map[string]Detected, len(res.Detected))
 	for _, d := range res.Detected {
 		if prev, ok := bySlug[d.Slug]; ok {
-			if prev.Version != "unknown" || d.Version == "unknown" {
+			if !preferDetected(d, prev) {
 				continue
 			}
 		}
@@ -2306,6 +2584,16 @@ func userSlugs(users []User) []string {
 	out := make([]string, 0, len(users))
 	for _, u := range users {
 		out = append(out, u.Slug)
+	}
+	return out
+}
+
+// usersFromNames maps confirmed usernames (e.g. from the login-error
+// oracle) onto User entries carrying the slug only.
+func usersFromNames(names []string) []User {
+	out := make([]User, 0, len(names))
+	for _, n := range names {
+		out = append(out, User{Slug: n})
 	}
 	return out
 }

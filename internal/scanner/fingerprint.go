@@ -4,10 +4,17 @@
 package scanner
 
 import (
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"os"
 	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/Boreas37/onyx/internal/sanitize"
+	"github.com/Boreas37/onyx/internal/version"
 )
 
 const (
@@ -24,6 +31,18 @@ const (
 	// balloon the result map.
 	maxPassiveVersions = 200
 )
+
+// changelogSectionRe matches the line that opens a readme.txt Changelog
+// section in either the classic "== Changelog ==" or markdown
+// "## Changelog" spelling.
+var changelogSectionRe = regexp.MustCompile(`(?im)^\s*(?:={2,}|#{2,})\s*changelog\s*(?:={2,}|#{2,})?\s*$`)
+
+// changelogHeadingRe matches one changelog entry heading and captures the
+// version token at its head. The accepted spellings are the classic
+// "= 3.24.0 =" form, the markdown "### 3.24.0" form and the bare
+// "3.24.0 - ..." first line. The heading must start on its own line; an
+// optional "v" prefix is tolerated like every other version extractor.
+var changelogHeadingRe = regexp.MustCompile(`(?im)^\s*(?:={1,3}|#{1,3})?\s*((?:v|V)?\d[0-9a-zA-Z.+-]*)\s*(?:={1,3})?(?:\s*$|\s+-\s+[^\r\n]*$)`)
 
 var (
 	stableTagRe = regexp.MustCompile(`(?im)^\s*stable\s*tag\s*[:=]\s*((?:v|V)?\d[0-9a-zA-Z.+-]*)`)
@@ -58,6 +77,104 @@ func ExtractVersionFromReadme(body string) (version string, found bool) {
 		return "", false
 	}
 	return sanitizeVersion(m[1]), true
+}
+
+// ExtractVersionFromChangelog parses the first version heading inside a
+// readme.txt Changelog section ("== Changelog ==" or "## Changelog"): the
+// classic "= X.Y.Z =" heading, the markdown "### X.Y.Z" heading, or a
+// "X.Y.Z - ..." first line. The candidate is sanitized and must parse as a
+// numeric version (internal/version.Parse). found is false when there is no
+// Changelog section or no parseable heading — readmes whose only version is
+// buried in the changelog (no "Stable tag:" line) still get detected.
+func ExtractVersionFromChangelog(body string) (string, bool) {
+	sec := changelogSectionRe.FindStringIndex(body)
+	if sec == nil {
+		return "", false
+	}
+	m := changelogHeadingRe.FindStringSubmatch(body[sec[1]:])
+	if m == nil {
+		return "", false
+	}
+	v := sanitizeVersion(m[1])
+	if v == "" {
+		return "", false
+	}
+	if _, ok := version.Parse(v); !ok {
+		return "", false
+	}
+	return v, true
+}
+
+// maxFingerprintProbes caps how many asset files fingerprintCore fetches
+// from the optional --fingerprint-db table, bounding the extra request cost.
+const maxFingerprintProbes = 5
+
+// fingerprintTable is the decoded shape of the --fingerprint-db JSON file:
+//
+//	{"files": {"wp-includes/js/wp-emoji-release.min.js": {"<md5hex>": ["6.1","6.2"]}}}
+//
+// Each file path maps an md5 hex digest of its release content onto the
+// core versions known to carry it.
+type fingerprintTable struct {
+	Files map[string]map[string][]string `json:"files"`
+}
+
+// fingerprintCore probes well-known core asset files from the optional
+// --fingerprint-db table and returns the first version whose md5 digest
+// matches a served file. Paths are probed in sorted order, capped at
+// maxFingerprintProbes requests. A missing, unparseable or empty table is a
+// soft skip (returns found=false, never an error) so a broken DB file never
+// aborts a scan.
+func (s *Scanner) fingerprintCore() (string, bool) {
+	table, err := s.fingerprintTable()
+	if err != nil || table == nil || len(table.Files) == 0 {
+		return "", false
+	}
+	paths := make([]string, 0, len(table.Files))
+	for p := range table.Files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for i, p := range paths {
+		if i >= maxFingerprintProbes {
+			break
+		}
+		code, body, err := s.fetch("/" + strings.TrimLeft(p, "/"))
+		if err != nil || code != http.StatusOK {
+			continue
+		}
+		sum := md5.Sum(body)
+		if vers, ok := table.Files[p][hex.EncodeToString(sum[:])]; ok && len(vers) > 0 {
+			if v := sanitizeVersion(vers[0]); v != "" {
+				return v, true
+			}
+		}
+	}
+	return "", false
+}
+
+// fingerprintTable loads (once, cached) and decodes the --fingerprint-db
+// JSON table. Any read or parse failure is returned as an error so callers
+// can treat a broken table as a soft skip; the first failure is remembered
+// so a malformed file is not re-read on every probe.
+func (s *Scanner) fingerprintTable() (*fingerprintTable, error) {
+	s.fingerprintOnce.Do(func() {
+		if s.opts.FingerprintDB == "" {
+			return
+		}
+		data, err := os.ReadFile(s.opts.FingerprintDB)
+		if err != nil {
+			s.fingerprintErr = err
+			return
+		}
+		var t fingerprintTable
+		if err := json.Unmarshal(data, &t); err != nil {
+			s.fingerprintErr = err
+			return
+		}
+		s.fingerprintTab = &t
+	})
+	return s.fingerprintTab, s.fingerprintErr
 }
 
 // ExtractVersionFromStyleCSS parses the "Version:" header of a WordPress
