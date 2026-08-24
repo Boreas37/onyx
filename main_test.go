@@ -391,7 +391,7 @@ func TestScanExitCodes(t *testing.T) {
 		},
 	}}}
 	high := &scanner.Result{Findings: []scanner.Finding{{
-		Slug: "y",
+		Slug:            "y",
 		Vulnerabilities: []scanner.Vulnerability{{CVE: "CVE-2026-0003", Rating: "High"}},
 	}}}
 	notWP := &scanner.Result{IsWordPress: false}
@@ -415,7 +415,7 @@ func TestScanExitCodes(t *testing.T) {
 		{"network failure", nil, scanner.ErrNotWordPress, true, "", 2},
 	}
 	for _, c := range cases {
-		if got := scanExitCode(c.res, c.err, c.strictWP, c.failOn); got != c.want {
+		if got := scanExitCode(c.res, c.err, c.strictWP, c.failOn, false); got != c.want {
 			t.Errorf("%s: scanExitCode = %d, want %d", c.name, got, c.want)
 		}
 	}

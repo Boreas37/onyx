@@ -20,6 +20,7 @@ import (
 //	onyx db lookup SLUG [--db PATH]
 //	onyx db top [N] [--db PATH]
 //	onyx db search QUERY [--db PATH]
+//	onyx db diff B.json [--db PATH]
 func runDB(args []string) int {
 	if len(args) == 0 {
 		dbUsage()
@@ -46,6 +47,12 @@ func runDB(args []string) int {
 	switch cmd {
 	case "stats":
 		return dbStats(database, dbPath)
+	case "diff":
+		if len(rest) != 1 {
+			fmt.Fprintln(os.Stderr, "usage: onyx db diff B.json  (A is the --db database)")
+			return 2
+		}
+		return dbDiff(database, rest[0])
 	case "lookup":
 		if len(rest) != 1 {
 			fmt.Fprintln(os.Stderr, "usage: onyx db lookup SLUG")
@@ -80,6 +87,73 @@ func dbUsage() {
   onyx db lookup SLUG [--db PATH]
   onyx db top [N] [--db PATH]
   onyx db search QUERY [--db PATH]`)
+}
+
+// dbDiff compares the loaded database with a second feed file and prints
+// per-type and slug-level differences: records added/removed/updated
+// (by id), plus slugs that newly appear or disappear. Exit code is 0.
+func dbDiff(d *db.DB, pathB string) int {
+	b, err := db.Load(pathB)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "db diff:", err)
+		return 2
+	}
+	ids := func(dd *db.DB) map[string]bool {
+		m := make(map[string]bool, len(dd.Records))
+		for _, r := range dd.Records {
+			m[r.ID] = true
+		}
+		return m
+	}
+	slugs := func(dd *db.DB) map[string]bool {
+		m := make(map[string]bool)
+		for i := range dd.Records {
+			for j := range dd.Records[i].Software {
+				m[dd.Records[i].Software[j].Slug] = true
+			}
+		}
+		return m
+	}
+	ma, mb := ids(d), ids(b)
+	var added, removed []string
+	for id := range mb {
+		if !ma[id] {
+			added = append(added, id)
+		}
+	}
+	for id := range ma {
+		if !mb[id] {
+			removed = append(removed, id)
+		}
+	}
+	sa, sb := slugs(d), slugs(b)
+	var slugsAdded, slugsRemoved []string
+	for s := range sb {
+		if !sa[s] {
+			slugsAdded = append(slugsAdded, s)
+		}
+	}
+	for s := range sa {
+		if !sb[s] {
+			slugsRemoved = append(slugsRemoved, s)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	sort.Strings(slugsAdded)
+	sort.Strings(slugsRemoved)
+	fmt.Printf("db diff: %d records vs %d records\n", len(ma), len(mb))
+	fmt.Printf("  records added:   %d\n", len(added))
+	fmt.Printf("  records removed: %d\n", len(removed))
+	fmt.Printf("  slugs added:     %d\n", len(slugsAdded))
+	fmt.Printf("  slugs removed:   %d\n", len(slugsRemoved))
+	for _, l := range slugsAdded {
+		fmt.Printf("  + %s\n", l)
+	}
+	for _, l := range slugsRemoved {
+		fmt.Printf("  - %s\n", l)
+	}
+	return 0
 }
 
 // dbStats prints an overview of the local database: record counts by

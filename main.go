@@ -99,6 +99,10 @@ func main() {
 		os.Exit(runDB(os.Args[2:]))
 	case "doctor":
 		os.Exit(runDoctor(os.Args[2:]))
+	case "diff":
+		os.Exit(runDiff(os.Args[2:]))
+	case "example-config":
+		os.Exit(runExampleConfig(os.Args[2:]))
 	case "completion":
 		os.Exit(runCompletion(os.Args[2:]))
 	default:
@@ -145,70 +149,75 @@ func versionJSON() string {
 
 // scanOptions holds the parsed scan flags.
 type scanOptions struct {
-	dbPath              string
-	threads             int
-	timeout             int
-	format              string
-	apiOnly             bool
-	stealth             bool
-	rateLimit           float64
-	verbose             bool
-	minSeverity         string
-	enumerate           string
-	maxReq              int
-	output              string
-	silent              bool
-	progress            bool
-	userAgent           string
-	randomUA            bool
-	detectionMode       string
-	proxy               string
-	proxyAuth           string
-	proxyTargetOnly     bool
-	tlsFingerprint      string
-	perHostRateLimit    float64
-	noXMLRPC            bool
-	checks              string
-	connectTimeout      int
-	requestTimeout      int
-	contentDir          string
-	pluginsDir          string
-	excludeContentBased string
-	scope               string
-	noUpdateCheck       bool
-	noUpdate            bool
-	pluginsList         string
-	themesList          string
-	maxScanDuration     time.Duration
-	maxScanDurationSpec string
-	cacheTTL            time.Duration
-	stream              bool
-	configPath          string
-	nuclei              bool
-	nucleiTemplateDir   string
-	nucleiArgs          string
-	pocTrackerDir       string
-	noPocs              bool
-	passwordsFile       string
-	usernamesFile       string
-	user                string
-	xmlrpcBrute         string
-	mcMaxPasswords      int
-	wpAuth              string
-	noBrute             bool
-	noSummary           bool
-	strictWP            bool
-	targets             []string
-	targetsFile         string
-	profile             string
-	crawlPages          int
-	failOn              string
-	noIntel             bool
-	fingerprintDB       string
-	popularSlugs        bool
+	dbPath               string
+	threads              int
+	timeout              int
+	format               string
+	apiOnly              bool
+	stealth              bool
+	rateLimit            float64
+	verbose              bool
+	minSeverity          string
+	enumerate            string
+	maxReq               int
+	output               string
+	silent               bool
+	progress             bool
+	userAgent            string
+	randomUA             bool
+	detectionMode        string
+	proxy                string
+	proxyAuth            string
+	proxyTargetOnly      bool
+	tlsFingerprint       string
+	perHostRateLimit     float64
+	noXMLRPC             bool
+	checks               string
+	connectTimeout       int
+	requestTimeout       int
+	contentDir           string
+	pluginsDir           string
+	excludeContentBased  string
+	scope                string
+	noUpdateCheck        bool
+	noUpdate             bool
+	pluginsList          string
+	themesList           string
+	maxScanDuration      time.Duration
+	maxScanDurationSpec  string
+	cacheTTL             time.Duration
+	stream               bool
+	configPath           string
+	nuclei               bool
+	nucleiTemplateDir    string
+	nucleiArgs           string
+	pocTrackerDir        string
+	noPocs               bool
+	passwordsFile        string
+	usernamesFile        string
+	user                 string
+	xmlrpcBrute          string
+	mcMaxPasswords       int
+	wpAuth               string
+	noBrute              bool
+	noSummary            bool
+	strictWP             bool
+	targets              []string
+	targetsFile          string
+	profile              string
+	crawlPages           int
+	failOn               string
+	noIntel              bool
+	fingerprintDB        string
+	popularSlugs         bool
 	allowForeignRedirect bool
-	retries             int
-	jobs                int
+	retries              int
+	jobs                 int
+	discover404          bool
+	popularFile          string
+	failOnRateLimited    bool
+	nucleiMinSeverity    string
+	outputs              []string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -226,6 +235,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.popularSlugs = true
 	o.retries = 2
 	o.jobs = 1
+	o.discover404 = true
 	setFlags := make(map[string]bool)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -417,6 +427,36 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			if o.jobs < 1 {
 				fmt.Fprintln(os.Stderr, "error: --jobs must be >= 1")
 				os.Exit(2)
+			}
+		case a == "--no-discover-404":
+			o.discover404 = false
+		case a == "--fail-on-rate-limited":
+			o.failOnRateLimited = true
+		case a == "--nuclei-min-severity" && i+1 < len(args):
+			i++
+			sev := strings.ToLower(args[i])
+			switch sev {
+			case "critical", "high", "medium", "low", "info":
+			default:
+				fmt.Fprintf(os.Stderr, "error: invalid --nuclei-min-severity %q (use critical, high, medium, low or info)\n", args[i])
+				os.Exit(2)
+			}
+			o.nucleiMinSeverity = sev
+		case a == "--outputs" && i+1 < len(args):
+			i++
+			for _, f := range strings.Split(args[i], ",") {
+				f = strings.ToLower(strings.TrimSpace(f))
+				if f == "" {
+					continue
+				}
+				switch f {
+				case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx",
+					"markdown", "md", "html", "junit":
+				default:
+					fmt.Fprintf(os.Stderr, "error: invalid --outputs format %q\n", f)
+					os.Exit(2)
+				}
+				o.outputs = append(o.outputs, f)
 			}
 		case a == "--profile" && i+1 < len(args):
 			i++
@@ -753,6 +793,10 @@ Scan flags:
   --allow-foreign-redirect  follow redirects to hosts other than the target
   --retries N        retry transient network errors N times (default: 2, 0 = off)
   --jobs N           scan -T/extra targets with up to N concurrent scans (default: 1)
+  --no-discover-404  do not probe a nonexistent path for plugin/theme references
+  --fail-on-rate-limited  exit 4 when the target's 429 throttling cut the scan short
+  --nuclei-min-severity S  only run nuclei templates of S or worse (critical|high|medium|low|info)
+  --outputs LIST     write extra copies of the report (comma list of formats)
   --config FILE      JSON config file; explicit CLI flags win over config values
 
 Watch mode:
@@ -760,13 +804,16 @@ Watch mode:
   --interval D       re-scan every duration (30m, 1h); default: single compare-and-exit pass
   --webhook URL      POST a JSON change report when new/resolved vulnerabilities appear
   --webhook-format F payload shape: generic (default) or slack
+  --jsonl            emit each watch pass as one JSON line (machine-readable)
   --state-dir DIR    where baselines are stored (default: user cache dir /onyx/watch)
 
 Database inspection:
-  onyx db stats|lookup SLUG|top [N]|search QUERY [--db PATH]
+  onyx db stats|lookup SLUG|top [N]|search QUERY|diff B.json [--db PATH]
 
-Diagnostics:
+Diagnostics & helpers:
   onyx doctor [--db PATH] [--network]   local health checks (offline by default)
+  onyx diff A.json B.json               compare two saved scan results
+  onyx example-config                   print a commented JSON config template
 
 Shell completions:
   onyx completion bash|zsh|fish     (add the output to your shell config)
@@ -797,6 +844,20 @@ func runScan(target string, o scanOptions) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error loading database:", err)
 		return 2
+	}
+	// Optional data assets that `onyx update` mirrors next to the feed:
+	// a popular-list file and a core-fingerprint table. When present they
+	// become the defaults for the corresponding scan features.
+	if o.popularFile == "" {
+		if _, perr := os.Stat(filepath.Join(filepath.Dir(o.dbPath), "popular.json")); perr == nil {
+			o.popularFile = filepath.Join(filepath.Dir(o.dbPath), "popular.json")
+		}
+	}
+	if o.fingerprintDB == "" {
+		fp := filepath.Join(filepath.Dir(o.dbPath), "fingerprints.json")
+		if _, ferr := os.Stat(fp); ferr == nil {
+			o.fingerprintDB = fp
+		}
 	}
 
 	// Warn (informational only) when the local database is over 14 days
@@ -886,6 +947,25 @@ func runScan(target string, o scanOptions) int {
 			pr.LogInf("results written to %s", o.output)
 		}
 	}
+	// --outputs: render the same result into several formats at once.
+	// Each file is <output>.<format> (or onyx-report.<format> when
+	// --output is unset); stdout still carries the --format rendering.
+	for _, f := range o.outputs {
+		if f == o.format {
+			continue // already rendered above
+		}
+		if f == "table" || f == "cli-no-colour" {
+			continue // table formats go to stdout only
+		}
+		base := o.output
+		if base == "" {
+			base = "onyx-report"
+		}
+		p := base + "." + f
+		if werr := writeScanOutput(p, res, f); werr != nil {
+			fmt.Fprintf(os.Stderr, "error writing %s output: %v\n", f, werr)
+		}
+	}
 
 	switch o.format {
 	case "json":
@@ -919,7 +999,7 @@ func runScan(target string, o scanOptions) int {
 			report.PrintSummary(res)
 		}
 	}
-	return scanExitCode(res, err, o.strictWP, o.failOn)
+	return scanExitCode(res, err, o.strictWP, o.failOn, o.failOnRateLimited)
 }
 
 // runMulti scans several targets, printing a section header per target and
@@ -947,7 +1027,7 @@ func runMulti(targets []string, o scanOptions) int {
 		switch c {
 		case 2:
 			return 3
-		case 5:
+		case 4, 5:
 			return 2
 		case 3:
 			return 1
@@ -1018,12 +1098,18 @@ func severityRankOf(sev string) int {
 // to be WordPress, and 2 on outright failure. failOn raises the bar for
 // exit 5: only findings at or above that severity count ("high" is the
 // typical CI choice); an empty failOn keeps the old any-finding behavior.
-func scanExitCode(res *scanner.Result, err error, strictWP bool, failOn string) int {
+func scanExitCode(res *scanner.Result, err error, strictWP bool, failOn string, failOnRateLimited bool) int {
 	if err != nil && res == nil {
 		return 2
 	}
 	if strictWP && errors.Is(err, scanner.ErrNotWordPress) {
 		return 3
+	}
+	// A scan that the target's 429 throttling cut short is a distinct
+	// signal for CI: with --fail-on-rate-limited it exits 4 (incomplete)
+	// instead of reading as a clean pass.
+	if failOnRateLimited && res != nil && res.RateLimitedAbort {
+		return 4
 	}
 	// Nuclei-verified hits always count as failures: they are confirmed
 	// exploitations, not version-inference guesses.
@@ -1056,47 +1142,49 @@ func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Op
 		reqTimeout = o.timeout
 	}
 	return scanner.Options{
-		Threads:             o.threads,
-		Timeout:             time.Duration(o.timeout) * time.Second,
-		ConnectTimeout:      time.Duration(o.connectTimeout) * time.Second,
-		RequestTimeout:      time.Duration(reqTimeout) * time.Second,
-		APIOnly:             o.apiOnly,
-		Stealth:             o.stealth,
-		RateLimit:           o.rateLimit,
-		MaxRequests:         o.maxReq,
-		Enumerate:           o.enumerate,
-		UserAgent:           o.userAgent,
-		RandomUA:            o.randomUA,
-		DetectionMode:       o.detectionMode,
-		Proxy:               o.proxy,
-		ProxyAuth:           o.proxyAuth,
-		ProxyTargetOnly:     o.proxyTargetOnly,
-		TLSFingerprint:      o.tlsFingerprint,
-		PerHostRateLimit:    o.perHostRateLimit,
-		NoXMLRPC:            o.noXMLRPC,
-		Checks:              o.checks,
-		ContentDir:          o.contentDir,
-		PluginsDir:          o.pluginsDir,
-		ExcludeContentBased: o.excludeContentBased,
-		Scope:               o.scope,
-		PluginsList:         o.pluginsList,
-		ThemesList:          o.themesList,
-		MaxScanDuration:     o.maxScanDuration,
-		CacheTTL:            o.cacheTTL,
-		Findings:            findings,
-		PasswordsFile:       o.passwordsFile,
-		UsernamesFile:       o.usernamesFile,
-		User:                o.user,
-		XMLRPCBrute:         o.xmlrpcBrute,
-		MCPerRequest:        o.mcMaxPasswords,
-		WPAuth:              o.wpAuth,
-		NoBrute:             o.noBrute,
-		NoSummary:           o.noSummary,
-		CrawlPages:          o.crawlPages,
-		FingerprintDB:       o.fingerprintDB,
-		PopularSlugs:        o.popularSlugs,
+		Threads:              o.threads,
+		Timeout:              time.Duration(o.timeout) * time.Second,
+		ConnectTimeout:       time.Duration(o.connectTimeout) * time.Second,
+		RequestTimeout:       time.Duration(reqTimeout) * time.Second,
+		APIOnly:              o.apiOnly,
+		Stealth:              o.stealth,
+		RateLimit:            o.rateLimit,
+		MaxRequests:          o.maxReq,
+		Enumerate:            o.enumerate,
+		UserAgent:            o.userAgent,
+		RandomUA:             o.randomUA,
+		DetectionMode:        o.detectionMode,
+		Proxy:                o.proxy,
+		ProxyAuth:            o.proxyAuth,
+		ProxyTargetOnly:      o.proxyTargetOnly,
+		TLSFingerprint:       o.tlsFingerprint,
+		PerHostRateLimit:     o.perHostRateLimit,
+		NoXMLRPC:             o.noXMLRPC,
+		Checks:               o.checks,
+		ContentDir:           o.contentDir,
+		PluginsDir:           o.pluginsDir,
+		ExcludeContentBased:  o.excludeContentBased,
+		Scope:                o.scope,
+		PluginsList:          o.pluginsList,
+		ThemesList:           o.themesList,
+		MaxScanDuration:      o.maxScanDuration,
+		CacheTTL:             o.cacheTTL,
+		Findings:             findings,
+		PasswordsFile:        o.passwordsFile,
+		UsernamesFile:        o.usernamesFile,
+		User:                 o.user,
+		XMLRPCBrute:          o.xmlrpcBrute,
+		MCPerRequest:         o.mcMaxPasswords,
+		WPAuth:               o.wpAuth,
+		NoBrute:              o.noBrute,
+		NoSummary:            o.noSummary,
+		CrawlPages:           o.crawlPages,
+		FingerprintDB:        o.fingerprintDB,
+		PopularSlugs:         o.popularSlugs,
 		AllowForeignRedirect: o.allowForeignRedirect,
-		MaxRetries:          o.retries,
+		MaxRetries:           o.retries,
+		Discover404:          o.discover404,
+		PopularFile:          o.popularFile,
 	}
 }
 
@@ -1127,6 +1215,7 @@ type watchOptions struct {
 	webhook       string
 	webhookFormat string
 	stateDir      string
+	jsonl         bool
 }
 
 // parseWatchArgs parses `watch` arguments. A subset of scan flags is
@@ -1161,6 +1250,8 @@ func parseWatchArgs(args []string) (target string, o scanOptions, w watchOptions
 		case a == "--state-dir" && i+1 < len(args):
 			i++
 			w.stateDir = args[i]
+		case a == "--jsonl":
+			w.jsonl = true
 		case a == "--db" && i+1 < len(args):
 			i++
 			o.dbPath = args[i]
@@ -1231,16 +1322,24 @@ func runWatch(target string, o scanOptions, w watchOptions) int {
 		}
 
 		diff, err := watch.Run(target, res, watch.Options{
-			StateDir:    stateDir,
-			Webhook:     w.webhook,
+			StateDir:     stateDir,
+			Webhook:      w.webhook,
 			NotifyFormat: w.webhookFormat,
 		}, time.Now())
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "watch error:", err)
 			return 2
 		}
-		fmt.Printf("[%s] %s\n", time.Now().UTC().Format("2006-01-02T15:04:05Z"), diff.Summary())
-		if !diff.Empty() {
+		if w.jsonl {
+			if j, jerr := watch.DiffToJSON(diff); jerr == nil {
+				fmt.Println(string(j))
+			} else {
+				fmt.Fprintln(os.Stderr, "watch jsonl:", jerr)
+			}
+		} else {
+			fmt.Printf("[%s] %s\n", time.Now().UTC().Format("2006-01-02T15:04:05Z"), diff.Summary())
+		}
+		if !diff.Empty() && !w.jsonl {
 			watch.PrintDiff(diff)
 		} else if w.webhook != "" && pass == 1 && !o.silent {
 			// Run() already notified on first-run baselines; nothing else to do.
@@ -1307,7 +1406,13 @@ func verifyWithNuclei(res *scanner.Result, o scanOptions) {
 		return
 	}
 
-	results, err := nuclei.Run(res.Target, templates, splitNucleiArgs(o.nucleiArgs))
+	extra := splitNucleiArgs(o.nucleiArgs)
+	if o.nucleiMinSeverity != "" {
+		// nuclei's own -severity filter skips low-value templates before
+		// any request is made (no YAML parsing needed on our side).
+		extra = append(extra, "-severity", o.nucleiMinSeverity)
+	}
+	results, err := nuclei.Run(res.Target, templates, extra)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] nuclei verification failed: %v — skipping verification\n", err)
 		return
@@ -1433,6 +1538,18 @@ func writeScanOutput(path string, res *scanner.Result, format string) error {
 			return err
 		}
 		out = buf.Bytes()
+	case "sarif":
+		var buf bytes.Buffer
+		report.WriteSARIF(&buf, onyxVersion, res)
+		out = buf.Bytes()
+	case "cyclonedx":
+		var buf bytes.Buffer
+		report.WriteCycloneDX(&buf, onyxVersion, res)
+		out = buf.Bytes()
+	case "jsonl":
+		var buf bytes.Buffer
+		report.WriteJSONL(&buf, res)
+		out = buf.Bytes()
 	case "markdown", "md", "html", "junit":
 		var buf bytes.Buffer
 		if format == "markdown" {
@@ -1498,19 +1615,19 @@ func update(dst, feed string, force bool) error {
 		// available on the mirror, apply it instead of re-downloading the
 		// whole 151MB feed. Any problem along the way falls back to the
 		// classic full download, so this can never make update worse.
-	if !force {
-		done, err := updateViaDelta(dst)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[WARN] delta update unavailable (%v) — falling back to full download\n", err)
-		} else if done {
-			// A delta was applied (or the database was already current).
-			// Warm the read index so subsequent scans start fast.
-			if _, iErr := db.LoadCached(dst); iErr != nil {
-				fmt.Fprintf(os.Stderr, "[WARN] index warm-up failed (scans will build it lazily): %v\n", iErr)
+		if !force {
+			done, err := updateViaDelta(dst)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[WARN] delta update unavailable (%v) — falling back to full download\n", err)
+			} else if done {
+				// A delta was applied (or the database was already current).
+				// Warm the read index so subsequent scans start fast.
+				if _, iErr := db.LoadCached(dst); iErr != nil {
+					fmt.Fprintf(os.Stderr, "[WARN] index warm-up failed (scans will build it lazily): %v\n", iErr)
+				}
+				return nil
 			}
-			return nil
 		}
-	}
 		var err error
 		url, err = productionAssetURL()
 		if err != nil {
@@ -1797,15 +1914,9 @@ func productionAssetURL() (string, error) {
 		return "", fmt.Errorf("release lookup: HTTP %d", resp.StatusCode)
 	}
 
-	var rel struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			Name               string `json:"name"`
-			BrowserDownloadURL string `json:"browser_download_url"`
-		} `json:"assets"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return "", fmt.Errorf("release decode: %w", err)
+	rel, err := latestReleaseAssets(relURL)
+	if err != nil {
+		return "", err
 	}
 	for _, a := range rel.Assets {
 		if a.Name == productionAsset {
@@ -1813,6 +1924,110 @@ func productionAssetURL() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("asset %s not found in release %s", productionAsset, rel.TagName)
+}
+
+// releaseAsset is one GitHub release asset entry.
+type releaseAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+// releaseInfo is the subset of GitHub release metadata onyx needs.
+type releaseInfo struct {
+	TagName string         `json:"tag_name"`
+	Assets  []releaseAsset `json:"assets"`
+}
+
+// latestReleaseAssets fetches and decodes the latest onyx-db release
+// metadata (shared by the feed download and the optional data assets).
+func latestReleaseAssets(relURL string) (*releaseInfo, error) {
+	req, err := http.NewRequest("GET", relURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "onyx")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("release lookup: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("release lookup: HTTP %d", resp.StatusCode)
+	}
+	var rel releaseInfo
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, fmt.Errorf("release decode: %w", err)
+	}
+	return &rel, nil
+}
+
+// updateOptionalAssets mirrors the optional data assets (popular-list and
+// core-fingerprint table) next to the database. Every failure is a
+// warning: scans work fine without them (the scanner falls back to the
+// built-in lists and disables fingerprinting).
+func updateOptionalAssets(dst string, rel *releaseInfo) {
+	if rel == nil {
+		return
+	}
+	dir := filepath.Dir(dst)
+	for _, asset := range []struct {
+		name, out string
+	}{
+		{"popular.json.gz", "popular.json"},
+		{"fingerprints.json.gz", "fingerprints.json"},
+	} {
+		var url string
+		for _, a := range rel.Assets {
+			if a.Name == asset.name {
+				url = a.BrowserDownloadURL
+				break
+			}
+		}
+		if url == "" {
+			continue // mirror does not publish this asset yet
+		}
+		outPath := filepath.Join(dir, asset.out)
+		tmp, err := os.CreateTemp(dir, ".onyx-aux-*")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] %s download: %v\n", asset.name, err)
+			continue
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		if err := downloadToFile(url, tmpName); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] %s download: %v\n", asset.name, err)
+			continue
+		}
+		if pub := dbPubKeyPath(); pub != "" {
+			sigTmp := tmpName + ".sig"
+			if dErr := downloadToFile(url+".minisig", sigTmp); dErr != nil {
+				fmt.Fprintf(os.Stderr, "[WARN] %s signature fetch: %v — skipping\n", asset.name, dErr)
+				continue
+			}
+			if vErr := dbupdate.VerifyMinisign(pub, sigTmp, tmpName); vErr != nil {
+				fmt.Fprintf(os.Stderr, "[WARN] %s signature verification FAILED: %v — skipping\n", asset.name, vErr)
+				continue
+			}
+		}
+		zr, gErr := gzip.NewReader(tmp)
+		if gErr != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] %s gzip: %v\n", asset.name, gErr)
+			continue
+		}
+		if _, cErr := io.Copy(tmp, zr); cErr != nil {
+			zr.Close()
+			fmt.Fprintf(os.Stderr, "[WARN] %s unpack: %v\n", asset.name, cErr)
+			continue
+		}
+		zr.Close()
+		tmp.Close()
+		if rErr := os.Rename(tmpName, outPath); rErr != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] %s rename: %v\n", asset.name, rErr)
+			continue
+		}
+		fmt.Printf("update: %s -> %s\n", asset.name, outPath)
+	}
 }
 
 // updateFromURL downloads url into dst, unpacking a gzip payload when gz is
