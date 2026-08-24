@@ -28,7 +28,7 @@ type Bar struct {
 	findings atomic.Int64
 	current  atomic.Value // string
 
-	pad    int       // width of the last drawn progress line
+	pad    int // width of the last drawn progress line
 	mu     sync.Mutex
 	lastSh time.Time // last throttle window start
 }
@@ -111,7 +111,13 @@ func (b *Bar) line() string {
 	if total > 0 {
 		label += fmt.Sprintf(" %d/%d", done, total)
 	}
-	return label + " " + elapsed
+	line := label + " " + elapsed
+	if total > 0 && done > 0 {
+		elapsedDur := time.Since(b.start)
+		remaining := elapsedDur * time.Duration(total-done) / time.Duration(done)
+		line += " ETA " + remaining.Round(time.Second).String()
+	}
+	return line
 }
 
 func (b *Bar) render() {

@@ -447,3 +447,62 @@ func TestRenderSlackTextNilAndEmpty(t *testing.T) {
 		t.Errorf("empty diff missing summary: %q", out)
 	}
 }
+
+// TestDiffToJSONShape locks the exact JSONL contract integrators rely on:
+// snake_case-free field names and null slices when nothing is present.
+func TestDiffToJSONShape(t *testing.T) {
+	got, err := DiffToJSON(&Diff{})
+	if err != nil {
+		t.Fatalf("DiffToJSON: %v", err)
+	}
+	want := `{"target":"","scanned_at":"0001-01-01T00:00:00Z","new":null,"resolved":null,"unchanged":0}`
+	if string(got) != want {
+		t.Fatalf("DiffToJSON(&Diff{}) = %s, want %s", got, want)
+	}
+}
+
+func TestDiffToJSONNilEmitsEmptyObject(t *testing.T) {
+	got, err := DiffToJSON(nil)
+	if err != nil {
+		t.Fatalf("DiffToJSON(nil): %v", err)
+	}
+	if string(got) != "{}" {
+		t.Fatalf("DiffToJSON(nil) = %s, want {}", got)
+	}
+}
+
+// TestDiffToJSONRoundTrip unmarshals the output into an independent struct
+// carrying the same tags, proving the JSON contract matches the wire shape.
+func TestDiffToJSONRoundTrip(t *testing.T) {
+	d := &Diff{
+		Target:    "https://example.com",
+		ScannedAt: testNow,
+		New: []Change{
+			{Slug: "akismet", Type: "plugin", CVE: "CVE-2025-9999", Title: "Akismet SSRF", Rating: "high"},
+		},
+		Resolved: []Change{
+			{Slug: "hello", CVE: "CVE-2023-3333"},
+		},
+		Unchanged: 12,
+	}
+	data, err := DiffToJSON(d)
+	if err != nil {
+		t.Fatalf("DiffToJSON: %v", err)
+	}
+	var back struct {
+		Target    string    `json:"target"`
+		ScannedAt time.Time `json:"scanned_at"`
+		New       []Change  `json:"new"`
+		Resolved  []Change  `json:"resolved"`
+		Unchanged int       `json:"unchanged"`
+	}
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatalf("unmarshal %s: %v", data, err)
+	}
+	if back.Target != d.Target || !back.ScannedAt.Equal(d.ScannedAt) || back.Unchanged != d.Unchanged {
+		t.Fatalf("round trip scalars mismatch: %+v", back)
+	}
+	if !reflect.DeepEqual(back.New, d.New) || !reflect.DeepEqual(back.Resolved, d.Resolved) {
+		t.Fatalf("round trip slices mismatch: %+v", back)
+	}
+}

@@ -106,3 +106,53 @@ func TestTTYInfClearsLine(t *testing.T) {
 		t.Errorf("expected progress redraw after INF log, got %q", got)
 	}
 }
+
+// TestLineETAAppendsAfterElapsed verifies line() appends a rounded
+// remaining-time estimate once work is in progress, and omits it when there
+// is no total or nothing done yet.
+func TestLineETAAppendsAfterElapsed(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name    string
+		total   int64
+		done    int64
+		elapsed time.Duration
+		wantETA bool
+	}{
+		{"no total", 0, 5, 2 * time.Minute, false},
+		{"nothing done", 100, 0, 2 * time.Minute, false},
+		{"in progress", 500, 100, 2 * time.Minute, true},
+		{"complete", 500, 500, 2 * time.Minute, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := New(&bytes.Buffer{}, true)
+			b.start = now.Add(-tt.elapsed)
+			b.total.Store(tt.total)
+			b.done.Store(tt.done)
+			got := b.line()
+			if has := strings.Contains(got, " ETA "); has != tt.wantETA {
+				t.Fatalf("line() = %q, ETA present = %v, want %v", got, has, tt.wantETA)
+			}
+		})
+	}
+}
+
+// TestLineETAPrefixUntouched pins the exact ETA value and proves the
+// existing prefix (bar, percent, count, elapsed) is left unchanged.
+func TestLineETAPrefixUntouched(t *testing.T) {
+	b := New(&bytes.Buffer{}, true)
+	b.start = time.Now().Add(-12 * time.Second)
+	b.total.Store(500)
+	b.done.Store(252)
+
+	wantPrefix := "[###############---------------]  50% 252/500 12s"
+	got := b.line()
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("line() = %q, want prefix %q", got, wantPrefix)
+	}
+	// 12s elapsed at 252/500 done -> 12*248/252 ≈ 12s remaining.
+	if !strings.Contains(got, " ETA 12s") {
+		t.Fatalf("line() = %q, want ETA 12s suffix", got)
+	}
+}

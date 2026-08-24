@@ -57,11 +57,11 @@ type Change struct {
 
 // Diff is the outcome of comparing a scan against a previous state.
 type Diff struct {
-	Target    string
-	ScannedAt time.Time
-	New       []Change // vulnerabilities present now, absent in baseline
-	Resolved  []Change // in baseline, absent now
-	Unchanged int
+	Target    string    `json:"target"`
+	ScannedAt time.Time `json:"scanned_at"`
+	New       []Change  `json:"new"`      // vulnerabilities present now, absent in baseline
+	Resolved  []Change  `json:"resolved"` // in baseline, absent now
+	Unchanged int       `json:"unchanged"`
 }
 
 // LoadState reads a previously saved state file. When the file does not
@@ -180,6 +180,19 @@ func DiffStates(prev *State, res *scanner.Result, now time.Time) *Diff {
 		return d.Resolved[i].CVE < d.Resolved[j].CVE
 	})
 	return d
+}
+
+// DiffToJSON returns the compact JSON encoding of d for JSONL output. A nil
+// diff encodes as the empty object so callers can always print the result.
+func DiffToJSON(d *Diff) ([]byte, error) {
+	if d == nil {
+		return []byte("{}"), nil
+	}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return nil, fmt.Errorf("watch: encode diff: %w", err)
+	}
+	return data, nil
 }
 
 // SaveState atomically writes st to path: the parent directory is created if
