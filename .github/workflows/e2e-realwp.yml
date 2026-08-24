@@ -1,0 +1,128 @@
+name: e2e-realwp
+
+# Nightly end-to-end scan against a REAL WordPress installation. Unlike the
+# hermetic e2e (e2e.yml, fake target on stdlib http.server) this one boots a
+# real WordPress core install (mysql:8.0 + wordpress:latest service
+# containers), installs contact-form-7 via wp-cli with docker exec, and runs
+# the onyx scan against it with assertions in scripts/e2e-realwp.sh.
+#
+# The scan assertions are deliberately tolerant: they assert detection
+# (core version non-empty, xmlrpc enabled, contact-form-7 detected, users
+# enumerated, no version.php/wp-config.php.bak false positives) — never a
+# specific WordPress version, so upstream WP releases cannot break it.
+#
+# WordPress service containers are plain containers on the runner's docker
+# daemon, so the job can docker exec into the wordpress container to run
+# wp-cli. The container is located by image (docker ps --filter
+# ancestor=wordpress:latest), which GH-hosted runners resolve reliably;
+# service container names (<hash>_<service>_<rand>) are not stable.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-realwp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: onyx_e2e_root
+          MYSQL_DATABASE: wordpress
+          MYSQL_USER: wpuser
+          MYSQL_PASSWORD: wppass
+        # No host port needed: the wordpress service reaches MySQL through
+        # the job's private docker network using the service name as the
+        # hostname (mysql:3306). Health check runs inside the container
+        # where $MYSQL_ROOT_PASSWORD is defined.
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -p$MYSQL_ROOT_PASSWORD"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      wordpress:
+        image: wordpress:latest
+        env:
+          WORDPRESS_DB_HOST: mysql:3306
+          WORDPRESS_DB_USER: wpuser
+          WORDPRESS_DB_PASSWORD: wppass
+          WORDPRESS_DB_NAME: wordpress
+        # Map the container's apache :80 to the runner host :8080 so the
+        # scan can reach it at http://localhost:8080/.
+        ports:
+          - "8080:80"
+        # curl ships in the php base image (see docker-library/php), so the
+        # health check needs nothing extra.
+        options: >-
+          --health-cmd "curl -f http://localhost/ || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build
+        run: |
+          go build ./...
+          go build -o /tmp/onyx .
+
+      - name: Construct minimal test feed
+        run: |
+          mkdir -p data
+          cat > data/wordpress-feed.json <<'EOF'
+          {"00000000-0000-4000-8000-00000000cf7f":{"id":"00000000-0000-4000-8000-00000000cf7f","title":"Contact Form 7 - Stored XSS","software":[{"type":"plugin","name":"Contact Form 7","slug":"contact-form-7","affected_versions":{"*":{"from_version":"*","to_version":"*"}}}],"informational":false,"description":"Universal-range contact-form-7 record used by the real-WordPress e2e.","cve":"CVE-2026-00002","cvss":{"vector":"CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:L/A:L","score":8.1,"rating":"high"},"published_at":"2026-01-01T00:00:00Z"}}
+          EOF
+          python3 -c "import json; json.load(open('data/wordpress-feed.json')); print('feed is valid JSON')"
+
+      # Service containers run on the runner's docker daemon (they are just
+      # containers to the runner), so docker exec works even though the job
+      # itself has no `container:` key. The container id is not stable
+      # between runs, so it is located by image; only one wordpress:latest
+      # container exists per job.
+      - name: Locate WordPress service container
+        id: wp
+        run: |
+          set -euo pipefail
+          CID="$(docker ps -q --filter ancestor=wordpress:latest | head -n1)"
+          if [ -z "$CID" ]; then
+            echo "::error::wordpress service container not found (docker ps):"
+            docker ps --format '{{.ID}} {{.Image}} {{.Names}}'
+            exit 1
+          fi
+          echo "container=$CID" >> "$GITHUB_OUTPUT"
+
+      # wp-cli does not ship in the wordpress image; bootstrap the phar
+      # inside the container and install the core + contact-form-7. Runs as
+      # root (wordpress image default), hence --allow-root. The site URL is
+      # localhost:80 as seen from inside the container; the scan reaches it
+      # via the host-side 8080 mapping. --skip-email avoids the mailer.
+      - name: Install WordPress + contact-form-7 via wp-cli (docker exec)
+        run: |
+          set -euo pipefail
+          docker exec "${{ steps.wp.outputs.container }}" sh -c '
+            set -eu
+            curl -sfL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar
+            php /tmp/wp-cli.phar --allow-root --info >/dev/null
+            php /tmp/wp-cli.phar --allow-root core install \
+              --url=http://localhost/ \
+              --title="onyx e2e realwp" \
+              --admin_user=admin \
+              --admin_password=admin \
+              --admin_email=admin@example.com \
+              --skip-email
+            php /tmp/wp-cli.phar --allow-root plugin install contact-form-7 --activate
+            php /tmp/wp-cli.phar --allow-root plugin get contact-form-7 --field=version
+          '
+
+      - name: Run real-WordPress e2e scan
+        run: scripts/e2e-realwp.sh /tmp/onyx data/wordpress-feed.json http://localhost:8080/
