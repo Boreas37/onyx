@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
+	"github.com/Boreas37/onyx/internal/dbupdate"
 )
 
 // runDB drives the `onyx db` inspection subcommands: read-only queries
@@ -34,7 +37,7 @@ func runDB(args []string) int {
 		i++
 	}
 
-	database, err := db.Load(dbPath)
+	database, err := db.LoadCached(dbPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error loading database:", err)
 		return 2
@@ -214,4 +217,137 @@ func fileSize(path string) int64 {
 		return 0
 	}
 	return fi.Size()
+}
+
+// runDoctor runs local health checks for the tool and its data. Offline by
+// default; --network also verifies the mirror manifest (and its minisign
+// signature when ONYX_DB_PUBKEY is set). Exit code is 1 when any check
+// fails, 0 otherwise.
+func runDoctor(args []string) int {
+	dbPath := defaultDB
+	network := false
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--db" && i+1 < len(args):
+			i++
+			dbPath = args[i]
+		case args[i] == "--network":
+			network = true
+		default:
+			fmt.Fprintln(os.Stderr, "usage: onyx doctor [--db PATH] [--network]")
+			return 2
+		}
+	}
+	fail := false
+	ok := func(cond bool, label, detail string) {
+		if cond {
+			fmt.Printf("[OK]    %s\n", label)
+		} else {
+			fmt.Printf("[ERROR] %s\n", label)
+			if detail != "" {
+				fmt.Printf("        %s\n", detail)
+			}
+			fail = true
+		}
+	}
+	warn := func(label, detail string) {
+		fmt.Printf("[WARN]  %s", label)
+		if detail != "" {
+			fmt.Printf(" — %s", detail)
+		}
+		fmt.Println()
+	}
+
+	_, statErr := os.Stat(dbPath)
+	ok(statErr == nil, fmt.Sprintf("database file exists (%s)", dbPath), "run 'onyx update' first")
+	if statErr != nil {
+		return 1
+	}
+
+	d, err := db.LoadCached(dbPath)
+	if err != nil {
+		ok(false, "database loads", err.Error())
+	} else {
+		ok(true, "database loads", "")
+		fmt.Printf("        %d records, %d skipped (unparseable)\n", d.Count(), d.Skipped())
+	}
+	if _, err := os.Stat(dbPath + ".sha256"); err == nil {
+		ok(true, "checksum sidecar (.sha256)", "")
+	} else {
+		ok(false, "checksum sidecar (.sha256)", "no .sha256 sidecar — run 'onyx update'")
+	}
+	if b, err := os.ReadFile(dbPath + ".feedtype"); err == nil {
+		fmt.Printf("        feed: %s\n", strings.TrimSpace(string(b)))
+	}
+	if b, err := os.ReadFile(dbPath + ".manifest-ts"); err == nil {
+		if ts, perr := time.Parse(time.RFC3339, strings.TrimSpace(string(b))); perr == nil {
+			days := int(time.Since(ts).Hours() / 24)
+			ok(true, "manifest timestamp recorded", "")
+			if days > 14 {
+				warn("manifest is stale", fmt.Sprintf("%d days old — run 'onyx update'", days))
+			}
+		} else {
+			ok(false, "manifest timestamp parses", string(b))
+		}
+	} else {
+		warn("no manifest timestamp sidecar", "expected after 'onyx update'")
+	}
+
+	if pub := os.Getenv("ONYX_DB_PUBKEY"); pub != "" {
+		if b, perr := os.ReadFile(pub); perr != nil {
+			ok(false, "minisign public key readable", perr.Error())
+		} else if len(b) == 0 || !strings.Contains(strings.SplitN(string(b), "\n", 2)[0], "untrusted comment") {
+			ok(false, "minisign public key looks valid", "file is empty or not a minisign key")
+		} else {
+			ok(true, "minisign public key configured", "")
+		}
+	} else {
+		warn("ONYX_DB_PUBKEY unset", "signature verification is off")
+	}
+
+	if base, err := os.UserCacheDir(); err == nil {
+		cdir := filepath.Join(base, "onyx", "http")
+		if entries, e := os.ReadDir(cdir); e == nil {
+			fmt.Printf("[OK]    HTTP cache (%s): %d entries\n", cdir, len(entries))
+		} else {
+			warn("HTTP cache dir absent", cdir)
+		}
+	}
+
+	if network {
+		murl := manifestURL()
+		raw, merr := dbupdate.FetchManifestRaw(http.DefaultClient, murl)
+		if merr != nil {
+			ok(false, "mirror manifest reachable", merr.Error())
+		} else {
+			m, perr := dbupdate.ParseManifest(raw)
+			if perr != nil {
+				ok(false, "mirror manifest parses", perr.Error())
+			} else {
+				fmt.Printf("[OK]    mirror manifest (%s)\n", m.GeneratedAt)
+				fmt.Printf("        full sha256: %s (%d delta entries)\n",
+					shortHash(m.Full.Sha256), len(m.Deltas))
+			}
+			if pub := os.Getenv("ONYX_DB_PUBKEY"); pub != "" {
+				sigTmp := murl + ".minisig"
+				if sErr := dbupdate.VerifyManifest(pub, raw, sigTmp); sErr != nil {
+					ok(false, "manifest signature verifies", sErr.Error())
+				} else {
+					ok(true, "manifest signature verifies", "")
+				}
+			}
+		}
+	}
+
+	if fail {
+		return 1
+	}
+	return 0
+}
+
+func shortHash(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
 }

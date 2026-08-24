@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
@@ -96,6 +97,8 @@ func main() {
 		}
 	case "db":
 		os.Exit(runDB(os.Args[2:]))
+	case "doctor":
+		os.Exit(runDoctor(os.Args[2:]))
 	case "completion":
 		os.Exit(runCompletion(os.Args[2:]))
 	default:
@@ -201,6 +204,11 @@ type scanOptions struct {
 	crawlPages          int
 	failOn              string
 	noIntel             bool
+	fingerprintDB       string
+	popularSlugs        bool
+	allowForeignRedirect bool
+	retries             int
+	jobs                int
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -215,6 +223,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.connectTimeout = 10
 	o.contentDir = "wp-content"
 	o.pluginsDir = "wp-content/plugins"
+	o.popularSlugs = true
+	o.retries = 2
+	o.jobs = 1
 	setFlags := make(map[string]bool)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -390,6 +401,23 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			}
 		case a == "--no-intel":
 			o.noIntel = true
+		case a == "--fingerprint-db" && i+1 < len(args):
+			i++
+			o.fingerprintDB = args[i]
+		case a == "--no-popular":
+			o.popularSlugs = false
+		case a == "--allow-foreign-redirect":
+			o.allowForeignRedirect = true
+		case a == "--retries" && i+1 < len(args):
+			i++
+			o.retries = atoi(args[i], 2)
+		case a == "--jobs" && i+1 < len(args):
+			i++
+			o.jobs = atoi(args[i], 1)
+			if o.jobs < 1 {
+				fmt.Fprintln(os.Stderr, "error: --jobs must be >= 1")
+				os.Exit(2)
+			}
 		case a == "--profile" && i+1 < len(args):
 			i++
 			o.profile = args[i]
@@ -414,6 +442,15 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	// --stream alone implies --format jsonl.
 	if o.stream && !setFlags["format"] {
 		o.format = "jsonl"
+	}
+	// Config cascade: when no explicit --config was given, look for a
+	// defaults file in the standard locations (first match wins), the
+	// same convention WPScan follows. Explicit CLI flags still win over
+	// anything discovered.
+	if o.configPath == "" {
+		if discovered := discoverConfig(); discovered != "" {
+			o.configPath = discovered
+		}
 	}
 	// --config FILE: JSON defaults overridden by explicit CLI flags.
 	if o.configPath != "" {
@@ -464,6 +501,27 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		}
 	}
 	return target, o
+}
+
+// discoverConfig returns the path of the first existing onyx defaults
+// file, following the usual cascade: $XDG_CONFIG_HOME/onyx/scan.json,
+// ~/.config/onyx/scan.json and ./onyx.json (current directory). It
+// returns "" when none exists.
+func discoverConfig() string {
+	var candidates []string
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		candidates = append(candidates, filepath.Join(xdg, "onyx", "scan.json"))
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".config", "onyx", "scan.json"))
+	}
+	candidates = append(candidates, filepath.Join(".", "onyx.json"))
+	for _, c := range candidates {
+		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 // applyConfig overlays the known keys of a JSON config file onto o. CLI
@@ -690,16 +748,25 @@ Scan flags:
   -T, --targets FILE scan several targets sequentially (one URL per line; # comments); exit code aggregates
   --fail-on SEV      only exit 5 when findings >= SEV exist (critical/high/medium/low); default: any finding
   --no-intel         skip EPSS/CISA KEV enrichment
+  --fingerprint-db FILE  JSON core-fingerprint table (md5 file hashes -> versions)
+  --no-popular       do not append the static popular plugin/theme slug lists
+  --allow-foreign-redirect  follow redirects to hosts other than the target
+  --retries N        retry transient network errors N times (default: 2, 0 = off)
+  --jobs N           scan -T/extra targets with up to N concurrent scans (default: 1)
   --config FILE      JSON config file; explicit CLI flags win over config values
 
 Watch mode:
   onyx watch URL [--interval D] [--webhook URL] [scan flags]
   --interval D       re-scan every duration (30m, 1h); default: single compare-and-exit pass
   --webhook URL      POST a JSON change report when new/resolved vulnerabilities appear
+  --webhook-format F payload shape: generic (default) or slack
   --state-dir DIR    where baselines are stored (default: user cache dir /onyx/watch)
 
 Database inspection:
   onyx db stats|lookup SLUG|top [N]|search QUERY [--db PATH]
+
+Diagnostics:
+  onyx doctor [--db PATH] [--network]   local health checks (offline by default)
 
 Shell completions:
   onyx completion bash|zsh|fish     (add the output to your shell config)
@@ -726,7 +793,7 @@ func runScan(target string, o scanOptions) int {
 		}
 	}
 
-	database, err := db.Load(o.dbPath)
+	database, err := db.LoadCached(o.dbPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error loading database:", err)
 		return 2
@@ -855,9 +922,13 @@ func runScan(target string, o scanOptions) int {
 	return scanExitCode(res, err, o.strictWP, o.failOn)
 }
 
-// runMulti scans several targets sequentially, printing a section header
-// per target and aggregating exit codes: any hard failure (2) wins, then
-// findings (5), then strict-WP misses (3), else 0.
+// runMulti scans several targets, printing a section header per target and
+// aggregating exit codes: any hard failure (2) wins, then findings (5),
+// then strict-WP misses (3), else 0. With --jobs N (N > 1) the targets are
+// scanned concurrently with at most N in flight; because scans are
+// network-bound this can cut wall time for large target files. Output
+// order may then differ from the input order (each target still prints
+// under its own "=== [i/N] target ===" header).
 //
 // Formats that cannot be meaningfully concatenated (json document, sarif,
 // cyclonedx) are rejected up front; jsonl and csv are flat formats and
@@ -872,7 +943,6 @@ func runMulti(targets []string, o scanOptions) int {
 			return 2
 		}
 	}
-	worst := 0
 	rank := func(c int) int {
 		switch c {
 		case 2:
@@ -884,13 +954,42 @@ func runMulti(targets []string, o scanOptions) int {
 		}
 		return 0
 	}
-	for i, t := range targets {
-		if len(targets) > 1 {
-			fmt.Fprintf(os.Stderr, "\n=== [%d/%d] %s ===\n", i+1, len(targets), t)
+	worst := 0
+	jobs := o.jobs
+	if jobs < 1 {
+		jobs = 1
+	}
+	if jobs == 1 || len(targets) == 1 {
+		for i, t := range targets {
+			if len(targets) > 1 {
+				fmt.Fprintf(os.Stderr, "\n=== [%d/%d] %s ===\n", i+1, len(targets), t)
+			}
+			code := runScan(t, o)
+			if rank(code) > rank(worst) {
+				worst = code
+			}
 		}
-		code := runScan(t, o)
-		if rank(code) > rank(worst) {
-			worst = code
+		return worst
+	}
+	// Concurrent mode: bounded worker pool, codes aggregated afterwards.
+	codes := make([]int, len(targets))
+	sem := make(chan struct{}, jobs)
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		i, t := i, t
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fmt.Fprintf(os.Stderr, "\n=== [%d/%d] %s ===\n", i+1, len(targets), t)
+			codes[i] = runScan(t, o)
+		}()
+	}
+	wg.Wait()
+	for _, c := range codes {
+		if rank(c) > rank(worst) {
+			worst = c
 		}
 	}
 	return worst
@@ -994,6 +1093,10 @@ func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Op
 		NoBrute:             o.noBrute,
 		NoSummary:           o.noSummary,
 		CrawlPages:          o.crawlPages,
+		FingerprintDB:       o.fingerprintDB,
+		PopularSlugs:        o.popularSlugs,
+		AllowForeignRedirect: o.allowForeignRedirect,
+		MaxRetries:          o.retries,
 	}
 }
 
@@ -1020,9 +1123,10 @@ func enrichFindings(res *scanner.Result) {
 
 // watchOptions are the flags unique to `onyx watch`.
 type watchOptions struct {
-	interval time.Duration
-	webhook  string
-	stateDir string
+	interval      time.Duration
+	webhook       string
+	webhookFormat string
+	stateDir      string
 }
 
 // parseWatchArgs parses `watch` arguments. A subset of scan flags is
@@ -1046,6 +1150,14 @@ func parseWatchArgs(args []string) (target string, o scanOptions, w watchOptions
 		case a == "--webhook" && i+1 < len(args):
 			i++
 			w.webhook = args[i]
+		case a == "--webhook-format" && i+1 < len(args):
+			i++
+			f := strings.ToLower(args[i])
+			if f != "generic" && f != "slack" {
+				fmt.Fprintf(os.Stderr, "error: invalid --webhook-format %q (use generic or slack)\n", args[i])
+				os.Exit(2)
+			}
+			w.webhookFormat = f
 		case a == "--state-dir" && i+1 < len(args):
 			i++
 			w.stateDir = args[i]
@@ -1093,7 +1205,7 @@ func runWatch(target string, o scanOptions, w watchOptions) int {
 	pass := 0
 	for {
 		pass++
-		database, err := db.Load(o.dbPath)
+		database, err := db.LoadCached(o.dbPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error loading database:", err)
 			return 2
@@ -1119,8 +1231,9 @@ func runWatch(target string, o scanOptions, w watchOptions) int {
 		}
 
 		diff, err := watch.Run(target, res, watch.Options{
-			StateDir: stateDir,
-			Webhook:  w.webhook,
+			StateDir:    stateDir,
+			Webhook:     w.webhook,
+			NotifyFormat: w.webhookFormat,
 		}, time.Now())
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "watch error:", err)
@@ -1385,14 +1498,19 @@ func update(dst, feed string, force bool) error {
 		// available on the mirror, apply it instead of re-downloading the
 		// whole 151MB feed. Any problem along the way falls back to the
 		// classic full download, so this can never make update worse.
-		if !force {
-			done, err := updateViaDelta(dst)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[WARN] delta update unavailable (%v) — falling back to full download\n", err)
-			} else if done {
-				return nil
+	if !force {
+		done, err := updateViaDelta(dst)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] delta update unavailable (%v) — falling back to full download\n", err)
+		} else if done {
+			// A delta was applied (or the database was already current).
+			// Warm the read index so subsequent scans start fast.
+			if _, iErr := db.LoadCached(dst); iErr != nil {
+				fmt.Fprintf(os.Stderr, "[WARN] index warm-up failed (scans will build it lazily): %v\n", iErr)
 			}
+			return nil
 		}
+	}
 		var err error
 		url, err = productionAssetURL()
 		if err != nil {
@@ -1406,7 +1524,11 @@ func update(dst, feed string, force bool) error {
 		return err
 	}
 	// Signature verification happens inside updateFromURL, on the raw
-	// published artifact before unpacking.
+	// published artifact before unpacking. Warm the read index so the
+	// first scan after an update does not pay the full parse cost.
+	if _, iErr := db.LoadCached(dst); iErr != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] index warm-up failed (scans will build it lazily): %v\n", iErr)
+	}
 	return nil
 }
 
@@ -1566,7 +1688,26 @@ func updateViaDelta(dst string) (bool, error) {
 	}
 	localSHA := strings.TrimSpace(string(prevBytes))
 
-	m, err := dbupdate.FetchManifest(http.DefaultClient, manifestURL())
+	raw, err := dbupdate.FetchManifestRaw(http.DefaultClient, manifestURL())
+	if err != nil {
+		return false, fmt.Errorf("manifest: %w", err)
+	}
+	// Signature gate for the manifest itself: when a pubkey is configured,
+	// an unsigned or mis-signed manifest.json is a hard error — never a
+	// silent acceptance. This closes the last unauthenticated link in the
+	// delta chain (the manifest is what selects which delta to trust).
+	if pub := dbPubKeyPath(); pub != "" {
+		sigPath := dst + ".manifest.sig.tmp"
+		defer os.Remove(sigPath)
+		if dErr := downloadToFile(manifestURL()+".minisig", sigPath); dErr != nil {
+			return false, fmt.Errorf("manifest signature fetch (pubkey configured): %w", dErr)
+		}
+		if vErr := dbupdate.VerifyManifest(pub, raw, sigPath); vErr != nil {
+			return false, fmt.Errorf("manifest signature verification FAILED: %w", vErr)
+		}
+		fmt.Println("update: manifest signature verified")
+	}
+	m, err := dbupdate.ParseManifest(raw)
 	if err != nil {
 		return false, fmt.Errorf("manifest: %w", err)
 	}

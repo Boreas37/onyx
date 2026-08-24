@@ -22,11 +22,13 @@ var scanFlagList = []string{
 	"--passwords", "--usernames", "--user", "--xmlrpc-brute",
 	"--multicall-max-passwords", "--wp-auth", "--no-brute", "--no-summary",
 	"--strict-wp", "--crawl-pages", "--fail-on", "--no-intel",
+	"--fingerprint-db", "--no-popular", "--allow-foreign-redirect",
+	"--retries", "--jobs",
 	"--targets", "--profile", "--connect-timeout", "--request-timeout",
 	"--format", "--db",
 }
 
-var onyxSubcommands = []string{"scan", "update", "version", "db", "watch", "completion"}
+var onyxSubcommands = []string{"scan", "update", "version", "db", "watch", "doctor", "completion"}
 var dbSubcommands = []string{"stats", "lookup", "top", "search"}
 
 func runCompletion(args []string) int {
