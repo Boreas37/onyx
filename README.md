@@ -94,6 +94,10 @@ onyx scan https://example.com
 | `--allow-foreign-redirect` | Follow HTTP redirects to hosts other than the scanned target (default: blocked — SSRF hardening) |
 | `--retries N` | Retry transient network errors N times with exponential backoff + jitter (default 2, `0` disables) |
 | `--jobs N` | Scan `-T`/extra targets with up to N concurrent scans (default 1 = sequential; output order may vary) |
+| `--no-discover-404` | Do not probe a nonexistent path for plugin/theme references |
+| `--fail-on-rate-limited` | Exit `4` when the target's 429 throttling cut the scan short (CI: incomplete != clean) |
+| `--nuclei-min-severity S` | Only run nuclei templates of `S` or worse (`critical`/`high`/`medium`/`low`/`info`) |
+| `--outputs LIST` | Write extra report copies (`json,sarif,html,...`) as `<output>.<format>` files |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -150,6 +154,7 @@ or missing tracker clone only print a `[WARN]` and the scan still completes.
 | Code | Meaning |
 |---|---|
 | `0` | Scan finished, no qualifying vulnerable components found |
+| `4` | Scan cut short by the target's rate limiting (only with `--fail-on-rate-limited`) |
 | `5` | Vulnerabilities found (with `--fail-on SEV`: at least one at `SEV` or worse) |
 | `3` | Target does not look like WordPress (only with `--strict-wp`) |
 | `2` | Error (bad URL, unreachable target, missing DB) |
@@ -165,6 +170,7 @@ a clean pass.
     onyx db lookup contact-form-7     # all recorded vulns for one slug, most severe first
     onyx db top 20                    # most vulnerable slugs in the feed
     onyx db search "CVE-2025"         # grep titles/CVE ids (capped at 20)
+    onyx db diff B.json               # compare two feed snapshots
 
 All `db` subcommands are read-only and work fully offline; pass `--db PATH`
 to inspect a file other than the default.
@@ -199,6 +205,18 @@ wraps the same data as a Slack webhook `{"text": ...}` message. Without
 checks.
 Scan flags like `--db`, `--threads`, `--enumerate`, `--max-requests` are
 honored.
+
+## Result diffing and config help
+
+```bash
+onyx diff a.json b.json          # compare two saved scan results (exit 1 on any difference)
+onyx example-config              # print a commented JSON config template
+```
+
+`onyx diff` compares the vulnerability sets of two `--format json` outputs
+and reports added / removed / changed entries — handy for drift checks
+between scheduled scans. The config template matches every key
+`applyConfig` understands.
 
 ## Exploitation intelligence
 
@@ -277,6 +295,23 @@ During a scan a single live progress line renders on stderr in a terminal
 (`[##########----------] 50% 252/500 12s`). When output is piped or logged,
 no control characters are emitted — just `[INF]` log lines. `--silent`
 disables progress entirely; stdout always carries only the results.
+
+## Report enrichment
+
+Findings carry the feed's display names and fix guidance: JSON output
+includes `remediation` and `patched_versions` when the record provides
+them, and every result is stamped with a `schema_version` field so CI
+consumers can detect breaking output changes. Detected components report
+`tested_up_to` / `requires_at_least` when their readme provides them.
+
+## Optional data assets
+
+`onyx update` also mirrors two optional files next to the database when
+the mirror publishes them: `popular.json` (fresh popular plugin/theme
+lists replacing the built-in seeds) and `fingerprints.json` (MD5 core
+fingerprints that power `--fingerprint-db` automatically). Both are
+signature-verified when `ONYX_DB_PUBKEY` is set; a missing asset is a
+warning, never an error.
 
 ## The database
 
