@@ -4,6 +4,11 @@
 // The feed is a 151MB JSON object keyed by vulnerability UUID. It is
 // decoded record-by-record with a streaming decoder so the whole file is
 // never held in memory as one giant map.
+//
+// Re-parsing 151MB of JSON on every scan is wasteful, so the package also
+// supports a pre-built index sidecar: SaveIndex writes <path>.idx next to
+// the feed, and LoadCached serves loads from it whenever it is fresh,
+// skipping the full JSON decode (see index.go).
 package db
 
 import (
@@ -221,7 +226,7 @@ func Load(path string) (*DB, error) {
 	}
 	defer f.Close()
 
-	db := &DB{Path: path, bySlug: make(map[string][]*Vuln)}
+	db := &DB{Path: path}
 	dec := json.NewDecoder(f)
 	dec.UseNumber()
 
@@ -299,21 +304,32 @@ func Load(path string) (*DB, error) {
 			}
 		}
 		db.Records = append(db.Records, rec)
+	}
 
-		// Index non-informational records by slug, pointing at the stored
-		// record rather than the loop-local copy so the index and
-		// db.Records never alias two different structs.
+	finalize(db)
+	return db, nil
+}
+
+// finalize builds the slug index and the top-slug ordering for a fully
+// loaded DB. It is shared by Load and the index-sidecar loader
+// (rebuildFromIndex in index.go) so both paths produce identical lookup
+// semantics.
+func finalize(d *DB) {
+	d.bySlug = make(map[string][]*Vuln, len(d.Records))
+	// Index non-informational records by slug, pointing at the stored
+	// record rather than a loop-local copy so the index and
+	// d.Records never alias two different structs.
+	for i := range d.Records {
+		rec := &d.Records[i]
 		if rec.Informational {
 			continue
 		}
-		idx := len(db.Records) - 1
-		stored := &db.Records[idx]
-		for i := range stored.Software {
-			slug := stored.Software[i].Slug
+		for j := range rec.Software {
+			slug := rec.Software[j].Slug
 			if slug == "" {
 				continue
 			}
-			db.bySlug[slug] = append(db.bySlug[slug], stored)
+			d.bySlug[slug] = append(d.bySlug[slug], rec)
 		}
 	}
 
@@ -322,8 +338,8 @@ func Load(path string) (*DB, error) {
 		slug  string
 		count int
 	}
-	counts := make(map[string]int, len(db.bySlug))
-	for slug, recs := range db.bySlug {
+	counts := make(map[string]int, len(d.bySlug))
+	for slug, recs := range d.bySlug {
 		counts[slug] = len(recs)
 	}
 	ordered := make([]slugCount, 0, len(counts))
@@ -336,11 +352,10 @@ func Load(path string) (*DB, error) {
 		}
 		return ordered[i].slug < ordered[j].slug
 	})
-	db.topSlugs = make([]string, 0, len(ordered))
+	d.topSlugs = make([]string, 0, len(ordered))
 	for _, sc := range ordered {
-		db.topSlugs = append(db.topSlugs, sc.slug)
+		d.topSlugs = append(d.topSlugs, sc.slug)
 	}
-	return db, nil
 }
 
 // decodeSoftware decodes one software entry, normalizing its

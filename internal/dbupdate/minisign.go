@@ -37,8 +37,8 @@ import (
 // header, while onyx writes plain (unencrypted) seed files — they cannot
 // be read by minisign and vice versa.
 const (
-	minisignAlg         = "Ed" // legacy/unhashed signature algorithm
-	minisignAlgHashed   = "ED" // pre-hashed (SHA-512) signature algorithm
+	minisignAlg         = "Ed"                          // legacy/unhashed signature algorithm
+	minisignAlgHashed   = "ED"                          // pre-hashed (SHA-512) signature algorithm
 	pubKeyBlobLen       = 2 + 8 + ed25519.PublicKeySize // 42
 	sigBlobLen          = 2 + 8 + ed25519.SignatureSize // 74
 	trustedCommentLine  = "trusted comment: "
@@ -75,17 +75,27 @@ func VerifyMinisign(pubKeyPath, sigPath, dataPath string) error {
 	if err != nil {
 		return err
 	}
-	sigBlob, trustedComment, globalSig, hasGlobal, err := readSignatureFile(sigPath)
-	if err != nil {
-		return err
-	}
 	data, err := os.ReadFile(dataPath)
 	if err != nil {
 		return fmt.Errorf("reading signed data: %w", err)
 	}
+	return verifyMinisignBytes(pub, sigPath, data)
+}
+
+// verifyMinisignBytes is the shared verification core: it checks the
+// signature blob at sigPath over the in-memory data against pub. Both
+// VerifyMinisign (data read from a file) and VerifyManifest (raw manifest
+// bytes) delegate here, so every artifact type rides the exact same
+// parsing, algorithm and comment-binding pipeline. See VerifyMinisign for
+// the full semantics.
+func verifyMinisignBytes(pub ed25519.PublicKey, sigPath string, data []byte) error {
+	sigBlob, trustedComment, globalSig, hasGlobal, err := readSignatureFile(sigPath)
+	if err != nil {
+		return err
+	}
 
 	alg := string(sigBlob[:2])
-	mainMsg := []byte(data)
+	mainMsg := data
 	if alg == minisignAlgHashed {
 		// minisign 0.12 pre-hashes with BLAKE2b (libsodium's
 		// crypto_generichash, outlen=64) before signing.
@@ -113,6 +123,22 @@ func VerifyMinisign(pubKeyPath, sigPath, dataPath string) error {
 		}
 	}
 	return nil
+}
+
+// VerifyManifest verifies a minisign 0.12-compatible Ed25519 signature at
+// sigPath over in-memory manifest bytes against the public key at
+// pubKeyPath. It is the bytes-in counterpart of VerifyMinisign (which
+// reads the signed data from a file): callers that already hold the
+// manifest body — e.g. from FetchManifestRaw — can verify it directly
+// without writing it to a temp file. All parsing, algorithm and
+// comment-binding rules are identical to VerifyMinisign, including the
+// two-line comment-less main-sig-only acceptance.
+func VerifyManifest(pubKeyPath string, rawManifest []byte, sigPath string) error {
+	pub, err := readPublicKeyFile(pubKeyPath)
+	if err != nil {
+		return err
+	}
+	return verifyMinisignBytes(pub, sigPath, rawManifest)
 }
 
 // readPublicKeyFile parses a minisign public key file into its 32-byte

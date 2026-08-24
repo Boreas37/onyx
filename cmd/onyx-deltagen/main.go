@@ -9,7 +9,9 @@
 //
 // Both inputs are uncompressed feed JSON files; the delta is written as a
 // gzipped JSON-lines document whose header carries the SHA-256 of the base
-// file exactly as passed here. Statistics are printed to stdout as JSON:
+// file exactly as passed here, plus the optional v2 semantic digest of the
+// new feed (result_semantic_sha256), which ApplyDelta verifies against the
+// reconstructed feed. Statistics are printed to stdout as JSON:
 //
 //	{"added":3,"removed":1,"updated":12,"base_records":38884,"result_records":38898}
 package main

@@ -60,29 +60,47 @@ type DeltaStats struct {
 //
 // Fields:
 //
-//	format         always "onyx-delta-v1"; rejects files that are not deltas.
-//	base_sha256    hex sha256 of the complete base (old) feed file; ApplyDelta
-//	               refuses to patch anything else, which pins the delta to an
-//	               exact base snapshot.
-//	result_records expected record count of the reconstructed feed; verified
-//	               after applying so truncation or corruption of either side
-//	               is detected even when every individual op parses.
-//	records        number of operation lines that follow the header; also
-//	               verified during application.
+//	format                 always "onyx-delta-v1"; rejects files that are
+//	                       not deltas. The format string is intentionally
+//	                       NOT bumped for the optional digest field below —
+//	                       v1 files with the field absent (or present) must
+//	                       keep applying, and ApplyDelta treats the field as
+//	                       optional either way.
+//	base_sha256            hex sha256 of the complete base (old) feed file;
+//	                       ApplyDelta refuses to patch anything else, which
+//	                       pins the delta to an exact base snapshot.
+//	result_records         expected record count of the reconstructed feed;
+//	                       verified after applying so truncation or
+//	                       corruption of either side is detected even when
+//	                       every individual op parses.
+//	records                number of operation lines that follow the header;
+//	                       also verified during application.
+//	result_semantic_sha256 OPTIONAL (delta-v2) hex sha256 of the canonical
+//	                       semantic digest of the feed the delta was
+//	                       generated from (see semanticFeedDigest). Absent
+//	                       in v1 files; ApplyDelta verifies the
+//	                       reconstructed output against it when present and
+//	                       skips the check when absent.
 //
-// Note on integrity: there is deliberately no result_sha256 field whose
-// equality is enforced after applying. A delta application cannot
-// reproduce the upstream byte layout — untouched records keep their base
-// ordering while adds and updates are appended — so the result is only
-// semantically equal to the new feed, never byte-identical. Structural
-// verification (record counts + every op applied cleanly) plus the pinned
-// base hash give equivalent corruption detection without a false promise
-// of byte equality.
+// Note on integrity: structural verification (record counts + every op
+// applied cleanly) plus the pinned base hash catch truncation and most
+// corruption, but they cannot catch an op whose record bytes were rewritten
+// while the counts stay valid. result_semantic_sha256 closes that gap
+// whenever the generating tool emits it: the digest covers every record's
+// compacted content keyed by id, sorted by id, so any content change —
+// including a rewritten op record — changes it. It is a SEMANTIC digest,
+// not a byte hash: there is deliberately no result byte hash, because an
+// application cannot reproduce the upstream byte layout — untouched records
+// keep their base ordering while adds and updates are appended — so the
+// result is only semantically equal to the new feed, never byte-identical.
+// The digest is defined over sorted records precisely so it is insensitive
+// to record order and whitespace.
 type deltaHeader struct {
-	Format        string `json:"format"`
-	BaseSHA256    string `json:"base_sha256"`
-	ResultRecords int    `json:"result_records"`
-	Records       int    `json:"records"`
+	Format               string `json:"format"`
+	BaseSHA256           string `json:"base_sha256"`
+	ResultRecords        int    `json:"result_records"`
+	Records              int    `json:"records"`
+	ResultSemanticSHA256 string `json:"result_semantic_sha256,omitempty"`
 }
 
 // deltaOp is one JSON-lines operation record.
@@ -116,6 +134,14 @@ type deltaOp struct {
 // file) because diffing needs random access by UUID; the new feed is only
 // ever touched one record at a time. This matches the memory profile of
 // db.Load, which also materialises every record.
+//
+// The delta header carries result_semantic_sha256: the canonical semantic
+// digest of the NEW feed (see semanticFeedDigest), computed from newPath
+// after the streaming diff, so ApplyDelta can verify the reconstructed
+// feed's content — not just its shape. Computing it re-opens newPath; a
+// feed mutated between the diff pass and the digest pass would produce a
+// header whose digest matches neither version, which ApplyDelta then
+// rejects.
 //
 // Edge cases: an empty (or whitespace-only) feed file is treated as zero
 // records, so generating against an empty old file yields all-adds and
@@ -164,11 +190,17 @@ func GenerateDelta(oldPath, newPath string, outPath string) (DeltaStats, error) 
 	}
 	stats.ResultRecords = stats.BaseRecords + stats.Added - stats.Removed
 
+	digest, err := semanticFeedDigest(newPath)
+	if err != nil {
+		return stats, fmt.Errorf("digesting new feed: %w", err)
+	}
+
 	header := deltaHeader{
-		Format:        DeltaFormat,
-		BaseSHA256:    baseSHA,
-		ResultRecords: stats.ResultRecords,
-		Records:       len(ops),
+		Format:               DeltaFormat,
+		BaseSHA256:           baseSHA,
+		ResultRecords:        stats.ResultRecords,
+		Records:              len(ops),
+		ResultSemanticSHA256: digest,
 	}
 	if err := writeFileAtomic(outPath, func(w io.Writer) error {
 		gz := gzip.NewWriter(w)
@@ -201,7 +233,15 @@ func GenerateDelta(oldPath, newPath string, outPath string) (DeltaStats, error) 
 //   - every operation must apply cleanly: update/remove ids must exist in
 //     the base, add ids must not, and no id may appear twice among the
 //     operations;
-//   - the reconstructed record count must equal header.result_records.
+//   - the reconstructed record count must equal header.result_records;
+//   - when the header carries result_semantic_sha256, the canonical
+//     semantic digest of the reconstructed feed (see semanticFeedDigest)
+//     must equal it. This catches content corruption that survives the
+//     structural checks — e.g. a record's bytes rewritten inside an op
+//     while counts stay valid. The check runs after the atomic write
+//     completes; on mismatch the output file is removed, so a rejected
+//     delta leaves nothing behind. v1 deltas without the field skip the
+//     check entirely (backward compatible).
 //
 // Untouched records are copied verbatim — their exact raw JSON bytes from
 // the base file, not a re-encoding — so unchanged records survive a
@@ -378,6 +418,24 @@ func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 		return stats, fmt.Errorf("result record count mismatch: got %d, want %d",
 			stats.ResultRecords, header.ResultRecords)
 	}
+
+	// Delta-v2 integrity check: when the header advertises a semantic
+	// digest, verify the reconstructed feed's content — not just its
+	// shape — against it. A mismatch means some op's record bytes were
+	// corrupted or forged in a way the structural checks cannot see; the
+	// output is removed so a rejected delta leaves nothing behind. v1
+	// deltas carry no digest and skip this entirely.
+	if header.ResultSemanticSHA256 != "" {
+		got, err := semanticFeedDigest(outPath)
+		if err != nil {
+			return stats, fmt.Errorf("digesting result feed: %w", err)
+		}
+		if got != header.ResultSemanticSHA256 {
+			os.Remove(outPath)
+			return stats, fmt.Errorf("result feed semantic digest mismatch: got %s, want %s",
+				got, header.ResultSemanticSHA256)
+		}
+	}
 	return stats, nil
 }
 
@@ -464,6 +522,45 @@ func compactJSON(raw json.RawMessage) []byte {
 		return raw
 	}
 	return buf.Bytes()
+}
+
+// semanticFeedDigest returns the hex sha256 of the canonical semantic
+// digest of the feed at path: for every record sorted by id, the bytes
+//
+//	id + "\x00" + json.Compact(record) + "\n"
+//
+// hashed in that order. The digest is order-insensitive by construction
+// (records are sorted by id) and whitespace-insensitive (records are
+// compacted), so it changes if and only if some record's content changes.
+// ApplyDelta verifies a reconstructed feed against the digest its delta's
+// header advertises; the sorted-and-compacted definition exists precisely
+// because the reconstructed feed's byte layout differs from the source's
+// (see deltaHeader).
+//
+// Memory: the compacted records of the whole feed are held in memory to
+// enable the id sort — the same profile as loadFeed, which GenerateDelta
+// already uses, so this does not change the package's memory envelope.
+func semanticFeedDigest(path string) (string, error) {
+	recs := make(map[string][]byte)
+	if err := streamFeed(path, func(id string, raw json.RawMessage) error {
+		recs[id] = compactJSON(raw)
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	ids := make([]string, 0, len(recs))
+	for id := range recs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	h := sha256.New()
+	for _, id := range ids {
+		io.WriteString(h, id)
+		h.Write([]byte{0})
+		h.Write(recs[id])
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // fileSHA256 streams path through crypto/sha256 and returns the hex

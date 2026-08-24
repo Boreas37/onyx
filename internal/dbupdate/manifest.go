@@ -80,10 +80,15 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	return &m, nil
 }
 
-// FetchManifest GETs url and decodes the Manifest document. A nil client
-// gets a default one with a 30s timeout. Any non-200 status or malformed
-// body is an error; the response body is size-capped defensively.
-func FetchManifest(client *http.Client, url string) (*Manifest, error) {
+// FetchManifestRaw GETs url and returns the raw manifest bytes, subject to
+// the same size cap and error handling as FetchManifest. It is the
+// transport layer that FetchManifest builds on, exported so callers that
+// want to verify the manifest's signature (VerifyManifest) or cache its
+// raw body can fetch exactly the bytes that were advertised without a
+// parse-then-re-encode round trip. A nil client gets a default one with a
+// 30s timeout; any non-200 status is an error and the response body is
+// size-capped defensively.
+func FetchManifestRaw(client *http.Client, url string) ([]byte, error) {
 	if client == nil {
 		client = &http.Client{Timeout: DefaultManifestTimeout}
 	}
@@ -98,6 +103,18 @@ func FetchManifest(client *http.Client, url string) (*Manifest, error) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize))
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
+	}
+	return body, nil
+}
+
+// FetchManifest GETs url and decodes the Manifest document. It is the raw
+// fetch of FetchManifestRaw followed by ParseManifest; a nil client gets a
+// default one with a 30s timeout. Any non-200 status or malformed body is
+// an error; the response body is size-capped defensively.
+func FetchManifest(client *http.Client, url string) (*Manifest, error) {
+	body, err := FetchManifestRaw(client, url)
+	if err != nil {
+		return nil, err
 	}
 	return ParseManifest(body)
 }
