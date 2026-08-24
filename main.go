@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	onyxVersion     = "0.7.0"
+	onyxVersion     = "0.8.0"
 	defaultDB       = "data/wordfence.json"
 	feedProduction  = "production"
 	feedScanner     = "scanner"
@@ -222,6 +222,8 @@ type scanOptions struct {
 	popularFile          string
 	popularThemes        bool
 	wpVersion            string
+	disableTLSChecks     bool
+	updateDB             bool
 	failOnRateLimited    bool
 	nucleiMinSeverity    string
 	outputs              []string
@@ -447,6 +449,10 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--wp-version" && i+1 < len(args):
 			i++
 			o.wpVersion = args[i]
+		case a == "--disable-tls-checks":
+			o.disableTLSChecks = true
+		case a == "--update-db":
+			o.updateDB = true
 		case a == "--no-discover-404":
 			o.discover404 = false
 		case a == "--fail-on-rate-limited":
@@ -470,7 +476,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 				}
 				switch f {
 				case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx",
-					"markdown", "md", "html", "junit":
+					"markdown", "md", "html", "junit", "gitlab-sast":
 				default:
 					fmt.Fprintf(os.Stderr, "error: invalid --outputs format %q\n", f)
 					os.Exit(2)
@@ -618,9 +624,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	}
 	switch o.format {
 	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx",
-		"markdown", "md", "html", "junit":
+		"markdown", "md", "html", "junit", "gitlab-sast":
 	default:
-		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif, csv, cyclonedx, markdown, html or junit)\n", o.format)
+		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif, csv, cyclonedx, markdown, html, junit or gitlab-sast)\n", o.format)
 		os.Exit(2)
 	}
 	if o.targetsFile != "" {
@@ -878,7 +884,7 @@ Scan flags:
   --db PATH          database file (default: %s)
   --threads N        concurrent requests (default: 5)
   --timeout S        per-request timeout in seconds (default: 10)
-  --format F         output format: table, cli-no-colour, json, jsonl, sarif, csv (default: table)
+  --format F         output format: table, cli-no-colour, json, jsonl, sarif, csv, cyclonedx, md, html, junit, gitlab-sast (default: table)
   --json             print results as JSON (same as --format json)
   --api              only query the REST API, skip brute-force enumeration
   --stealth          one request per second
@@ -944,6 +950,8 @@ Scan flags:
   --jobs N           scan -T/extra targets with up to N concurrent scans (default: 1)
   --no-discover-404  do not probe a nonexistent path for plugin/theme references
   --fail-on-rate-limited  exit 4 when the target's 429 throttling cut the scan short
+  --disable-tls-checks    skip TLS certificate verification (MITM proxies)
+  --update-db             refresh a database older than 14 days before scanning
   --nuclei-min-severity S  only run nuclei templates of S or worse (critical|high|medium|low|info)
   --outputs LIST     write extra copies of the report (comma list of formats)
   --config FILE      JSON config file; explicit CLI flags win over config values
@@ -1012,6 +1020,16 @@ func runScan(target string, o scanOptions) int {
 		if err := update(o.dbPath, feedProduction, false); err != nil {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
 			return 2
+		}
+	} else if o.updateDB && !o.noUpdate {
+		// --update-db: refresh a stale database (older than 14 days)
+		// before scanning. Network failures degrade to a warning — the
+		// existing data still gets scanned.
+		if days := dbAgeDays(o.dbPath); days > 14 {
+			fmt.Fprintf(os.Stderr, "database is %d days old — refreshing...\n", days)
+			if err := update(o.dbPath, feedProduction, false); err != nil {
+				fmt.Fprintln(os.Stderr, "[WARN] update failed (scanning with existing data):", err)
+			}
 		}
 	}
 
@@ -1171,6 +1189,8 @@ func runScan(target string, o scanOptions) int {
 		report.PrintHTML(res)
 	case "junit":
 		report.PrintJUnit(onyxVersion, res)
+	case "gitlab-sast":
+		report.PrintGitLabSAST(res)
 	case "cli-no-colour":
 		report.NoColor = true
 		report.PrintTable(res, o.verbose, o.minSeverity)
@@ -1371,6 +1391,8 @@ func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Op
 		PopularFile:          o.popularFile,
 		PopularThemes:        o.popularThemes,
 		CoreVersionOverride:  o.wpVersion,
+		InsecureTLS:          o.disableTLSChecks,
+		MediaIDs:             mediaIDsFor(o.enumerate),
 		BasicAuthUser:        o.basicAuthUser,
 		BasicAuthPass:        o.basicAuthPass,
 		Cookie:               o.cookie,
@@ -1739,6 +1761,10 @@ func writeScanOutput(path string, res *scanner.Result, format string) error {
 		var buf bytes.Buffer
 		report.WriteCycloneDX(&buf, onyxVersion, res)
 		out = buf.Bytes()
+	case "gitlab-sast":
+		var buf bytes.Buffer
+		report.WriteGitLabSAST(&buf, res)
+		out = buf.Bytes()
 	case "jsonl":
 		var buf bytes.Buffer
 		report.WriteJSONL(&buf, res)
@@ -1779,6 +1805,9 @@ func writeFormatTo(w io.Writer, format string, res *scanner.Result) error {
 		return report.WriteHTML(w, res)
 	case "junit":
 		return report.WriteJUnit(w, onyxVersion, res)
+	case "gitlab-sast":
+		report.WriteGitLabSAST(w, res)
+		return nil
 	}
 	j, err := json.MarshalIndent(res, "", "  ")
 	if err != nil {
@@ -2356,4 +2385,13 @@ func downloadFeed(url string, gz bool, out io.Writer) (string, error) {
 	// contributes to the digest.
 	_, _ = io.Copy(io.Discard, raw) // intentional drain; errors surface via the digest check
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// mediaIDsFor returns the attachment-ID probe cap for the "m" enumerate
+// token: 15 by default, 0 (legacy presence-only) when media is disabled.
+func mediaIDsFor(enum string) int {
+	if strings.Contains(enum, "m") {
+		return 15
+	}
+	return 0
 }
