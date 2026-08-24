@@ -65,35 +65,42 @@ var authorSlugRe = regexp.MustCompile(`(?:^|/)author/([^/?#]+)`)
 
 // Options tunes the scan behaviour. Zero values fall back to defaults.
 type Options struct {
-	Threads             int           // concurrent HTTP requests (default 5)
-	Timeout             time.Duration // per-request timeout (default 10s, alias for RequestTimeout)
-	Stealth             bool          // throttle to 1 request/second
-	RateLimit           float64       // max requests per second (0 = unlimited)
-	APIOnly             bool          // skip brute-force enumeration, only wp-json/plugins
-	MaxRequests         int           // cap on brute-force enumeration requests (default 500)
-	Enumerate           string        // what to enumerate: u/p/t, combinable (default "pt")
-	UserAgent           string        // custom User-Agent for all requests
-	RandomUA            bool          // pick a random browser User-Agent per request
-	DetectionMode       string        // passive (homepage only), aggressive (DB only), mixed (default)
-	Proxy               string        // http://, https://, socks5:// or socks5h:// proxy URL
-	ProxyAuth           string        // --proxy-auth USER:PASS for SOCKS5 proxies (RFC 1929)
-	ProxyTargetOnly     bool          // --proxy-target-only: use the proxy only for target-host traffic
-	TLSFingerprint      string        // --tls-fingerprint: chrome | firefox | random (TLSClientConfig variations)
-	PerHostRateLimit    float64       // --per-host-rate-limit N: per-host requests per second (0 = off)
-	NoXMLRPC            bool          // skip the XML-RPC (xmlrpc.php) ping check
-	Checks              string        // extra checks: cb (config backups), dbe (db exports), comma-separated
-	ConnectTimeout      time.Duration // TCP dial timeout (default 10s)
-	RequestTimeout      time.Duration // per-request timeout (default 10s)
-	ContentDir          string        // wp-content directory (default "wp-content")
-	PluginsDir          string        // plugins directory (default "wp-content/plugins")
-	ExcludeContentBased string        // regex; matching homepage HTML aborts the scan
-	Scope               string        // regex; a non-matching target URL is out of scope
-	PluginsList         string        // file with plugin slugs (one per line, # comments)
-	ThemesList          string        // file with theme slugs (one per line, # comments)
-	MaxScanDuration     time.Duration // hard stop for the whole scan; 0 = unlimited
-	CacheTTL            time.Duration // HTTP response cache TTL; 0 = off
-	CrawlPages          int           // --crawl-pages N: passively crawl up to N sitemap pages (0 = disabled)
-	Findings            chan Finding  // when set, every finding is emitted live
+	Threads             int               // concurrent HTTP requests (default 5)
+	Timeout             time.Duration     // per-request timeout (default 10s, alias for RequestTimeout)
+	Stealth             bool              // throttle to 1 request/second
+	RateLimit           float64           // max requests per second (0 = unlimited)
+	APIOnly             bool              // skip brute-force enumeration, only wp-json/plugins
+	MaxRequests         int               // cap on brute-force enumeration requests (default 500)
+	Enumerate           string            // what to enumerate: u/p/t, combinable (default "pt")
+	UserAgent           string            // custom User-Agent for all requests
+	RandomUA            bool              // pick a random browser User-Agent per request
+	BasicAuthUser       string            // HTTP Basic auth username sent on every request (--basic-auth USER:PASS)
+	BasicAuthPass       string            // HTTP Basic auth password sent on every request
+	Cookie              string            // static Cookie header sent on every request (--cookie)
+	Headers             map[string]string // extra request headers sent on every request (--headers k=v,..)
+	VHost               string            // Host header override for every request (--vhost)
+	Force               bool              // --force: scan on even without WordPress fingerprints
+	ExcludeVulns        []string          // --exclude-vulns: vulnerability IDs to skip entirely (case-sensitive)
+	DetectionMode       string            // passive (homepage only), aggressive (DB only), mixed (default)
+	Proxy               string            // http://, https://, socks5:// or socks5h:// proxy URL
+	ProxyAuth           string            // --proxy-auth USER:PASS for SOCKS5 proxies (RFC 1929)
+	ProxyTargetOnly     bool              // --proxy-target-only: use the proxy only for target-host traffic
+	TLSFingerprint      string            // --tls-fingerprint: chrome | firefox | random (TLSClientConfig variations)
+	PerHostRateLimit    float64           // --per-host-rate-limit N: per-host requests per second (0 = off)
+	NoXMLRPC            bool              // skip the XML-RPC (xmlrpc.php) ping check
+	Checks              string            // extra checks: cb (config backups), dbe (db exports), comma-separated
+	ConnectTimeout      time.Duration     // TCP dial timeout (default 10s)
+	RequestTimeout      time.Duration     // per-request timeout (default 10s)
+	ContentDir          string            // wp-content directory (default "wp-content")
+	PluginsDir          string            // plugins directory (default "wp-content/plugins")
+	ExcludeContentBased string            // regex; matching homepage HTML aborts the scan
+	Scope               string            // regex; a non-matching target URL is out of scope
+	PluginsList         string            // file with plugin slugs (one per line, # comments)
+	ThemesList          string            // file with theme slugs (one per line, # comments)
+	MaxScanDuration     time.Duration     // hard stop for the whole scan; 0 = unlimited
+	CacheTTL            time.Duration     // HTTP response cache TTL; 0 = off
+	CrawlPages          int               // --crawl-pages N: passively crawl up to N sitemap pages (0 = disabled)
+	Findings            chan Finding      // when set, every finding is emitted live
 
 	PasswordsFile string // --passwords FILE: wordlist for the wp-login brute force (one per line)
 	UsernamesFile string // --usernames FILE: wordlist for brute-force attacks (one per line)
@@ -108,6 +115,11 @@ type Options struct {
 	// ("{"files": {path: {md5hex: [versions]}}}") used as a final core
 	// version fallback when meta/RSS/OPML sources all fail. A missing or
 	// unparseable table is silently skipped. Disabled when empty.
+	// Context, when set, overrides the scan-wide context used by
+	// requestCtx() (signal-based cancellation etc.). MaxScanDuration
+	// takes precedence when both are set.
+	Context context.Context
+
 	FingerprintDB string
 	// PopularSlugs appends the static popular plugin/theme slug seed lists
 	// (popular.go) to aggressive enumeration after the DB top-slug list.
@@ -332,6 +344,44 @@ func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if ua != "" {
 		req = req.Clone(req.Context())
 		req.Header.Set("User-Agent", ua)
+	}
+	return t.base.RoundTrip(req)
+}
+
+// headerTransport stamps the per-scan request decorations onto every
+// outbound request: HTTP Basic auth credentials, a static Cookie header,
+// arbitrary custom headers and a Host header override. It composes with
+// uaTransport (this wrapper sits outside it), so the User-Agent and all the
+// decorations land on the same request. Empty option values leave the
+// corresponding field of the cloned request untouched, so decoration is a
+// no-op when nothing is configured.
+type headerTransport struct {
+	base      http.RoundTripper
+	basicUser string
+	basicPass string
+	cookie    string
+	headers   map[string]string
+	vhost     string
+}
+
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.basicUser != "" {
+		req = req.Clone(req.Context())
+		req.SetBasicAuth(t.basicUser, t.basicPass)
+	}
+	if t.cookie != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set("Cookie", t.cookie)
+	}
+	if len(t.headers) > 0 {
+		req = req.Clone(req.Context())
+		for k, v := range t.headers {
+			req.Header.Set(k, v)
+		}
+	}
+	if t.vhost != "" {
+		req = req.Clone(req.Context())
+		req.Host = t.vhost
 	}
 	return t.base.RoundTrip(req)
 }
@@ -626,6 +676,20 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 			randomUA:  opts.RandomUA,
 		}
 	}
+	// Per-scan request decoration (--basic-auth, --cookie, --headers,
+	// --vhost): wraps the UA transport so the User-Agent and every
+	// decoration land on the same request. Skipped entirely when nothing
+	// is configured, preserving the historical transport.
+	if opts.BasicAuthUser != "" || opts.Cookie != "" || len(opts.Headers) > 0 || opts.VHost != "" {
+		client.Transport = &headerTransport{
+			base:      client.Transport,
+			basicUser: opts.BasicAuthUser,
+			basicPass: opts.BasicAuthPass,
+			cookie:    opts.Cookie,
+			headers:   opts.Headers,
+			vhost:     opts.VHost,
+		}
+	}
 	s := &Scanner{
 		db:          database,
 		base:        strings.TrimRight(base, "/"),
@@ -776,6 +840,7 @@ const (
 	confMetaGenerator   = 90 // core generator meta tag
 	confRSSGenerator    = 85 // core RSS feed generator element
 	confOPMLGenerator   = 80 // core wp-links-opml.php generator attribute
+	confAssetVer        = 70 // core asset ?ver= cache-buster (wp-emoji-release etc.)
 	confPassiveVer      = 60 // passive asset ?ver= query string
 	confREST            = 100
 	confAuthREST        = 100
@@ -870,9 +935,10 @@ type Detected struct {
 
 // CoreEvidence records one WordPress core version observation together with
 // the source that produced it: "meta" (generator meta tag), "rss" (feed
-// generator element), "opml" (wp-links-opml.php generator attribute) or
-// "fingerprint" (core asset md5 table). Confidence carries the same 0..100
-// reliability score used by Detected.
+// generator element), "opml" (wp-links-opml.php generator attribute),
+// "asset-ver" (core-released asset ?ver= cache-buster) or "fingerprint"
+// (core asset md5 table). Confidence carries the same 0..100 reliability
+// score used by Detected.
 type CoreEvidence struct {
 	Source     string `json:"source"`
 	Version    string `json:"version"`
@@ -895,6 +961,9 @@ type Vulnerability struct {
 	// Kev reports whether the CVE is listed in the CISA Known Exploited
 	// Vulnerabilities catalog; omitted when false.
 	Kev bool `json:"kev,omitempty"`
+	// CVSSVector is the raw CVSS vector string from the feed record
+	// (e.g. "CVSS:3.1/AV:N/AC:L/..."); omitted when unknown.
+	CVSSVector string `json:"cvss_vector,omitempty"`
 	// Remediation is the human-readable fix guidance from the feed
 	// (e.g. "Update the plugin to version X or newer"); omitted when
 	// the record carries none.
@@ -957,7 +1026,8 @@ type Result struct {
 	Nuclei           []nuclei.NucleiResult `json:"nuclei,omitempty"`
 	PoCs             []pocs.PoCLink        `json:"pocs,omitempty"`
 	Users            []User                `json:"users,omitempty"`
-	XMLRPC           bool                  `json:"xmlrpc,omitempty"` // xmlrpc.php ping answered
+	XMLRPC           bool                  `json:"xmlrpc,omitempty"`          // xmlrpc.php ping answered
+	XMLRPCPingback   bool                  `json:"xmlrpc_pingback,omitempty"` // pingback.ping exposed (SSRF amplification)
 	Interesting      []string              `json:"interesting,omitempty"`
 	ConfigBackups    []string              `json:"config_backups,omitempty"`
 	DBExports        []string              `json:"db_exports,omitempty"`
@@ -1290,11 +1360,15 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	return http.StatusTooManyRequests, nil, nil, nil
 }
 
-// requestCtx returns the scan-wide context (--max-scan-duration), or a
-// background context when no duration was configured.
+// requestCtx returns the scan-wide context: the MaxScanDuration context
+// wins when set, otherwise Options.Context (signal-based cancellation),
+// otherwise a background context.
 func (s *Scanner) requestCtx() context.Context {
 	if s.ctx != nil {
 		return s.ctx
+	}
+	if s.opts.Context != nil {
+		return s.opts.Context
 	}
 	return context.Background()
 }
@@ -1350,27 +1424,31 @@ func (s *Scanner) cacheGet(u string) (int, []byte, bool) {
 // body may be empty for negative responses. Failures are silent: the cache
 // is an optimization, never a scan error.
 func (s *Scanner) cachePut(u string, code int, body []byte) {
-	if err := os.MkdirAll(s.cacheDir, 0o755); err != nil {
+	// 0700/0600: cached responses can contain target page content and
+	// should not be world-readable.
+	if err := os.MkdirAll(s.cacheDir, 0o700); err != nil {
 		return
 	}
 	data := make([]byte, 0, len(body)+16)
 	data = append(data, fmt.Sprintf("HTTP %d\n", code)...)
 	data = append(data, body...)
-	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), data, 0o644)
+	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), data, 0o600)
 }
 
 // checkXMLRPC pings POST /xmlrpc.php with a system.listMethods call and
-// reports whether the server answered with a methodResponse payload. The
-// request shares the scan-wide pacing: 429 cooldown gate, adaptive send
-// slot and the request counter.
-func (s *Scanner) checkXMLRPC() bool {
+// reports whether the server answered with a methodResponse payload
+// (enabled) and, separately, whether that payload exposes the pingback.ping
+// method (pingback) — the SSRF amplification primitive. The request shares
+// the scan-wide pacing: 429 cooldown gate, adaptive send slot and the
+// request counter.
+func (s *Scanner) checkXMLRPC() (enabled bool, pingback bool) {
 	s.lim.wait()
 	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
 	u := s.base + "/xmlrpc.php"
 	s.perHostWait(u)
 	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodPost, u, strings.NewReader(payload))
 	if err != nil {
-		return false
+		return false, false
 	}
 	req.Header.Set("Content-Type", "text/xml")
 	s.rateLimitGate()
@@ -1378,17 +1456,21 @@ func (s *Scanner) checkXMLRPC() bool {
 	s.requests.Add(1)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false
+		return false, false
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	if err != nil {
-		return false
+		return false, false
 	}
-	return strings.Contains(string(body), "methodResponse")
+	enabled = strings.Contains(string(body), "methodResponse")
+	if enabled {
+		pingback = strings.Contains(strings.ToLower(string(body)), "pingback.ping")
+	}
+	return enabled, pingback
 }
 
 // Response-authenticity helpers.
@@ -1763,10 +1845,12 @@ func normalizeUsers(lists ...[]User) []User {
 // evidence. wp-login/wp-json fetch errors are secondary and stay silent.
 //
 // The core version comes from the first source that answers, tried in
-// order: generator meta tag → RSS feed generator element (/?feed=rss2,
-// then /feed/) → wp-links-opml.php generator attribute. The RSS/OPML
-// fetches only run when the meta tag did not yield a version, keeping the
-// request count low; whichever source wins is recorded in s.coreEvidence.
+// order: generator meta tag → RSS/Atom feed generator element (/?feed=rss2,
+// then /feed/, then /feed/atom) → wp-links-opml.php generator attribute →
+// core-released asset ?ver= cache-buster → optional --fingerprint-db md5
+// table. The fallback fetches only run when the meta tag did not yield a
+// version, keeping the request count low; whichever source wins is recorded
+// in s.coreEvidence.
 func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr error) {
 	code, body, err := s.fetch("/")
 	if err != nil {
@@ -1792,9 +1876,12 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 	}
 
 	// Multi-source fallbacks, cheapest-first. Each stops the chain as soon
-	// as it produces a version.
+	// as it produces a version. The /feed/atom candidate is included
+	// because WordPress emits the same wordpress.org/?v= generator URL in
+	// its Atom feeds, which the /?feed=rss2 and /feed/ paths may be
+	// stripped or cached without.
 	if coreVersion == "" {
-		for _, path := range []string{"/?feed=rss2", "/feed/"} {
+		for _, path := range []string{"/?feed=rss2", "/feed/", "/feed/atom"} {
 			code, body, err := s.fetch(path)
 			if err != nil || code != http.StatusOK {
 				continue
@@ -1814,6 +1901,17 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 				evidence = append(evidence, "wp-links-opml.php generator (WordPress "+v+")")
 				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "opml", Version: v, Confidence: confOPMLGenerator})
 			}
+		}
+	}
+	// Core-released asset ?ver= fallback: some hardened sites strip the
+	// generator meta tag and feeds but still serve core assets whose ?ver=
+	// cache-buster tracks the core version. Only consulted when the
+	// homepage carried asset references and every cheaper source failed.
+	if coreVersion == "" && s.homepage != "" {
+		if v, ok := ExtractCoreVersionFromAssets(s.homepage); ok {
+			coreVersion = v
+			evidence = append(evidence, "core asset ?ver= (WordPress "+v+")")
+			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "asset-ver", Version: v, Confidence: confAssetVer})
 		}
 	}
 
@@ -2125,7 +2223,9 @@ func (s *Scanner) popularSeedLists() (plugins, themes []string) {
 // positives. The finding's display name comes from the database (NameFor)
 // when the slug is known, falling back to the slug itself; the first
 // matching software entry per record also supplies its Remediation and
-// PatchedVersions into the emitted vulnerability.
+// PatchedVersions into the emitted vulnerability. Records whose ID appears
+// in s.opts.ExcludeVulns (--exclude-vulns) are skipped entirely before any
+// range matching, as are the CVSS vector strings they carry.
 func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 	f := Finding{Slug: slug, Name: slug, Type: typ, InstalledVersion: rawVersion}
 	if name := s.db.NameFor(slug); name != "" {
@@ -2136,8 +2236,18 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 		return f
 	}
 	recs := s.db.Lookup(slug)
+	// --exclude-vulns: drop excluded record IDs before any matching. The
+	// set is rebuilt per call; matchDatabase is only ever invoked once per
+	// detected component, so the map churn is negligible.
+	excluded := make(map[string]bool, len(s.opts.ExcludeVulns))
+	for _, id := range s.opts.ExcludeVulns {
+		excluded[id] = true
+	}
 	seen := make(map[string]bool, len(recs))
 	for _, rec := range recs {
+		if excluded[rec.ID] {
+			continue
+		}
 		for si := range rec.Software {
 			sw := &rec.Software[si]
 			if sw.Slug != slug {
@@ -2157,6 +2267,7 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 					CVE:             rec.CVE,
 					CVSSScore:       rec.CVSS.Score,
 					Rating:          rec.CVSS.Rating,
+					CVSSVector:      rec.CVSS.Vector,
 					Description:     rec.Description,
 					PublishedAt:     rec.PublishedAt,
 					AffectedLabels:  []string{label},
@@ -2422,12 +2533,21 @@ func (s *Scanner) Scan() (*Result, error) {
 	res.Evidence = evidence
 	res.IsWordPress = coreVersion != "" || len(evidence) > 0
 	if !res.IsWordPress {
-		res.Errors = append(res.Errors, ErrNotWordPress.Error())
-		s.buildSummary(res, scanStart)
-		if pr != nil {
-			pr.LogInf("target %s does not appear to be WordPress", s.base)
+		if !s.opts.Force {
+			res.Errors = append(res.Errors, ErrNotWordPress.Error())
+			s.buildSummary(res, scanStart)
+			if pr != nil {
+				pr.LogInf("target %s does not appear to be WordPress", s.base)
+			}
+			return res, ErrNotWordPress
 		}
-		return res, ErrNotWordPress
+		// --force: skip the WordPress-look gate and scan anyway. The core
+		// version stays empty and IsWordPress stays false, but every
+		// downstream step (interesting finders, enumeration, matching)
+		// runs normally on the collected evidence.
+		if pr != nil {
+			pr.LogInf("--force: continuing without WordPress fingerprints")
+		}
 	}
 	res.WordPressVersion = coreVersion
 	res.CoreEvidence = s.coreEvidence
@@ -2453,11 +2573,20 @@ func (s *Scanner) Scan() (*Result, error) {
 		res.Interesting = append(res.Interesting, "media uploads present")
 	}
 
-	// XML-RPC ping check (skip with --no-xmlrpc).
-	if !s.opts.NoXMLRPC && s.checkXMLRPC() {
-		res.XMLRPC = true
-		if pr != nil {
-			pr.LogInf("XML-RPC is enabled (xmlrpc.php responded)")
+	// XML-RPC ping check (skip with --no-xmlrpc). A positive ping also
+	// reports whether the method list exposes pingback.ping, the SSRF
+	// amplification primitive.
+	if !s.opts.NoXMLRPC {
+		xmlrpcOK, pingback := s.checkXMLRPC()
+		if xmlrpcOK {
+			res.XMLRPC = true
+			if pr != nil {
+				pr.LogInf("XML-RPC is enabled (xmlrpc.php responded)")
+			}
+			if pingback {
+				res.XMLRPCPingback = true
+				res.Interesting = append(res.Interesting, "XML-RPC pingback enabled (SSRF amplification risk)")
+			}
 		}
 	}
 

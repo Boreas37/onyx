@@ -256,6 +256,25 @@ func ExtractOPMLVersion(body string) (version string, found bool) {
 	return sanitizeVersion(m[1]), true
 }
 
+// coreAssetVerRe matches the ?ver= cache-buster WordPress appends to core
+// asset files it ships with every release: wp-emoji-release.min.js,
+// wp-embed.js, wp-util.js and wp-a11y.js (the js/ directory prefix covers
+// older releases that kept them under wp-includes/js/). Because these files
+// are released together with core, their ?ver= tracks the core version even
+// when the generator meta tag and feeds are stripped or rewritten.
+var coreAssetVerRe = regexp.MustCompile(`(?i)wp-includes/(?:js/)?(?:wp-emoji-release\.min|wp-embed|wp-util|wp-a11y)\.js[^"']*\?ver=([0-9][0-9a-zA-Z.-]*)`)
+
+// ExtractCoreVersionFromAssets parses the WordPress core version from the
+// ?ver= query string on core-released asset references (see coreAssetVerRe).
+// found is false when no such asset reference carries a version.
+func ExtractCoreVersionFromAssets(html string) (version string, found bool) {
+	m := coreAssetVerRe.FindStringSubmatch(html)
+	if m == nil {
+		return "", false
+	}
+	return sanitizeVersion(m[1]), true
+}
+
 // ExtractPassiveVersions parses plugin and theme versions from asset URLs
 // in HTML: any wp-content/plugins/<slug>/...?ver=1.2.3 or
 // wp-content/themes/<slug>/...?ver=1.2.3 reference counts as evidence of
