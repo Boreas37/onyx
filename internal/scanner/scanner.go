@@ -127,6 +127,12 @@ type Options struct {
 	// fingerprint table) while still fetching the homepage normally for
 	// passive evidence. Empty when unused.
 	CoreVersionOverride string
+	// InsecureTLS disables TLS certificate verification (--disable-tls-
+	// checks; scanners behind MITM proxies).
+	InsecureTLS bool
+	// MediaIDs caps attachment-ID probing for the "m" enumerate token;
+	// 0 keeps the legacy homepage-presence check only.
+	MediaIDs int
 	// PopularSlugs appends the static popular plugin/theme slug seed lists
 	// (popular.go) to aggressive enumeration after the DB top-slug list.
 	// The CLI flag defaults it to true; building Options directly leaves
@@ -186,6 +192,13 @@ type Scanner struct {
 	sitemapThemes   []string          //
 	sitemapVersions map[string]string // slug -> ?ver= version from sitemap pages
 	sitemapRequests int               // HTTP requests spent on sitemap discovery
+
+	// restRoutePlugins holds the plugin slugs extracted from the wp-json
+	// route index during detectWP (Source "rest-routes", confidence 85).
+	// They join passive enumeration exactly like homepage references:
+	// buildJobs queues readme probes for them and mergePassiveDetections
+	// materializes them when no stronger detection pinned them already.
+	restRoutePlugins []string
 
 	rlMu          sync.Mutex // guards the rate-limit state below
 	rateHits      int        // count of 429 responses seen
@@ -278,7 +291,11 @@ var timthumbPaths = []string{
 }
 
 // timthumbFinder probes for an exposed TimThumb image-resizer copy: any of
-// timthumbPaths answering 200 with a body mentioning timthumb.
+// timthumbPaths answering 200 with a body mentioning timthumb. When the
+// body also carries a recognizable release marker (see
+// ExtractTimthumbVersion), the path is suffixed with the pinned version —
+// "(TimThumb X.Y.Z)" — so reports name the exact exposed copy; bodies
+// without a marker keep the bare path.
 func (s *Scanner) timthumbFinder() []string {
 	var found []string
 	for _, p := range timthumbPaths {
@@ -287,6 +304,9 @@ func (s *Scanner) timthumbFinder() []string {
 			continue
 		}
 		if strings.Contains(strings.ToLower(string(body)), "timthumb") {
+			if v, ok := ExtractTimthumbVersion(string(body)); ok {
+				p += " (TimThumb " + v + ")"
+			}
 			found = append(found, p)
 		}
 	}
@@ -646,15 +666,35 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	}
 	tr.DialContext = dialCtx
 
+	if opts.InsecureTLS {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{}
+		}
+		tr.TLSClientConfig.InsecureSkipVerify = true
+	}
+	// The fingerprint branches below REPLACE tr.TLSClientConfig wholesale,
+	// which would drop the InsecureSkipVerify flag set above. Each branch
+	// therefore re-applies it when InsecureTLS is on. The fingerprint
+	// table hands out shared (read-only-by-convention) configs, so the
+	// flag is set on a Clone — mutating the shared table would leak
+	// skip-verify into later scans of other targets.
+	applyInsecure := func(cfg *tls.Config) *tls.Config {
+		if !opts.InsecureTLS {
+			return cfg
+		}
+		cfg = cfg.Clone()
+		cfg.InsecureSkipVerify = true
+		return cfg
+	}
 	switch fingerprint {
 	case "chrome", "firefox":
-		tr.TLSClientConfig = tlsFingerprintConfig(fingerprint)
+		tr.TLSClientConfig = applyInsecure(tlsFingerprintConfig(fingerprint))
 	case "random":
 		if tr.Proxy != nil {
 			// Go's http.Transport refuses a custom TLS dialer when
 			// dialing through an HTTP proxy, so fall back to one random
 			// combination for the whole scan.
-			tr.TLSClientConfig = randomTLSFingerprint()
+			tr.TLSClientConfig = applyInsecure(randomTLSFingerprint())
 		} else {
 			// One fresh connection per request (keep-alives off), each
 			// handshaking with a randomly picked fingerprint.
@@ -663,7 +703,7 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 				if err != nil {
 					return nil, err
 				}
-				tc := tls.Client(conn, randomTLSFingerprint())
+				tc := tls.Client(conn, applyInsecure(randomTLSFingerprint()))
 				if err := tc.HandshakeContext(ctx); err != nil {
 					conn.Close()
 					return nil, err
@@ -871,6 +911,7 @@ const (
 	confPassiveVer      = 60 // passive asset ?ver= query string
 	confREST            = 100
 	confAuthREST        = 100
+	confRestRoutes      = 85 // plugin namespace from the wp-json route index
 	confFingerprint     = 85 // core asset md5 fingerprint table
 )
 
@@ -896,6 +937,8 @@ func sourceConfidence(source string) int {
 		return confPassiveVer
 	case "rest":
 		return confREST
+	case "rest-routes":
+		return confRestRoutes
 	case "auth-rest":
 		return confAuthREST
 	case "fingerprint":
@@ -942,7 +985,8 @@ func preferDetected(a, b Detected) bool {
 // "readme" (plugin readme.txt "Stable tag:" probe), "readme-changelog"
 // (plugin readme.txt Changelog section heading), "composer" (plugin
 // composer.json "version" field), "style.css" (theme stylesheet probe),
-// "rest" (unauthenticated wp-json listing), "auth-rest" (authenticated
+// "rest" (unauthenticated wp-json listing), "rest-routes" (plugin
+// namespace from the wp-json route index), "auth-rest" (authenticated
 // wp-json inventory) or "fingerprint" (core asset md5 table). Confidence is
 // the 0..100 reliability estimate assigned to the detection source (see
 // sourceConfidence); it is omitted from JSON output when zero.
@@ -1074,6 +1118,9 @@ type Result struct {
 	LoginBrutes      []LoginBrute `json:"login_brutes,omitempty"` // valid credentials found by brute force
 	AuthStatus       string       `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
 	Summary          *Summary     `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
+	// ScannedAt records when the scan finished (UTC); added in schema 1.0
+	// so saved results carry their own timestamp.
+	ScannedAt time.Time `json:"scanned_at"`
 	// SchemaVersion is the version of the Result JSON shape, so CI
 	// consumers can detect breaking output changes. "1.0" is the first
 	// versioned shape (onyx 0.5.0+); always present.
@@ -1479,8 +1526,9 @@ const maxXMLRPCMethods = 20
 // xmlrpcMethodRe matches one <string>NAME</string> element of a
 // system.listMethods response and captures the name. Only tokens made of
 // lowercase letters, digits, dots and underscores can look like method
-// names (matched case-insensitively); fault strings, blog names and other
-// prose never match the shape.
+// names (matched case-insensitively; real names like wp.getUsersBlogs
+// carry uppercase letters, which are kept verbatim); fault strings, blog
+// names and other prose never match the shape.
 var xmlrpcMethodRe = regexp.MustCompile(`(?i)<string>\s*([a-z0-9_.]+)\s*</string>`)
 
 // extractXMLRPCMethods parses the method names out of a system.listMethods
@@ -2029,6 +2077,17 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 	if code, body, err := s.fetch("/wp-json/"); err == nil && (code == 200 || code == 403) {
 		if len(body) > 0 && (body[0] == '{' || body[0] == '[') {
 			evidence = append(evidence, "wp-json REST API root responded")
+			// Route-based plugin detection: the route index is only ever
+			// served by the live install, so plugin namespaces registered
+			// there are strong presence evidence. Extracted slugs join the
+			// passive enumeration pool (buildJobs probes their readmes,
+			// mergePassiveDetections materializes them at confidence 85).
+			// A 200 body that fails to parse as routes/array shape yields
+			// no slugs; a 403 index (restricted) is evidence but not
+			// extractable.
+			if code == http.StatusOK {
+				s.restRoutePlugins = ExtractRESTRoutePlugins(body)
+			}
 		}
 	}
 	return coreVersion, evidence, nil
@@ -2180,6 +2239,22 @@ func (s *Scanner) buildJobs() []job {
 			seen["t:"+slug] = true
 			jobs = append(jobs, job{kind: "theme", slug: slug,
 				path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
+		}
+	}
+
+	// Passive detection via the wp-json route index: plugin namespaces
+	// extracted from the REST API root (Source "rest-routes", confidence
+	// 85) join the job list exactly like homepage references. The route
+	// index is served by the live install, so a namespace is strong
+	// presence evidence; the readme probe below pins the version.
+	if passive && len(s.restRoutePlugins) > 0 {
+		for _, slug := range s.restRoutePlugins {
+			if !s.enumeratePlugins() || seen["p:"+slug] {
+				continue
+			}
+			seen["p:"+slug] = true
+			jobs = append(jobs, job{kind: "plugin", slug: slug,
+				path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
 		}
 	}
 
@@ -2524,7 +2599,11 @@ func (s *Scanner) fetchHeaders(path string) (int, http.Header, []byte, error) {
 // readme.txt/style.css/REST versions win; entries still at "unknown" get
 // the passive version and every versioned entry is matched against the
 // database. Slug-only passive references keep flowing through enumeration
-// jobs and are not materialized here.
+// jobs and are not materialized here. REST-route namespaces (wp-json route
+// index) ARE materialized here though: the live install only registers
+// routes for active plugins, so an unversioned namespace is still reported
+// at confidence 85 (Source "rest-routes") when no stronger detection
+// pinned the component already.
 func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding)) {
 	versions := make(map[string]string)
 	for slug, ver := range ExtractPassiveVersionsIn(s.homepage, s.contentDir) {
@@ -2540,7 +2619,7 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 			versions[slug] = ver
 		}
 	}
-	if len(versions) == 0 {
+	if len(versions) == 0 && len(s.restRoutePlugins) == 0 {
 		return
 	}
 
@@ -2560,16 +2639,53 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 	reg(s.fourohfourThemes, "theme")
 	reg(s.sitemapPlugins, "plugin")
 	reg(s.sitemapThemes, "theme")
+	// REST-route slugs are plugins by construction (buildJobs only ever
+	// feeds the route index into plugin jobs); registering them lets
+	// their ?ver= versions materialize below.
+	reg(s.restRoutePlugins, "plugin")
 
 	index := make(map[string]int, len(res.Detected))
 	for i := range res.Detected {
 		index[res.Detected[i].Slug] = i
 	}
+
+	// Route-index materialization: plugins whose namespace appeared in the
+	// wp-json route index are reported at "unknown" (Source "rest-routes",
+	// confidence 85) unless a stronger detection already exists. Gated on
+	// the plugin enumerate token like every other plugin source.
+	if s.enumeratePlugins() {
+		for _, slug := range s.restRoutePlugins {
+			restDet := Detected{Slug: slug, Name: slug, Type: "plugin", Version: "unknown",
+				Source: "rest-routes", Confidence: confRestRoutes}
+			if i, ok := index[slug]; ok {
+				if preferDetected(restDet, res.Detected[i]) {
+					res.Detected[i] = restDet
+				}
+				continue
+			}
+			index[slug] = len(res.Detected)
+			res.Detected = append(res.Detected, restDet)
+		}
+	}
+
+	if len(versions) == 0 {
+		return
+	}
+
 	slugs := make([]string, 0, len(versions))
 	for slug := range versions {
 		slugs = append(slugs, slug)
 	}
 	sort.Strings(slugs)
+
+	// restSlugs marks the route-index namespaces so their versioned
+	// passive entries carry the stronger "rest-routes" source (85) instead
+	// of the generic "passive-ver" label (60): both the route and the
+	// asset version point at the same plugin.
+	restSlugs := make(map[string]bool, len(s.restRoutePlugins))
+	for _, slug := range s.restRoutePlugins {
+		restSlugs[slug] = true
+	}
 
 	var findings []Finding
 	for _, slug := range slugs {
@@ -2578,8 +2694,12 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 			continue
 		}
 		ver := versions[slug]
+		src, conf := "passive-ver", confPassiveVer
+		if restSlugs[slug] {
+			src, conf = "rest-routes", confRestRoutes
+		}
 		if i, ok := index[slug]; ok {
-			passive := Detected{Slug: slug, Name: slug, Type: t, Version: ver, Source: "passive-ver", Confidence: confPassiveVer}
+			passive := Detected{Slug: slug, Name: slug, Type: t, Version: ver, Source: src, Confidence: conf}
 			if !preferDetected(passive, res.Detected[i]) {
 				continue // a probed/known version wins over the passive hint
 			}
@@ -2587,7 +2707,7 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 		} else {
 			index[slug] = len(res.Detected)
 			res.Detected = append(res.Detected, Detected{
-				Slug: slug, Name: slug, Type: t, Version: ver, Source: "passive-ver", Confidence: confPassiveVer,
+				Slug: slug, Name: slug, Type: t, Version: ver, Source: src, Confidence: conf,
 			})
 		}
 		if f := s.matchDatabase(slug, t, ver); len(f.Vulnerabilities) > 0 {
@@ -2619,6 +2739,7 @@ func (s *Scanner) Scan() (*Result, error) {
 
 	res := &Result{Target: s.base, SchemaVersion: "1.0"}
 	scanStart := time.Now()
+	res.ScannedAt = scanStart
 	pr := s.progress
 	if pr != nil {
 		defer pr.Finish()
@@ -2885,6 +3006,49 @@ func (s *Scanner) Scan() (*Result, error) {
 		wg.Wait()
 	}
 
+	// Attachment-ID media probing (--media-ids N, enumerate token "m"):
+	// probe /?p=N for N = 1..min(MediaIDs, 30) and count how many post
+	// pages embed an uploads reference. These probes deliberately run
+	// AFTER the enumeration jobs and draw from NO job budget: they are
+	// extra requests bounded only by the MediaIDs cap (and a hard 30
+	// probe ceiling), so a huge --media-ids can never starve enumeration.
+	// Each probe is a full fetch — pacing, retries and the request counter
+	// all apply, so Summary.Requests includes them. The legacy
+	// homepage-presence entry ("media uploads present") is independent and
+	// kept alongside (the two messages never collide).
+	if s.enumerateMedia() && s.opts.MediaIDs > 0 {
+		probes := s.opts.MediaIDs
+		if probes > 30 {
+			probes = 30
+		}
+		hits := 0
+		for n := 1; n <= probes; n++ {
+			if s.scanDone() {
+				break
+			}
+			code, body, err := s.fetch("/?p=" + strconv.Itoa(n))
+			if err != nil || code != http.StatusOK {
+				continue
+			}
+			if strings.Contains(strings.ToLower(string(body)), "/"+s.contentDir+"/uploads/") {
+				hits++
+			}
+		}
+		if hits > 0 {
+			msg := fmt.Sprintf("media attachments found (%d of %d probed)", hits, probes)
+			dup := false
+			for _, it := range res.Interesting {
+				if it == msg {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				res.Interesting = append(res.Interesting, msg)
+			}
+		}
+	}
+
 	// Passive ?ver= versions (homepage + sitemap pages): fill in versions
 	// for passively observed components that enumeration could not pin
 	// down, then match them against the database.
@@ -2993,7 +3157,19 @@ func (s *Scanner) Scan() (*Result, error) {
 		res.Detected = append(res.Detected, d)
 	}
 	sort.Slice(res.Detected, func(i, j int) bool { return res.Detected[i].Slug < res.Detected[j].Slug })
-	sort.Slice(res.Findings, func(i, j int) bool { return res.Findings[i].Slug < res.Findings[j].Slug })
+	// Severity ordering (no-intel output): findings sort by their worst
+	// CVSS score DESC, then slug ascending, so table/JSON output reads
+	// severity-ordered even without the intel enrichment pass. When intel
+	// enrichment IS enabled (main's intel.Enrich), it re-sorts the
+	// findings on its own — this sort is a deterministic default, not a
+	// contract downstream code may rely on.
+	sort.Slice(res.Findings, func(i, j int) bool {
+		ai, aj := worstCVSS(res.Findings[i]), worstCVSS(res.Findings[j])
+		if ai != aj {
+			return ai > aj
+		}
+		return res.Findings[i].Slug < res.Findings[j].Slug
+	})
 
 	// Active-install counts from the --popular-file counts maps: after the
 	// final dedup, decorate each detected component whose slug appears in
@@ -3063,6 +3239,19 @@ func (s *Scanner) buildSummary(res *Result, scanStart time.Time) {
 		Low:         low,
 		Users:       len(res.Users),
 	}
+}
+
+// worstCVSS returns the highest CVSS score across a finding's matched
+// vulnerabilities (0 when it carries none). Scan() orders findings by it so
+// severity-ordered output works without the intel enrichment pass.
+func worstCVSS(f Finding) float64 {
+	var worst float64
+	for _, v := range f.Vulnerabilities {
+		if v.CVSSScore > worst {
+			worst = v.CVSSScore
+		}
+	}
+	return worst
 }
 
 // severityCounts tallies the vulnerabilities of the findings by rating.

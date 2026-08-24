@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Boreas37/onyx/internal/scanner"
 )
@@ -108,6 +109,48 @@ func TestWriteJUnit(t *testing.T) {
 	}
 	if err := xml.Unmarshal([]byte(out), &suites); err != nil {
 		t.Fatalf("junit not valid XML: %v", err)
+	}
+}
+
+// TestWriteMarkdownScannedAt verifies the report timestamp comes from
+// res.ScannedAt when set, and falls back to the now() clock (no panic, line
+// still present) when the result predates the field.
+func TestWriteMarkdownScannedAt(t *testing.T) {
+	res := formatsFixture()
+	res.ScannedAt = time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	var b bytes.Buffer
+	WriteMarkdown(&b, res)
+	if !strings.Contains(b.String(), "**Scanned:** 2026-08-01T12:00:00Z") {
+		t.Errorf("markdown missing deterministic ScannedAt:\n%s", b.String())
+	}
+
+	var zero bytes.Buffer
+	WriteMarkdown(&zero, formatsFixture())
+	if !strings.Contains(zero.String(), "**Scanned:**") {
+		t.Errorf("zero ScannedAt markdown missing scanned line:\n%s", zero.String())
+	}
+}
+
+// TestWriteHTMLScannedAt verifies the HTML "Generated:" line comes from
+// res.ScannedAt when set, and falls back to the now() clock (no panic)
+// when the result predates the field.
+func TestWriteHTMLScannedAt(t *testing.T) {
+	res := formatsFixture()
+	res.ScannedAt = time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	var b bytes.Buffer
+	if err := WriteHTML(&b, res); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(b.String(), "Generated: 2026-08-01T12:00:00Z") {
+		t.Errorf("html missing deterministic Generated line:\n%s", b.String())
+	}
+
+	var zero bytes.Buffer
+	if err := WriteHTML(&zero, formatsFixture()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(zero.String(), "Generated:") {
+		t.Errorf("zero ScannedAt html missing generated line:\n%s", zero.String())
 	}
 }
 

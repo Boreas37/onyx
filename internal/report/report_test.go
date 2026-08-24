@@ -369,6 +369,195 @@ func TestPrintSARIFMinimalStructure(t *testing.T) {
 	}
 }
 
+// gitlabSASTResult builds a Result exercising every GitLab SAST branch: a
+// CVE-bearing critical with a description, a CVE-bearing high, and a
+// feed-id-only info record.
+func gitlabSASTResult() *scanner.Result {
+	return &scanner.Result{
+		Target: "https://example.test",
+		Findings: []scanner.Finding{
+			{
+				Slug: "elementor", Type: "plugin", InstalledVersion: "3.24.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{ID: "aaaaaaaa-0000-0000-0000-000000000001", CVE: "CVE-2024-1001",
+						Title: "Elementor SQL Injection", Description: "SQLi in the widget loader", Rating: "critical"},
+					{ID: "bbbbbbbb-0000-0000-0000-000000000002", CVE: "CVE-2024-1002",
+						Title: "Elementor Stored XSS", Rating: "high"},
+					{ID: "cccccccc-0000-0000-0000-000000000003",
+						Title: "Elementor Info Leak", Rating: "info"},
+				},
+			},
+		},
+	}
+}
+
+// TestPrintGitLabSASTStructure verifies the gl-sast-report.json shape: one
+// vulnerability per record, cve-or-id in both id and cve, capitalized
+// whitelisted severities, the onyx scanner, and NVD identifiers for CVEs
+// versus onyx_id identifiers (no URL) for feed-only records.
+func TestPrintGitLabSASTStructure(t *testing.T) {
+	out := captureStdout(t, func() { PrintGitLabSAST(gitlabSASTResult()) })
+
+	var doc struct {
+		Version         string `json:"version"`
+		Vulnerabilities []struct {
+			ID          string `json:"id"`
+			Category    string `json:"category"`
+			Name        string `json:"name"`
+			Message     string `json:"message"`
+			Description string `json:"description"`
+			CVE         string `json:"cve"`
+			Severity    string `json:"severity"`
+			Confidence  string `json:"confidence"`
+			Scanner     struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"scanner"`
+			Location struct {
+				File    string `json:"file"`
+				EndLine int    `json:"end_line"`
+			} `json:"location"`
+			Identifiers []struct {
+				Type  string `json:"type"`
+				Name  string `json:"name"`
+				Value string `json:"value"`
+				URL   string `json:"url"`
+			} `json:"identifiers"`
+		} `json:"vulnerabilities"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("gitlab sast output is not valid JSON: %v\n%s", err, out)
+	}
+	if doc.Version != "15.0.6" {
+		t.Errorf("version = %q, want 15.0.6", doc.Version)
+	}
+	if len(doc.Vulnerabilities) != 3 {
+		t.Fatalf("got %d vulnerabilities, want 3:\n%s", len(doc.Vulnerabilities), out)
+	}
+
+	v := doc.Vulnerabilities[0]
+	if v.ID != "CVE-2024-1001" || v.CVE != "CVE-2024-1001" {
+		t.Errorf("id/cve = %q/%q, want CVE-2024-1001 both", v.ID, v.CVE)
+	}
+	if v.Category != "sast" || v.Name != "Elementor SQL Injection" ||
+		v.Message != "Elementor SQL Injection" || v.Description != "SQLi in the widget loader" {
+		t.Errorf("name/message/description/category = %q/%q/%q/%q", v.Name, v.Message, v.Description, v.Category)
+	}
+	if v.Severity != "Critical" || v.Confidence != "Confirmed" {
+		t.Errorf("severity/confidence = %q/%q, want Critical/Confirmed", v.Severity, v.Confidence)
+	}
+	if v.Scanner.ID != "onyx" || v.Scanner.Name != "onyx" {
+		t.Errorf("scanner = %+v, want onyx/onyx", v.Scanner)
+	}
+	if v.Location.File != "https://example.test" || v.Location.EndLine != 1 {
+		t.Errorf("location = %+v, want example.test/1", v.Location)
+	}
+	wantID := []struct {
+		typ, name, value, url string
+	}{
+		{"cve", "CVE-2024-1001", "CVE-2024-1001", "https://nvd.nist.gov/vuln/detail/CVE-2024-1001"},
+		{"cve", "CVE-2024-1002", "CVE-2024-1002", "https://nvd.nist.gov/vuln/detail/CVE-2024-1002"},
+		{"onyx_id", "", "cccccccc-0000-0000-0000-000000000003", ""},
+	}
+	for i, id := range wantID {
+		got := doc.Vulnerabilities[i].Identifiers
+		if len(got) != 1 {
+			t.Fatalf("vulnerability[%d] identifiers = %d entries, want 1:\n%s", i, len(got), out)
+		}
+		if got[0].Type != id.typ || got[0].Name != id.name || got[0].Value != id.value || got[0].URL != id.url {
+			t.Errorf("vulnerability[%d] identifier = %+v, want %+v", i, got[0], id)
+		}
+	}
+	if doc.Vulnerabilities[1].Severity != "High" || doc.Vulnerabilities[2].Severity != "Info" {
+		t.Errorf("severity mapping wrong: %q %q, want High/Info",
+			doc.Vulnerabilities[1].Severity, doc.Vulnerabilities[2].Severity)
+	}
+}
+
+// TestWriteGitLabSASTHostileFieldsDecodeCleanly verifies hostile feed
+// fields stay structurally valid: the rating collapses to Unknown, control
+// characters are stripped from title/description, markup is escaped by the
+// encoder, and the identifiers stay correct for both CVE and feed-id
+// records.
+func TestWriteGitLabSASTHostileFieldsDecodeCleanly(t *testing.T) {
+	res := gitlabSASTResult()
+	v := &res.Findings[0].Vulnerabilities[0]
+	v.Rating = `high"><script>alert(1)</script>`
+	v.Title = "T \x1b[31m\"&'<script>\x01"
+	v.Description = "D\n\x07\x01"
+
+	var buf bytes.Buffer
+	WriteGitLabSAST(&buf, res)
+	out := buf.String()
+
+	var doc struct {
+		Vulnerabilities []struct {
+			Severity    string `json:"severity"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Identifiers []struct {
+				Type  string `json:"type"`
+				Value string `json:"value"`
+				URL   string `json:"url"`
+			} `json:"identifiers"`
+		} `json:"vulnerabilities"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("gitlab sast output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(doc.Vulnerabilities) != 3 {
+		t.Fatalf("got %d vulnerabilities, want 3:\n%s", len(doc.Vulnerabilities), out)
+	}
+	r := doc.Vulnerabilities[0]
+	if r.Severity != "Unknown" {
+		t.Errorf("hostile rating severity = %q, want whitelisted %q", r.Severity, "Unknown")
+	}
+	if strings.ContainsAny(r.Name+r.Description, "\x1b\x01\x07\r\n") {
+		t.Errorf("control characters survived into name/description: %q", r.Name+r.Description)
+	}
+	if strings.Contains(out, "<script>") {
+		t.Errorf("raw output leaked unescaped markup:\n%s", out)
+	}
+	if want := `T [31m"&'<script>`; r.Name != want {
+		t.Errorf("decoded name = %q, want verbatim %q (control chars stripped, markup kept)", r.Name, want)
+	}
+	if len(r.Identifiers) != 1 || r.Identifiers[0].Type != "cve" ||
+		r.Identifiers[0].Value != "CVE-2024-1001" ||
+		r.Identifiers[0].URL != "https://nvd.nist.gov/vuln/detail/CVE-2024-1001" {
+		t.Errorf("cve identifier = %+v, want the NVD-linked cve entry", r.Identifiers)
+	}
+	feed := doc.Vulnerabilities[2]
+	if len(feed.Identifiers) != 1 || feed.Identifiers[0].Type != "onyx_id" ||
+		feed.Identifiers[0].Value != "cccccccc-0000-0000-0000-000000000003" ||
+		feed.Identifiers[0].URL != "" {
+		t.Errorf("feed identifier = %+v, want url-less onyx_id entry", feed.Identifiers)
+	}
+}
+
+// TestWriteGitLabSASTEmptyFindings verifies a clean scan produces a
+// structurally valid report with an empty (non-null) vulnerabilities array.
+func TestWriteGitLabSASTEmptyFindings(t *testing.T) {
+	var buf bytes.Buffer
+	WriteGitLabSAST(&buf, &scanner.Result{Target: "https://example.test"})
+	out := buf.String()
+	if !strings.Contains(out, `"vulnerabilities": []`) {
+		t.Errorf("empty findings must serialize as [], got:\n%s", out)
+	}
+	var doc struct {
+		Version         string `json:"version"`
+		Vulnerabilities []any  `json:"vulnerabilities"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("clean gitlab sast output is not valid JSON: %v\n%s", err, out)
+	}
+	if doc.Version != "15.0.6" {
+		t.Errorf("version = %q, want 15.0.6", doc.Version)
+	}
+	if doc.Vulnerabilities == nil || len(doc.Vulnerabilities) != 0 {
+		t.Errorf("vulnerabilities = %v, want empty non-nil slice", doc.Vulnerabilities)
+	}
+}
+
 // TestPrintCSVQuotesCommasAndRowsPerVulnerability verifies --format csv:
 // one row per vulnerability (not per finding), the header columns, and
 // encoding/csv quoting for titles containing commas.

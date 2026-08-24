@@ -1,9 +1,17 @@
 package scanner
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// xmlrpcMethodNameRe is the character set of extracted XML-RPC method
+// names, checked by FuzzExtractXMLRPCMethods. The parser matches
+// case-insensitively (real names like wp.getUsersBlogs carry uppercase
+// letters and are kept verbatim), so the check applies the same
+// case-insensitive semantics.
+var xmlrpcMethodNameRe = regexp.MustCompile(`(?i)^[a-z0-9_.]+$`)
 
 // The fuzz targets below pin the report-safety invariants: no matter what a
 // hostile server returns, extracted strings never carry control characters
@@ -98,6 +106,87 @@ func FuzzAuthorSlugFromBody(f *testing.F) {
 		slug := authorSlugFromBody(body)
 		if len(slug) > maxSlugLen {
 			t.Fatalf("slug %d chars exceeds cap %d", len(slug), maxSlugLen)
+		}
+	})
+}
+
+// FuzzExtractRESTRoutes pins the route-index parser's report-safety
+// invariants: arbitrary bytes never panic, and every output slug is a
+// strict [a-z0-9_-]+ token no longer than the per-slug cap, with the
+// result list bounded by maxRESTRoutePlugins.
+func FuzzExtractRESTRoutes(f *testing.F) {
+	f.Add([]byte(`{"routes":{"contact-form-7/v1/contact-forms":{"namespace":"contact-form-7/v1"},"wp/v2/posts":{},"elementor/v1":{}}}`))
+	f.Add([]byte(`["contact-form-7/v1/contact-forms","wp/v2/posts","acme/endpoint"]`))
+	f.Add([]byte(`{"routes":{}}`))
+	f.Add([]byte(`{}`))
+	f.Add([]byte(`not json at all`))
+	f.Add([]byte(`{"routes":{"` + strings.Repeat("a", 50000) + `/v1":{}}}`))
+	f.Fuzz(func(t *testing.T, body []byte) {
+		slugs := ExtractRESTRoutePlugins(body)
+		if len(slugs) > maxRESTRoutePlugins {
+			t.Fatalf("%d slugs exceed the cap %d", len(slugs), maxRESTRoutePlugins)
+		}
+		for _, s := range slugs {
+			if len(s) > maxRESTRoutePlugins {
+				t.Fatalf("slug %d chars exceeds the cap %d", len(s), maxRESTRoutePlugins)
+			}
+			if !restSlugRe.MatchString(s) {
+				t.Fatalf("slug %q violates ^[a-z0-9_-]+$", s)
+			}
+		}
+	})
+}
+
+// FuzzExtractTimthumbVersion pins the TimThumb version extractor: arbitrary
+// bytes never panic and any extracted version is sanitized to the
+// maxVersionLen cap without control characters.
+func FuzzExtractTimthumbVersion(f *testing.F) {
+	f.Add("TimThumb version 2.8.10")
+	f.Add(`"version": "2.8.11"`)
+	f.Add("$version = '2.8.12';")
+	f.Add("$version = \"2.8.13\";")
+	f.Add("TimThumb version 9." + strings.Repeat("9", 10000))
+	f.Add("")
+	f.Fuzz(func(t *testing.T, body string) {
+		v, _ := ExtractTimthumbVersion(body)
+		if len(v) > maxVersionLen {
+			t.Fatalf("version %d chars exceeds cap %d", len(v), maxVersionLen)
+		}
+		for _, r := range v {
+			if r < 0x20 || r == 0x7f {
+				t.Fatalf("control char %q in version %q", r, v)
+			}
+		}
+	})
+}
+
+// FuzzExtractXMLRPCMethods pins the method-list parser: arbitrary bytes
+// never panic, the result list is bounded by maxXMLRPCMethods and every
+// extracted method name is a [a-z0-9_.]+ token (case-insensitive, matching
+// the parser's own semantics) carrying at least one dot.
+func FuzzExtractXMLRPCMethods(f *testing.F) {
+	f.Add(`<?xml version="1.0"?><methodResponse><params><param><value><array><data>` +
+		`<value><string>system.listMethods</string></value>` +
+		`<value><string>pingback.ping</string></value>` +
+		`<value><string>wp.getUsersBlogs</string></value>` +
+		`</data></array></value></param></params></methodResponse>`)
+	f.Add(`<string>system.multicall</string>`)
+	f.Add(strings.Repeat(`<string>wp.method</string>`, 500))
+	f.Add(`<string>` + strings.Repeat("a", 50000) + `.b</string>`)
+	f.Add("garbage")
+	f.Add("")
+	f.Fuzz(func(t *testing.T, body string) {
+		methods := extractXMLRPCMethods(body)
+		if len(methods) > maxXMLRPCMethods {
+			t.Fatalf("%d methods exceed the cap %d", len(methods), maxXMLRPCMethods)
+		}
+		for _, m := range methods {
+			if !xmlrpcMethodNameRe.MatchString(m) {
+				t.Fatalf("method %q violates ^[a-z0-9_.]+$", m)
+			}
+			if !strings.Contains(m, ".") {
+				t.Fatalf("method %q carries no dot", m)
+			}
 		}
 	})
 }

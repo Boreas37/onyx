@@ -504,3 +504,110 @@ func writeSARIF(w io.Writer, version string, res *scanner.Result) {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
 }
+
+// gitlabSeverity maps a rating onto the GitLab SAST severity set. The
+// rating collapses through sevClass first (anything hostile becomes
+// "unknown"), then the first letter is capitalized: critical→Critical,
+// high→High, medium→Medium, low→Low, info→Info, unknown→Unknown.
+func gitlabSeverity(rating string) string {
+	s := sevClass(rating)
+	if s == "" {
+		return "Unknown"
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// WriteGitLabSAST renders res as a GitLab SAST report (gl-sast-report.json,
+// schema 15.x) into w (used by --output / --outputs).
+func WriteGitLabSAST(w io.Writer, res *scanner.Result) {
+	writeGitLabSAST(w, res)
+}
+
+// PrintGitLabSAST writes res as a GitLab SAST report to stdout.
+func PrintGitLabSAST(res *scanner.Result) {
+	writeGitLabSAST(os.Stdout, res)
+}
+
+// writeGitLabSAST renders res as a GitLab SAST report into w: one
+// vulnerability per finding record. Severity is whitelisted through
+// sevClass before capitalization, so a hostile rating collapses to Unknown
+// instead of leaking markup. Identifiers carry the NVD link when the
+// record has a CVE and fall back to the onyx feed id (no URL) otherwise.
+// Title and description are sanitized (control characters stripped,
+// length-capped) before embedding; json.Marshal escapes any remaining
+// markup. Split from PrintGitLabSAST so tests can render into a buffer.
+func writeGitLabSAST(w io.Writer, res *scanner.Result) {
+	type identifier struct {
+		Type  string `json:"type"`
+		Name  string `json:"name,omitempty"`
+		Value string `json:"value"`
+		URL   string `json:"url,omitempty"`
+	}
+	type scannerInfo struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	type location struct {
+		File    string `json:"file"`
+		EndLine int    `json:"end_line"`
+	}
+	type vulnerability struct {
+		ID          string       `json:"id"`
+		Category    string       `json:"category"`
+		Name        string       `json:"name"`
+		Message     string       `json:"message"`
+		Description string       `json:"description"`
+		CVE         string       `json:"cve"`
+		Severity    string       `json:"severity"`
+		Confidence  string       `json:"confidence"`
+		Scanner     scannerInfo  `json:"scanner"`
+		Location    location     `json:"location"`
+		Identifiers []identifier `json:"identifiers"`
+	}
+	type sastReport struct {
+		Version         string          `json:"version"`
+		Vulnerabilities []vulnerability `json:"vulnerabilities"`
+	}
+
+	doc := sastReport{
+		Version:         "15.0.6",
+		Vulnerabilities: []vulnerability{},
+	}
+	for i := range res.Findings {
+		f := &res.Findings[i]
+		for _, v := range f.Vulnerabilities {
+			id := v.CVE
+			if id == "" {
+				id = v.ID
+			}
+			title := sanitize.Text(v.Title, 300)
+			ids := []identifier{}
+			if v.CVE != "" {
+				ids = append(ids, identifier{
+					Type:  "cve",
+					Name:  v.CVE,
+					Value: v.CVE,
+					URL:   "https://nvd.nist.gov/vuln/detail/" + v.CVE,
+				})
+			} else {
+				ids = append(ids, identifier{Type: "onyx_id", Value: v.ID})
+			}
+			doc.Vulnerabilities = append(doc.Vulnerabilities, vulnerability{
+				ID:          id,
+				Category:    "sast",
+				Name:        title,
+				Message:     title,
+				Description: sanitize.Text(v.Description, 1000),
+				CVE:         id,
+				Severity:    gitlabSeverity(v.Rating),
+				Confidence:  "Confirmed",
+				Scanner:     scannerInfo{ID: "onyx", Name: "onyx"},
+				Location:    location{File: res.Target, EndLine: 1},
+				Identifiers: ids,
+			})
+		}
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(doc)
+}

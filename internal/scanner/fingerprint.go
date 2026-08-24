@@ -30,6 +30,11 @@ const (
 	// extracted from a single page so a pathological document cannot
 	// balloon the result map.
 	maxPassiveVersions = 200
+	// maxRESTRoutePlugins caps how many plugin namespaces
+	// ExtractRESTRoutePlugins reports from a single wp-json route index,
+	// and how long each candidate slug may be, so a hostile route list
+	// cannot balloon the result.
+	maxRESTRoutePlugins = 50
 )
 
 // changelogSectionRe matches the line that opens a readme.txt Changelog
@@ -341,4 +346,130 @@ func ExtractPassiveSlugsIn(html, contentDir string) (plugins, themes []string) {
 	sort.Strings(plugins)
 	sort.Strings(themes)
 	return plugins, themes
+}
+
+// restRouteVersionRe matches the "/v<digit>" namespace-version marker
+// WordPress appends to REST route namespaces ("contact-form-7/v1/..."). A
+// route's plugin slug is everything before this marker — or before the
+// first plain "/" when the namespace carries no version marker at all
+// ("acme/endpoint" -> "acme").
+var restRouteVersionRe = regexp.MustCompile(`/v[0-9]`)
+
+// restSlugRe is the strict character set for REST-route plugin slugs.
+// Route namespaces are lowercase by WordPress convention; anything with
+// an uppercase letter, a dot or other punctuation is not a slug.
+var restSlugRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+// restKnownPrefixes are the route-index namespaces WordPress core and its
+// bundled features register ("wp/v2/...", "oembed/1.0/...",
+// "wp-site-health/v1/...", "wp/block-directory/v1/..."). Everything else
+// under the first namespace segment is treated as a plugin slug candidate.
+// Only these exact prefixes are dropped: a plugin named "wp" or
+// "oembed" would be a false negative, but none exists in the wild and the
+// core routes vastly outweigh that risk.
+var restKnownPrefixes = []string{"wp", "oembed", "wp-site-health", "wp/block-directory"}
+
+// restRouteSlug reduces one REST route key to its candidate plugin slug:
+// everything up to the first "/v<digit>" marker, or up to the first "/"
+// when no version marker exists ("contact-form-7/v1/contact-forms" ->
+// "contact-form-7", "elementor/v1" -> "elementor", "acme/endpoint" ->
+// "acme"). Routes without any slash ("hello") pass through unchanged.
+func restRouteSlug(route string) string {
+	if i := restRouteVersionRe.FindStringIndex(route); i != nil {
+		return route[:i[0]]
+	}
+	if i := strings.IndexByte(route, '/'); i >= 0 {
+		return route[:i]
+	}
+	return route
+}
+
+// ExtractRESTRoutePlugins parses the WordPress REST API root index
+// (/wp-json/) for plugin namespaces: when the body parses as
+// {"routes": {...}} the route keys are the candidate list, and a plain
+// array of route strings is accepted too. Each route key is reduced to
+// its first namespace segment (see restRouteSlug); segments matching the
+// exact known core prefixes (wp, oembed, wp-site-health,
+// wp/block-directory) are dropped and anything not matching
+// ^[a-z0-9_-]+$ or longer than maxRESTRoutePlugins runes is rejected.
+// The surviving slugs are deduplicated, sorted and capped at
+// maxRESTRoutePlugins entries. A body that parses as neither shape (or
+// carries no routes at all) returns nil.
+func ExtractRESTRoutePlugins(body []byte) []string {
+	var routes []string
+	var doc struct {
+		Routes map[string]json.RawMessage `json:"routes"`
+	}
+	if err := json.Unmarshal(body, &doc); err == nil && len(doc.Routes) > 0 {
+		for route := range doc.Routes {
+			routes = append(routes, route)
+		}
+	} else {
+		var arr []string
+		if err := json.Unmarshal(body, &arr); err == nil {
+			routes = arr
+		} else {
+			return nil
+		}
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, min(len(routes), maxRESTRoutePlugins))
+	// Deterministic processing order: the routes map iterates randomly,
+	// so the 50-entry cap must apply over a sorted list or the survivors
+	// would vary between runs.
+	sort.Strings(routes)
+	for _, route := range routes {
+		slug := restRouteSlug(route)
+		if len(slug) > maxRESTRoutePlugins || !restSlugRe.MatchString(slug) || seen[slug] {
+			continue
+		}
+		if isRestKnownPrefix(slug) {
+			continue
+		}
+		seen[slug] = true
+		out = append(out, slug)
+		if len(out) >= maxRESTRoutePlugins {
+			break
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isRestKnownPrefix reports whether slug is one of the exact core
+// route-index prefixes (wp, oembed, wp-site-health, wp/block-directory).
+func isRestKnownPrefix(slug string) bool {
+	for _, p := range restKnownPrefixes {
+		if slug == p {
+			return true
+		}
+	}
+	return false
+}
+
+// timthumbVersionRe matches the version markers common TimThumb builds
+// embed: the "TimThumb version X.Y.Z" banner line, a JSON-style
+// "version": "X.Y.Z" field and the $version = 'X.Y.Z' PHP assignment.
+// The captured version is deliberately digits-and-dots only, so prose or
+// code that merely mentions a version never matches a full release. The
+// whole expression is case-insensitive.
+var timthumbVersionRe = regexp.MustCompile(`(?i)(?:timthumb\s+version\s+([0-9.]+)|"version"\s*:\s*"([0-9.]+)"|\$version\s*=\s*['"]([0-9.]+)['"])`)
+
+// ExtractTimthumbVersion parses the version out of a TimThumb source or
+// info body using the common release markers (see timthumbVersionRe). The
+// first marker present wins and the result is sanitized via
+// sanitizeVersion (control characters stripped, capped at maxVersionLen
+// runes). found is false when the body carries no recognizable marker.
+func ExtractTimthumbVersion(body string) (string, bool) {
+	for _, m := range timthumbVersionRe.FindAllStringSubmatch(body, -1) {
+		for _, g := range m[1:] {
+			if g == "" {
+				continue
+			}
+			if v := sanitizeVersion(g); v != "" {
+				return v, true
+			}
+		}
+	}
+	return "", false
 }

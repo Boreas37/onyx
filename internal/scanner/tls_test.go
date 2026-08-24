@@ -3,6 +3,7 @@ package scanner
 import (
 	"crypto/tls"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 
@@ -133,5 +134,101 @@ func TestNewScannerTLSFingerprint(t *testing.T) {
 
 	if _, err := NewScanner(nil, "http://example.test", Options{TLSFingerprint: "edge"}); err == nil {
 		t.Fatal("expected error for an unknown --tls-fingerprint mode")
+	}
+}
+
+// TestNewScannerInsecureTLSComposition verifies InsecureTLS composes with
+// every --tls-fingerprint branch instead of being overwritten by them:
+// the flag survives the chrome/firefox and random+proxy config
+// replacements (on a Clone, never on the shared fingerprint table) and a
+// later fingerprint-only scan still gets the pristine shared config.
+func TestNewScannerInsecureTLSComposition(t *testing.T) {
+	d, _ := db.Load(minimalFeed(t))
+
+	sc, err := NewScanner(d, "https://example.test", Options{InsecureTLS: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := sc.client.Transport.(*http.Transport)
+	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("InsecureTLS alone must set InsecureSkipVerify")
+	}
+
+	for _, fp := range []string{"chrome", "firefox"} {
+		sc, err = NewScanner(d, "https://example.test", Options{InsecureTLS: true, TLSFingerprint: fp})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr = sc.client.Transport.(*http.Transport)
+		if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+			t.Fatalf("InsecureTLS + %s fingerprint must keep InsecureSkipVerify", fp)
+		}
+		// The shared fingerprint table must stay pristine: a later scan
+		// without InsecureTLS must not inherit the flag.
+		sc2, err := NewScanner(d, "https://example.test", Options{TLSFingerprint: fp})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tr2 := sc2.client.Transport.(*http.Transport); tr2.TLSClientConfig.InsecureSkipVerify {
+			t.Fatalf("%s fingerprint scan without InsecureTLS inherited skip-verify from the shared table", fp)
+		}
+	}
+
+	sc, err = NewScanner(d, "https://example.test", Options{InsecureTLS: true, TLSFingerprint: "random", Proxy: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr = sc.client.Transport.(*http.Transport)
+	if tr.TLSClientConfig == nil || !tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("InsecureTLS + random/proxy fallback must keep InsecureSkipVerify")
+	}
+	if tlsFingerprintConfig("chrome").InsecureSkipVerify {
+		t.Fatal("shared fingerprint table mutated by the random/proxy fallback")
+	}
+}
+
+// TestInsecureTLSScansSelfSigned verifies the end-to-end behavior against a
+// real TLS endpoint: a self-signed certificate fails the scan without
+// InsecureTLS, succeeds with it, and the combination with a chrome
+// fingerprint (which replaces TLSClientConfig wholesale) still succeeds.
+func TestInsecureTLSScansSelfSigned(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<!DOCTYPE html><html><head><meta name="generator" content="WordPress 6.4.2" /></head><body>hi</body></html>`))
+	}))
+	defer srv.Close()
+
+	d, _ := db.Load(minimalFeed(t))
+
+	sc, err := NewScanner(d, srv.URL, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Scan(); err == nil {
+		t.Error("scan against a self-signed cert without InsecureTLS must fail")
+	}
+
+	sc, err = NewScanner(d, srv.URL, Options{InsecureTLS: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Scan(); err != nil {
+		t.Errorf("scan with InsecureTLS: %v", err)
+	}
+
+	sc, err = NewScanner(d, srv.URL, Options{InsecureTLS: true, TLSFingerprint: "chrome"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Scan(); err != nil {
+		t.Errorf("scan with InsecureTLS + chrome fingerprint: %v", err)
+	}
+
+	sc, err = NewScanner(d, srv.URL, Options{InsecureTLS: true, TLSFingerprint: "random"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sc.Scan(); err != nil {
+		t.Errorf("scan with InsecureTLS + random fingerprint: %v", err)
 	}
 }

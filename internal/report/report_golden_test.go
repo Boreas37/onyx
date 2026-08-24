@@ -32,6 +32,7 @@ func goldenResult() *scanner.Result {
 		Target:           "https://shop.example.test",
 		IsWordPress:      true,
 		WordPressVersion: "7.1",
+		ScannedAt:        time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC),
 		Interesting:      []string{"readme.html exposed", "wp-json user enumeration enabled"},
 		Users: []scanner.User{
 			{ID: 1, Slug: "admin", Name: "Site Admin"},
