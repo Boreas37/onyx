@@ -114,7 +114,7 @@ jobs:
             curl -sfL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar
             php /tmp/wp-cli.phar --allow-root --info >/dev/null
             php /tmp/wp-cli.phar --allow-root core install \
-              --url=http://localhost/ \
+              --url=http://localhost:8080/ \
               --title="onyx e2e realwp" \
               --admin_user=admin \
               --admin_password=admin \
