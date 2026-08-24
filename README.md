@@ -75,7 +75,7 @@ onyx scan https://example.com
 | `--cache-ttl H` | Cache HTTP responses on disk for H hours |
 | `--nuclei` | Verify findings against projectdiscovery templates (needs the nuclei binary) |
 | `--output FILE` | Also write JSON results to `FILE` (table still prints to stdout) |
-| `--config FILE` | Load defaults from a JSON config file (CLI flags win) |
+| `--config FILE` | Load defaults from a JSON config file (CLI flags win). Without `--config`, onyx auto-discovers `$XDG_CONFIG_HOME/onyx/scan.json`, `~/.config/onyx/scan.json` and `./onyx.json` (first match) |
 | `--profile NAME` | Named preset: built-ins `stealth`, `aggressive`, `fast`, or a custom file in `~/.onyx/profiles/NAME.json`. Applied after `--config`; explicit CLI flags still win |
 | `--passwords FILE` | Wordlist of passwords (one per line) — enables the wp-login brute force (needs `--usernames FILE` or `--enumerate u`) |
 | `--usernames FILE` | Wordlist of usernames (one per line) for brute-force attacks |
@@ -89,6 +89,11 @@ onyx scan https://example.com
 | `-T FILE`, `--targets FILE` | Scan many sites sequentially (one URL per line, `#` comments). Extra URLs can also be passed positionally. Exit code aggregates: any hard failure → `2`, else any findings → `5`. Formats that cannot be concatenated (`json`, `sarif`, `cyclonedx`) require a single target |
 | `--fail-on SEV` | Exit `5` only when a finding is `SEV` or worse (`critical`/`high`/`medium`/`low`); default: any finding. Nuclei-verified hits always exit `5` |
 | `--no-intel` | Skip EPSS / CISA KEV enrichment (enabled by default; findings are annotated and sorted by exploitation priority) |
+| `--fingerprint-db FILE` | JSON table of static-file MD5 hashes → WordPress versions, used as a core-version fallback when meta/RSS/OPML yield nothing |
+| `--no-popular` | Do not append the built-in popular plugin/theme slug lists during aggressive enumeration |
+| `--allow-foreign-redirect` | Follow HTTP redirects to hosts other than the scanned target (default: blocked — SSRF hardening) |
+| `--retries N` | Retry transient network errors N times with exponential backoff + jitter (default 2, `0` disables) |
+| `--jobs N` | Scan `-T`/extra targets with up to N concurrent scans (default 1 = sequential; output order may vary) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -188,8 +193,10 @@ run's baseline (stored under the user cache dir, `--state-dir` to override):
 
 New vulnerabilities print under "New vulnerabilities:", fixed ones under
 "Resolved:". When anything changes and `--webhook` is set, onyx POSTs a JSON
-report (`target`, `summary`, `new[]`, `resolved[]`). Without `--interval`,
-watch runs a single compare-and-exit pass — handy for CI drift checks.
+report (`target`, `summary`, `new[]`, `resolved[]`); `--webhook-format slack`
+wraps the same data as a Slack webhook `{"text": ...}` message. Without
+`--interval`, watch runs a single compare-and-exit pass — handy for CI drift
+checks.
 Scan flags like `--db`, `--threads`, `--enumerate`, `--max-requests` are
 honored.
 
@@ -279,6 +286,15 @@ redistribution. The mirror lives in the
 [`onyx-db`](https://github.com/Boreas37/onyx-db) repository, updated daily.
 See its README for the license terms.
 
+### Read index sidecar
+
+`onyx update` also writes a pre-built index sidecar (`<db>.idx`); scans
+then start ~6x faster (~0.3s vs ~1.6s on the full 151MB feed) at roughly
+half the memory, because the 39k-record feed no longer needs its JSON
+re-parse. The sidecar is a cache: it is regenerated whenever the feed
+changes and any corruption or staleness silently falls back to the
+regular loader.
+
 ### Incremental updates and signatures
 
 `onyx update` first checks the mirror's `manifest.json`: when it publishes
@@ -289,8 +305,14 @@ to the full download with a warning, so updates never get *worse*.
 
 For supply-chain hardening, point `ONYX_DB_PUBKEY` at a minisign public
 key; update then verifies the feed signature (`<asset>.minisig`) after
-every download and refuses to bless a database that fails verification —
-a missing or bad signature is a hard error, not a warning. Public keys and
+every download, the `manifest.json` signature (so the delta selection
+itself is authenticated), and refuses to bless a database that fails
+verification — a missing or bad signature is a hard error, not a warning.
+A manifest older than the last accepted one is rejected as a downgrade
+(`ONYX_ALLOW_OLDER_MANIFEST=1` to override), and deltas now carry a
+semantic result digest that `ApplyDelta` verifies after reconstruction
+(byte-for-byte equality is impossible by design, so the digest covers
+id + compact-record content in sorted order instead). Public keys and
 signatures interoperate with minisign 0.12 in both directions, including
 its default pre-hashed `ED` signatures; the trusted-comment binding uses
 minisign's raw-64-byte construction with a legacy fallback for previously
