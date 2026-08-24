@@ -2,6 +2,7 @@ package watch
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -62,7 +63,7 @@ func TestNotifyPostsJSON(t *testing.T) {
 		},
 		Unchanged: 12,
 	}
-	if err := Notify(srv.URL, d, srv.Client()); err != nil {
+	if err := Notify(srv.URL, d, "", srv.Client()); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
 
@@ -99,7 +100,7 @@ func TestNotifyPostsJSON(t *testing.T) {
 
 func TestNotifyNilClientUsesDefault(t *testing.T) {
 	srv, rec := recordingServer(t)
-	if err := Notify(srv.URL, &Diff{Target: "t", New: []Change{{Slug: "x"}}}, nil); err != nil {
+	if err := Notify(srv.URL, &Diff{Target: "t", New: []Change{{Slug: "x"}}}, "", nil); err != nil {
 		t.Fatalf("Notify with nil client: %v", err)
 	}
 	if rec.count() != 1 {
@@ -112,11 +113,98 @@ func TestNotifyNon2xxReturnsErrorWithStatus(t *testing.T) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	err := Notify(srv.URL, &Diff{Target: "t"}, srv.Client())
+	err := Notify(srv.URL, &Diff{Target: "t"}, "", srv.Client())
 	if err == nil {
 		t.Fatal("expected error for 500 response")
 	}
 	if !strings.Contains(err.Error(), "500") {
+		t.Fatalf("error %q does not mention status code", err)
+	}
+}
+
+// rawBodyServer returns an httptest server capturing the raw request body
+// and content type of each request.
+func rawBodyServer(t *testing.T) (*httptest.Server, *string, *string) {
+	t.Helper()
+	var (
+		mu    sync.Mutex
+		body  string
+		ctype string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		body = string(b)
+		ctype = r.Header.Get("Content-Type")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &body, &ctype
+}
+
+func TestNotifySlackFormatPostsTextWrapper(t *testing.T) {
+	srv, body, ctype := rawBodyServer(t)
+
+	d := DiffStates(BuildState("https://example.com", baseResult(), testNow), modifiedResult(), testNow)
+	if err := Notify(srv.URL, d, "slack", srv.Client()); err != nil {
+		t.Fatalf("Notify: %v", err)
+	}
+
+	if !strings.HasPrefix(*ctype, "application/json") {
+		t.Fatalf("content-type = %q, want application/json", *ctype)
+	}
+	var msg struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(*body), &msg); err != nil {
+		t.Fatalf("slack body %q is not valid JSON: %v", *body, err)
+	}
+	for _, want := range []string{
+		"2 new, 1 resolved, 3 unchanged",
+		"New vulnerabilities:",
+		"- [high] plugin/akismet CVE-2025-9999: Akismet SSRF",
+		"- [critical] plugin/jetpack CVE-2025-4444: Jetpack file upload",
+		"Resolved:",
+	} {
+		if !strings.Contains(msg.Text, want) {
+			t.Errorf("slack text missing %q:\n%s", want, msg.Text)
+		}
+	}
+	// The slack shape must not leak the generic payload fields.
+	for _, bad := range []string{`"target"`, `"summary"`, `"new"`, `"resolved"`} {
+		if strings.Contains(msg.Text, bad) {
+			t.Errorf("slack text leaked generic payload field %q:\n%s", bad, msg.Text)
+		}
+	}
+}
+
+func TestNotifyUnknownFormatFallsBackToGeneric(t *testing.T) {
+	srv, rec := recordingServer(t)
+	d := DiffStates(BuildState("https://example.com", baseResult(), testNow), modifiedResult(), testNow)
+	if err := Notify(srv.URL, d, "teams", srv.Client()); err != nil {
+		t.Fatalf("Notify with unknown format: %v", err)
+	}
+	if rec.body.Target != "https://example.com" {
+		t.Errorf("payload target = %q, want generic decode", rec.body.Target)
+	}
+	if len(rec.body.New) != 2 || rec.body.Summary != "2 new, 1 resolved, 3 unchanged" {
+		t.Errorf("payload = %+v, want generic payload shape", rec.body)
+	}
+}
+
+func TestNotifySlackNon2xxReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	err := Notify(srv.URL, &Diff{Target: "t"}, "slack", srv.Client())
+	if err == nil {
+		t.Fatal("expected error for 503 response")
+	}
+	if !strings.Contains(err.Error(), "503") {
 		t.Fatalf("error %q does not mention status code", err)
 	}
 }

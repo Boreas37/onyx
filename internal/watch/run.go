@@ -18,6 +18,10 @@ type Options struct {
 	StateDir string       // directory holding per-target state files
 	Webhook  string       // optional webhook URL notified on non-empty diffs
 	Client   *http.Client // optional HTTP client for the webhook
+	// NotifyFormat selects the webhook payload shape: "generic" (default,
+	// the existing JSON payload) or "slack" (a Slack webhook {"text": ...}
+	// message). Unknown values fall back to generic.
+	NotifyFormat string
 }
 
 // stateFileName maps a target URL to its state file name: the first 16 hex
@@ -56,7 +60,7 @@ func Run(target string, res *scanner.Result, opts Options, now time.Time) (*Diff
 		return d, err
 	}
 	if opts.Webhook != "" && !d.Empty() {
-		if err := Notify(opts.Webhook, d, opts.Client); err != nil {
+		if err := Notify(opts.Webhook, d, opts.NotifyFormat, opts.Client); err != nil {
 			return d, err
 		}
 	}

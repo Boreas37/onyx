@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Boreas37/onyx/internal/sanitize"
@@ -262,20 +263,61 @@ type notifyPayload struct {
 	Resolved  []Change  `json:"resolved"`
 }
 
-// Notify posts d to webhookURL as JSON. A nil client falls back to an
-// http.Client with a 15s timeout. A non-2xx response is an error carrying
-// the status.
-func Notify(webhookURL string, d *Diff, client *http.Client) error {
+// notifyFormatSlack selects the Slack webhook payload shape in Notify. Any
+// other format value (including the empty default) posts the generic JSON
+// payload.
+const notifyFormatSlack = "slack"
+
+// renderSlackText renders d as a compact multi-line summary suitable for a
+// Slack webhook message body: a header line, then "- " prefixed lines for
+// each new and resolved vulnerability.
+func renderSlackText(d *Diff) string {
+	if d == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Watch diff for %s (scanned %s): %s\n",
+		d.Target, d.ScannedAt.UTC().Format(time.RFC3339), d.Summary())
+	if len(d.New) > 0 {
+		b.WriteString("New vulnerabilities:\n")
+		for _, c := range d.New {
+			fmt.Fprintf(&b, "- [%s] %s/%s %s: %s\n", c.Rating, c.Type, c.Slug, c.CVE, c.Title)
+		}
+	}
+	if len(d.Resolved) > 0 {
+		b.WriteString("Resolved:\n")
+		for _, c := range d.Resolved {
+			fmt.Fprintf(&b, "- [%s] %s/%s %s\n", c.Rating, c.Type, c.Slug, c.CVE)
+		}
+	}
+	return b.String()
+}
+
+// Notify posts d to webhookURL. format selects the payload shape:
+// "slack" wraps the rendered summary as a Slack webhook message
+// ({"text": ...}) posted to the same URL; any other value (including the
+// empty default) posts the generic JSON payload. A nil client falls back
+// to an http.Client with a 15s timeout. A non-2xx response is an error
+// carrying the status.
+func Notify(webhookURL string, d *Diff, format string, client *http.Client) error {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	body, err := json.Marshal(notifyPayload{
-		Target:    d.Target,
-		ScannedAt: d.ScannedAt,
-		Summary:   d.Summary(),
-		New:       d.New,
-		Resolved:  d.Resolved,
-	})
+	var body []byte
+	var err error
+	if format == notifyFormatSlack {
+		body, err = json.Marshal(struct {
+			Text string `json:"text"`
+		}{Text: renderSlackText(d)})
+	} else {
+		body, err = json.Marshal(notifyPayload{
+			Target:    d.Target,
+			ScannedAt: d.ScannedAt,
+			Summary:   d.Summary(),
+			New:       d.New,
+			Resolved:  d.Resolved,
+		})
+	}
 	if err != nil {
 		return fmt.Errorf("watch: encode webhook payload: %w", err)
 	}

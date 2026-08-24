@@ -19,6 +19,10 @@ func esc(s string) string {
 	return html.EscapeString(sanitize.Text(s, 500))
 }
 
+// now is the clock used by timestamped writers; swapped by tests for
+// deterministic golden output. Public behavior is unchanged.
+var now = time.Now
+
 // mdCell escapes a string for use inside a Markdown table cell: pipes are
 // the column separator and raw newlines break the row.
 func mdCell(s string) string {
@@ -31,7 +35,7 @@ func WriteMarkdown(w io.Writer, res *scanner.Result) {
 	if res.WordPressVersion != "" {
 		fmt.Fprintf(w, "**WordPress core:** %s\n\n", mdCell(res.WordPressVersion))
 	}
-	fmt.Fprintf(w, "**Scanned:** %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(w, "**Scanned:** %s\n\n", now().UTC().Format(time.RFC3339))
 
 	if len(res.Interesting) > 0 {
 		fmt.Fprint(w, "## Interesting findings\n\n")
@@ -89,7 +93,7 @@ func WriteHTML(w io.Writer, res *scanner.Result) error {
 	if res.WordPressVersion != "" {
 		b.WriteString(" · WordPress <strong>" + esc(res.WordPressVersion) + "</strong>")
 	}
-	fmt.Fprintf(&b, " · Generated: %s</p>\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, " · Generated: %s</p>\n", now().UTC().Format(time.RFC3339))
 
 	if len(res.Interesting) > 0 {
 		b.WriteString("<h2>Interesting</h2>\n<ul>\n")

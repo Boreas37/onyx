@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>onyx — https://shop.example.test</title>
+<style>
+ body{font-family:-apple-system,sans-serif;margin:2rem auto;max-width:60rem;color:#1a1a2e;background:#fafafa}
+ h1{border-bottom:2px solid #16213e;padding-bottom:.3rem}
+ .meta{color:#555}
+ .sev-critical{color:#8b0000;font-weight:700}.sev-high{color:#c0392b;font-weight:600}
+ .sev-medium{color:#d35400}.sev-low,.sev-info,.sev-unknown{color:#7f8c8d}
+ table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}
+ td,th{border:1px solid #ddd;padding:.35rem .6rem;text-align:left}
+ th{background:#eee}.slug{font-family:monospace}
+</style></head><body>
+<h1>onyx scan report</h1>
+<p class="meta">Target: <strong>https://shop.example.test</strong> · WordPress <strong>7.1</strong> · Generated: 2026-08-01T12:00:00Z</p>
+<h2>Interesting</h2>
+<ul>
+<li>readme.html exposed</li>
+<li>wp-json user enumeration enabled</li>
+</ul>
+<h2>Vulnerabilities (4)</h2>
+<h3><span class="slug">plugin/elementor@3.24.0</span> — 3</h3>
+<table>
+<tr><th>Severity</th><th>CVE</th><th>Title</th></tr>
+<tr><td class="sev-critical">critical</td><td>CVE-2024-0001</td><td>Elementor &lt; 3.25.0 - SQL Injection</td></tr>
+<tr><td class="sev-medium">medium</td><td>CVE-2024-0002</td><td>Elementor &lt; 3.23.9 - Stored XSS</td></tr>
+<tr><td class="sev-low">low</td><td></td><td>Arbitrary file download in Elementor</td></tr>
+</table>
+<h3><span class="slug">plugin/akismet@4.0.0</span> — 1</h3>
+<table>
+<tr><th>Severity</th><th>CVE</th><th>Title</th></tr>
+<tr><td class="sev-high">high</td><td>CVE-2024-0003</td><td>Akismet &lt; 5.0 - Comment Spam Bypass</td></tr>
+</table>
+</body></html>

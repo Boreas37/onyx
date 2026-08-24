@@ -416,3 +416,34 @@ func TestPrintDiffEmpty(t *testing.T) {
 		t.Errorf("empty diff printed sections: %q", out)
 	}
 }
+
+func TestRenderSlackTextSections(t *testing.T) {
+	d := DiffStates(BuildState("https://example.com", baseResult(), testNow), modifiedResult(), testNow)
+	out := renderSlackText(d)
+	for _, want := range []string{
+		"https://example.com",
+		"2 new, 1 resolved, 3 unchanged",
+		"New vulnerabilities:",
+		"- [high] plugin/akismet CVE-2025-9999: Akismet SSRF",
+		"- [critical] plugin/jetpack CVE-2025-4444: Jetpack file upload",
+		"Resolved:",
+		"- [] /hello CVE-2023-3333",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("slack text missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderSlackTextNilAndEmpty(t *testing.T) {
+	if got := renderSlackText(nil); got != "" {
+		t.Errorf("renderSlackText(nil) = %q, want empty", got)
+	}
+	out := renderSlackText(&Diff{Target: "t", Unchanged: 5})
+	if strings.Contains(out, "New vulnerabilities:") || strings.Contains(out, "Resolved:") {
+		t.Errorf("empty diff rendered sections:\n%s", out)
+	}
+	if !strings.Contains(out, "0 new, 0 resolved, 5 unchanged") {
+		t.Errorf("empty diff missing summary: %q", out)
+	}
+}

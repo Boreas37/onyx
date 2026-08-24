@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -67,6 +68,10 @@ func uuidV4() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// uuidV4Fn is the serializer's UUID source; swapped by tests for
+// deterministic golden output. Public behavior is unchanged.
+var uuidV4Fn = uuidV4
+
 // cdxRef builds the sanitized "pkg:wordpress/<type>/<slug>@<version>"
 // bom-ref; the @version suffix is dropped for unknown versions.
 func cdxRef(kind, slug, version string) string {
@@ -77,20 +82,20 @@ func cdxRef(kind, slug, version string) string {
 	return ref
 }
 
-// PrintCycloneDX writes res as a CycloneDX 1.5 JSON BOM to stdout: one
+// writeCycloneDX writes res as a CycloneDX 1.5 JSON BOM to w: one
 // application component per detected plugin/theme, ordered by slug then
 // type, with onyx:type properties. Target-controlled strings are stripped
 // of control characters and length-capped before embedding so a hostile
 // target cannot corrupt the document.
-func PrintCycloneDX(toolVersion string, res *scanner.Result) {
+func writeCycloneDX(w io.Writer, toolVersion string, res *scanner.Result) {
 	bom := cdxBOM{
 		BOMFormat:    "CycloneDX",
 		SpecVersion:  "1.5",
-		SerialNumber: "urn:uuid:" + uuidV4(),
+		SerialNumber: "urn:uuid:" + uuidV4Fn(),
 		Version:      1,
 		Components:   []cdxComponent{},
 		Metadata: cdxMetadata{
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: now().UTC().Format(time.RFC3339),
 			Tools: cdxToolList{Components: []cdxComponent{{
 				Type:    "application",
 				Name:    "onyx",
@@ -134,5 +139,10 @@ func PrintCycloneDX(toolVersion string, res *scanner.Result) {
 		fmt.Fprintln(os.Stderr, "cyclonedx output:", err)
 		return
 	}
-	fmt.Println(string(out))
+	fmt.Fprintln(w, string(out))
+}
+
+// PrintCycloneDX writes res as a CycloneDX 1.5 JSON BOM to stdout.
+func PrintCycloneDX(toolVersion string, res *scanner.Result) {
+	writeCycloneDX(os.Stdout, toolVersion, res)
 }
