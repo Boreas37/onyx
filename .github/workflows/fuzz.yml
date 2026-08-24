@@ -1,9 +1,10 @@
 name: fuzz
 
 # Nightly fuzzing of the report-safety invariants: version extractors,
-# REST/JSON parsers, the feed loader and the sanitizer. Each target gets a
-# short budget; any crash or invariant violation fails the run and uploads
-# the failing corpus entry as an artifact.
+# REST/JSON parsers, the feed loader, the sanitizer, the report writers and
+# the version range matcher. Each target gets a short budget; any crash or
+# invariant violation fails the run and uploads the failing corpus entry as
+# an artifact.
 #
 # Note: `go test -fuzz` accepts exactly one fuzz target per invocation, so
 # the targets are enumerated explicitly.
@@ -39,13 +40,32 @@ jobs:
             target: FuzzLoad
           - package: ./internal/sanitize
             target: FuzzText
+          - package: ./internal/version
+            target: FuzzParse
+          - package: ./internal/version
+            target: FuzzInAffected
+          # FuzzWriteReportSafety lives in internal/report (owned by another
+          # agent). It may not exist on the very first CI run, so the guard
+          # step below skips it gracefully instead of hard-failing.
+          - package: ./internal/report
+            target: FuzzWriteReportSafety
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      - name: "Guard: fuzz target exists"
+        id: guard
+        run: |
+          if grep -Rqs "func Fuzz${{ matrix.target }}" "${{ matrix.package }}"; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::fuzz target Fuzz${{ matrix.target }} not found in ${{ matrix.package }} — skipping (may not have landed yet)"
+            echo "exists=0" >> "$GITHUB_OUTPUT"
+          fi
       - name: Fuzz ${{ matrix.target }} (${{ matrix.package }})
         id: fuzz
+        if: steps.guard.outputs.exists == '1'
         continue-on-error: true
         run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 120s ${{ matrix.package }}
       - name: Upload crash artifacts

@@ -69,6 +69,14 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go (for the SBOM's stdlib version)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -80,10 +88,87 @@ jobs:
           find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sort -k2 > checksums.txt
           cat checksums.txt
 
+      # P3-18b — SPDX 2.3 SBOM attached to every release. onyx is
+      # stdlib-only (go.mod declares zero third-party dependencies), so the
+      # SBOM is a minimal document describing the module plus the Go
+      # standard library it depends on. Best-effort: any failure here must
+      # never block the release, so the step is continue-on-error.
+      - name: Generate SBOM (best-effort)
+        continue-on-error: true
+        run: |
+          python3 - "${{ github.ref_name }}" > sbom.spdx.json <<'PY'
+          import datetime
+          import json
+          import subprocess
+          import sys
+
+          tag = sys.argv[1]
+          try:
+              gover = subprocess.run(
+                  ["go", "version"], capture_output=True, text=True, check=True
+              ).stdout.strip().split(" ")[2]
+          except Exception:
+              gover = "go1.23"
+
+          doc = {
+              "spdxVersion": "SPDX-2.3",
+              "dataLicense": "CC0-1.0",
+              "SPDXID": "SPDXRef-DOCUMENT",
+              "name": "onyx-%s-sbom" % tag,
+              "documentNamespace": "https://github.com/Boreas37/onyx/releases/tag/%s#sbom" % tag,
+              "creationInfo": {
+                  "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "creators": ["Tool: onyx-release-workflow"],
+              },
+              "packages": [
+                  {
+                      "name": "github.com/Boreas37/onyx",
+                      "SPDXID": "SPDXRef-Package-onyx",
+                      "versionInfo": tag,
+                      "downloadLocation": "https://github.com/Boreas37/onyx",
+                      "filesAnalyzed": False,
+                      "licenseConcluded": "NOASSERTION",
+                      "licenseDeclared": "NOASSERTION",
+                      "copyrightText": "NOASSERTION",
+                      "comment": "stdlib-only: the module github.com/Boreas37/onyx has zero third-party Go dependencies and depends only on the Go standard library.",
+                  },
+                  {
+                      "name": "Go Standard Library",
+                      "SPDXID": "SPDXRef-Package-gostdlib",
+                      "versionInfo": gover,
+                      "downloadLocation": "https://go.dev/dl/",
+                      "filesAnalyzed": False,
+                      "licenseConcluded": "BSD-3-Clause",
+                      "copyrightText": "NOASSERTION",
+                  },
+              ],
+              "relationships": [
+                  {
+                      "spdxElementId": "SPDXRef-DOCUMENT",
+                      "relatedSpdxElement": "SPDXRef-Package-onyx",
+                      "relationshipType": "DESCRIBES",
+                  },
+                  {
+                      "spdxElementId": "SPDXRef-Package-onyx",
+                      "relatedSpdxElement": "SPDXRef-Package-gostdlib",
+                      "relationshipType": "DEPENDS_ON",
+                  },
+              ],
+          }
+          json.dump(doc, sys.stdout, indent=2)
+          sys.stdout.write("\n")
+          PY
+          python3 -c "import json; json.load(open('sbom.spdx.json')); print('sbom.spdx.json is valid JSON')"
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: |
             dist/**/*.tar.gz
             dist/**/*.zip
             dist/checksums.txt
+            sbom.spdx.json
+            docs/SBOM.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

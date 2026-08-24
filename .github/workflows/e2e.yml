@@ -1,0 +1,49 @@
+name: e2e
+
+# P3-19 — hermetic end-to-end scan test. Builds onyx, constructs a minimal
+# Wordfence-shaped feed, stands up a fake WordPress target (stdlib http.server
+# bound to 127.0.0.1:8123, no docker, no external network) and asserts the
+# scanner's behaviour: vulnerability detection, core version fingerprinting,
+# user enumeration via the rest_route fallback, and the absence of false
+# positives for the wp-config.php.bak decoy and the empty-body version.php.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build binary
+        run: |
+          go build ./...
+          go build -o /tmp/onyx-minisign ./cmd/onyx-minisign
+          go build -o /tmp/onyx .
+
+      - name: Construct minimal test feed
+        run: |
+          mkdir -p data
+          cat > data/wordfence.json <<'EOF'
+          {"test-vuln-0001":{"id":"test-vuln-0001","title":"ACME Toolbox < 1.2.4 SQL Injection","software":[{"type":"plugin","name":"ACME Toolbox","slug":"acme-toolbox","affected_versions":{"<= 1.2.3":{"to_version":"1.2.3","to_inclusive":true}}}],"informational":false,"description":"ACME Toolbox is vulnerable to SQL injection before 1.2.4.","cve":"CVE-2026-00001","cvss":{"vector":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","score":9.8,"rating":"critical"},"published_at":"2026-01-01T00:00:00Z"}}
+          EOF
+          python3 -c "import json; json.load(open('data/wordfence.json')); print('feed is valid JSON')"
+
+      - name: Run end-to-end scan
+        run: scripts/e2e.sh /tmp/onyx data/wordfence.json
+
+      - name: Smoke gate (build + vet + targeted tests)
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./internal/scanner/ ./internal/report/ ./internal/version/
