@@ -124,6 +124,19 @@ type Options struct {
 	// plus jitter before giving up. The CLI flag defaults it to 2; 0
 	// disables retries entirely.
 	MaxRetries int
+	// Discover404 probes ONE deliberately nonexistent path
+	// (/<contentDir>-404-check-<random>/) after the homepage fetch and
+	// treats any wp-content references in its 200 body as passive
+	// plugin/theme evidence, WPScan's urls_in_404_page parity. The zero
+	// value (off) preserves the historical request budget; the CLI defaults
+	// it to true.
+	Discover404 bool
+	// PopularFile is an optional path to a JSON popular-list file
+	// ({"plugins":["slug",...],"themes":["slug",...]}) that replaces the
+	// built-in popular.go seed lists for aggressive enumeration. A missing
+	// or unparseable file falls back to the built-ins with a one-time
+	// warning, never an error. Empty when unused.
+	PopularFile string
 }
 
 // Scanner drives one scan against a single target.
@@ -149,7 +162,6 @@ type Scanner struct {
 	rlMu          sync.Mutex // guards the rate-limit state below
 	rateHits      int        // count of 429 responses seen
 	rlBackoff     time.Duration
-	maxBackoff    time.Duration
 	cooldownUntil time.Time     // global pause: every fetch gates on this
 	consecOK      int           // consecutive non-429 responses
 	sendSlot      time.Time     // next permitted send instant (adaptive pacing)
@@ -188,6 +200,21 @@ type Scanner struct {
 	fingerprintOnce sync.Once
 	fingerprintTab  *fingerprintTable
 	fingerprintErr  error
+
+	// homepageCode is the HTTP status of the homepage fetch (0 when it was
+	// never performed, e.g. a transport failure). The WAF/challenge
+	// auto-detection rule keys off it.
+	homepageCode int
+	// fourohfourPlugins / fourohfourThemes hold the plugin and theme slugs
+	// referenced on the --discover-404 probe page (WPScan urls_in_404_page
+	// parity); they join passive enumeration exactly like homepage
+	// references. fourohfourVersions carries the ?ver= versions found on
+	// that page so they can be matched against the database.
+	fourohfourPlugins  []string
+	fourohfourThemes   []string
+	fourohfourVersions map[string]string
+
+	popularOnce sync.Once // guards the --popular-file load (one-time warning)
 }
 
 // configBackupFiles are the wp-config.php backup names probed by the cb
@@ -711,7 +738,6 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 		s.perHostLim = make(map[string]*rateLimiter)
 		s.perHostInterval = time.Duration(float64(time.Second) / opts.PerHostRateLimit)
 	}
-	s.maxBackoff = 30 * time.Second
 	return s, nil
 }
 
@@ -835,6 +861,11 @@ type Detected struct {
 	Version    string `json:"installed_version"`
 	Source     string `json:"source,omitempty"`
 	Confidence int    `json:"confidence,omitempty"`
+	// TestedUpTo and RequiresAtLeast are readme.txt / style.css header
+	// metadata ("Tested up to:" / "Requires at least:" lines) captured for
+	// reporting; both are omitted when the artifact carries none.
+	TestedUpTo      string `json:"tested_up_to,omitempty"`
+	RequiresAtLeast string `json:"requires_at_least,omitempty"`
 }
 
 // CoreEvidence records one WordPress core version observation together with
@@ -864,6 +895,13 @@ type Vulnerability struct {
 	// Kev reports whether the CVE is listed in the CISA Known Exploited
 	// Vulnerabilities catalog; omitted when false.
 	Kev bool `json:"kev,omitempty"`
+	// Remediation is the human-readable fix guidance from the feed
+	// (e.g. "Update the plugin to version X or newer"); omitted when
+	// the record carries none.
+	Remediation string `json:"remediation,omitempty"`
+	// PatchedVersions lists the feed's known-fixed versions for this
+	// software entry; omitted when unknown.
+	PatchedVersions []string `json:"patched_versions,omitempty"`
 }
 
 // Finding links an installed component to its matching vulnerabilities.
@@ -930,6 +968,10 @@ type Result struct {
 	LoginBrutes      []LoginBrute          `json:"login_brutes,omitempty"` // valid credentials found by brute force
 	AuthStatus       string                `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
 	Summary          *Summary              `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
+	// SchemaVersion is the version of the Result JSON shape, so CI
+	// consumers can detect breaking output changes. "1.0" is the first
+	// versioned shape (onyx 0.5.0+); always present.
+	SchemaVersion string `json:"schema_version"`
 }
 
 // sendRequest issues one HTTP request through client, re-running the full
@@ -1051,6 +1093,49 @@ func (s *Scanner) rateLimitGate() {
 // outbound requests while a target keeps answering 429.
 const maxAdaptiveSpacing = 2 * time.Second
 
+// maxBackoff caps the shared exponential 429 backoff (1s, 2s, 4s, ...) so
+// a hostile or broken target cannot park the scan behind ever-growing
+// waits.
+const maxBackoff = 30 * time.Second
+
+// nextSpacing grows the adaptive inter-request spacing after a 429: the
+// first hit starts at 250ms and every further hit doubles it until
+// maxAdaptiveSpacing, at which point the value saturates exactly at the
+// cap. Pure so the pacing math can be property-tested.
+func nextSpacing(cur time.Duration) time.Duration {
+	if cur == 0 {
+		return 250 * time.Millisecond
+	}
+	cur *= 2
+	if cur > maxAdaptiveSpacing {
+		return maxAdaptiveSpacing
+	}
+	return cur
+}
+
+// nextBackoff grows the shared exponential 429 backoff: the first hit
+// starts at 1s and every further hit doubles it until maxBackoff, at which
+// point the value saturates exactly at the cap. Pure so the pacing math
+// can be property-tested.
+func nextBackoff(cur time.Duration) time.Duration {
+	if cur == 0 {
+		return time.Second
+	}
+	cur *= 2
+	if cur > maxBackoff {
+		return maxBackoff
+	}
+	return cur
+}
+
+// shouldAbort reports whether the rate-limit early-abort heuristic fires:
+// at least rateAbortMinHits requests have been throttled AND at least
+// rateAbortPct percent of all traffic so far was throttled (total > 0).
+// Pure so the heuristic can be property-tested.
+func shouldAbort(hits, total int) bool {
+	return total > 0 && hits >= rateAbortMinHits && hits*100/total >= rateAbortPct
+}
+
 // rateAbortMinHits and rateAbortPct define the early-abort heuristic: once
 // enough requests have been sent and at least half of recent traffic is
 // being throttled, enumeration stops early — grinding through hundreds of
@@ -1092,22 +1177,8 @@ func (s *Scanner) noteRateLimited(h http.Header) time.Duration {
 	defer s.rlMu.Unlock()
 	s.rateHits++
 	s.consecOK = 0
-	if s.spacing == 0 {
-		s.spacing = 250 * time.Millisecond
-	} else {
-		s.spacing *= 2
-		if s.spacing > maxAdaptiveSpacing {
-			s.spacing = maxAdaptiveSpacing
-		}
-	}
-	if s.rlBackoff == 0 {
-		s.rlBackoff = time.Second
-	} else {
-		s.rlBackoff *= 2
-		if s.rlBackoff > s.maxBackoff {
-			s.rlBackoff = s.maxBackoff
-		}
-	}
+	s.spacing = nextSpacing(s.spacing)
+	s.rlBackoff = nextBackoff(s.rlBackoff)
 	wait := s.rlBackoff
 	if ra, ok := retryAfter(h, time.Now()); ok {
 		// Clamp to [1s, 60s]: never spin faster than a second against an
@@ -1121,11 +1192,8 @@ func (s *Scanner) noteRateLimited(h http.Header) time.Duration {
 		wait = ra
 	}
 	s.cooldownUntil = time.Now().Add(wait)
-	if s.rateHits >= rateAbortMinHits {
-		total := s.requests.Load()
-		if total > 0 && s.rateHits*100/int(total) >= rateAbortPct {
-			s.abortRateLimited.Store(true)
-		}
+	if shouldAbort(s.rateHits, int(s.requests.Load())) {
+		s.abortRateLimited.Store(true)
 	}
 	return wait
 }
@@ -1476,6 +1544,39 @@ func (s *Scanner) interestingFinders() []string {
 	return out
 }
 
+// wafChallengeMarkers are the lowercase substrings that hint at a WAF or
+// bot-challenge interstitial when present in the homepage body. They cover
+// the common providers' challenge pages (Cloudflare's Turnstile/Challenge
+// Platform and cf-chl pages, Incapsula's "attention required", the generic
+// "checking your browser" JS challenge and WAF rate-limit interstitials).
+var wafChallengeMarkers = []string{
+	"challenge-platform",
+	"cf-chl",
+	"captcha",
+	"attention required",
+	"checking your browser",
+	"unusual traffic",
+}
+
+// wafChallengeEntry returns the static Interesting entry when the homepage
+// response looks like a WAF/challenge page: a 403/429/503 status or a body
+// carrying one of wafChallengeMarkers. It returns "" when the homepage was
+// never fetched (homepageCode 0) or looks clean. Purely informational —
+// the scan continues either way.
+func (s *Scanner) wafChallengeEntry() string {
+	switch s.homepageCode {
+	case http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return "possible WAF/challenge page (403/429/503 or challenge marker)"
+	}
+	lower := strings.ToLower(s.homepage)
+	for _, m := range wafChallengeMarkers {
+		if strings.Contains(lower, m) {
+			return "possible WAF/challenge page (403/429/503 or challenge marker)"
+		}
+	}
+	return ""
+}
+
 // restPath lists the URL forms under which a WordPress REST route answers:
 // pretty-permalink installs expose /wp-json<path>, while sites running
 // WITHOUT rewrite rules serve REST only through the rest_route query
@@ -1671,6 +1772,9 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 	if err != nil {
 		return "", nil, err
 	}
+	// Remember the homepage status for the WAF/challenge auto-detection
+	// rule (403/429/503 or challenge markers) evaluated later in Scan().
+	s.homepageCode = code
 	if code == 200 {
 		html := string(body)
 		s.homepage = html
@@ -1794,6 +1898,28 @@ func (j job) label(version string) string {
 	return l
 }
 
+// discover404 probes ONE deliberately nonexistent path and treats any
+// wp-content references in its 200 body as passive plugin/theme evidence,
+// WPScan's urls_in_404_page parity: some themes and plugins emit their full
+// asset inventory on their 404 error pages, which the homepage alone never
+// shows. The probe path embeds a per-scan random suffix so caching layers
+// and CDNs cannot serve a stale or canonicalized probe. Only a 200 response
+// whose body references the content directory counts; anything else
+// (404/403, a front-controller rewrite back to the homepage without
+// references) is ignored, so normal sites gain no extra jobs.
+func (s *Scanner) discover404() {
+	path := fmt.Sprintf("/%s-404-check-%08x/", s.contentDir, rand.Uint32())
+	code, body, err := s.fetch(path)
+	if err != nil || code != http.StatusOK {
+		return
+	}
+	if !strings.Contains(strings.ToLower(string(body)), strings.ToLower(s.contentDir)) {
+		return
+	}
+	s.fourohfourPlugins, s.fourohfourThemes = ExtractPassiveSlugsIn(string(body), s.contentDir)
+	s.fourohfourVersions = ExtractPassiveVersionsIn(string(body), s.contentDir)
+}
+
 func (s *Scanner) buildJobs() []job {
 	var jobs []job
 	seen := make(map[string]bool)
@@ -1814,6 +1940,29 @@ func (s *Scanner) buildJobs() []job {
 		for _, slug := range passiveT {
 			if !s.enumerateThemes() {
 				break
+			}
+			seen["t:"+slug] = true
+			jobs = append(jobs, job{kind: "theme", slug: slug,
+				path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
+		}
+	}
+
+	// Passive detection via the 404-check probe (--discover-404): slugs
+	// referenced on the deliberately nonexistent path join the job list
+	// exactly like homepage references, deduplicated through the same seen
+	// map.
+	if passive && (len(s.fourohfourPlugins)+len(s.fourohfourThemes) > 0) {
+		for _, slug := range s.fourohfourPlugins {
+			if !s.enumeratePlugins() || seen["p:"+slug] {
+				continue
+			}
+			seen["p:"+slug] = true
+			jobs = append(jobs, job{kind: "plugin", slug: slug,
+				path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
+		}
+		for _, slug := range s.fourohfourThemes {
+			if !s.enumerateThemes() || seen["t:"+slug] {
+				continue
 			}
 			seen["t:"+slug] = true
 			jobs = append(jobs, job{kind: "theme", slug: slug,
@@ -1900,10 +2049,13 @@ func (s *Scanner) buildJobs() []job {
 			// Popular slug seeds (--popular, default true): after the DB
 			// top list, append well-known slugs not already queued so
 			// popular-but-not-vulnerable components still get probed.
-			// Ordering is the deterministic popular.go list order; the loop
-			// stops as soon as the aggressive budget is exhausted.
+			// Ordering is the deterministic list order (the built-in
+			// popular.go lists, or the --popular-file lists when that
+			// option is set); the loop stops as soon as the aggressive
+			// budget is exhausted.
 			if s.opts.PopularSlugs {
-				for _, slug := range popularPlugins {
+				popP, popT := s.popularSeedLists()
+				for _, slug := range popP {
 					if len(jobs) >= budget {
 						break
 					}
@@ -1914,7 +2066,7 @@ func (s *Scanner) buildJobs() []job {
 					jobs = append(jobs, job{kind: "plugin", slug: slug,
 						path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
 				}
-				for _, slug := range popularThemes {
+				for _, slug := range popT {
 					if len(jobs) >= budget {
 						break
 					}
@@ -1931,12 +2083,54 @@ func (s *Scanner) buildJobs() []job {
 	return jobs
 }
 
+// popularSeedLists returns the plugin/theme seed lists for the popular
+// section of aggressive enumeration. By default these are the built-in
+// popular.go lists; when --popular-file is set, a readable JSON file
+// ({"plugins":[...],"themes":[...]}) replaces them entirely, keeping the
+// file's ordering and deduplicating repeated slugs. A missing or
+// unparseable file falls back to the built-ins with a one-time progress
+// warning — a broken list file never aborts a scan. The load runs at most
+// once per scan (popularOnce).
+func (s *Scanner) popularSeedLists() (plugins, themes []string) {
+	plugins, themes = popularPlugins, popularThemes
+	s.popularOnce.Do(func() {
+		if s.opts.PopularFile == "" {
+			return
+		}
+		data, err := os.ReadFile(s.opts.PopularFile)
+		if err != nil {
+			if pr := s.progress; pr != nil {
+				pr.LogInf("[WARN] popular list %s unreadable (%v) — using built-in lists", s.opts.PopularFile, err)
+			}
+			return
+		}
+		var f struct {
+			Plugins []string `json:"plugins"`
+			Themes  []string `json:"themes"`
+		}
+		if err := json.Unmarshal(data, &f); err != nil {
+			if pr := s.progress; pr != nil {
+				pr.LogInf("[WARN] popular list %s unparseable (%v) — using built-in lists", s.opts.PopularFile, err)
+			}
+			return
+		}
+		plugins, themes = unique(f.Plugins), unique(f.Themes)
+	})
+	return
+}
+
 // matchDatabase compares an installed version against every database record
 // for slug and returns the matching finding. Non-numeric ("unknown")
 // versions never match: no range matching is performed, preventing false
-// positives.
+// positives. The finding's display name comes from the database (NameFor)
+// when the slug is known, falling back to the slug itself; the first
+// matching software entry per record also supplies its Remediation and
+// PatchedVersions into the emitted vulnerability.
 func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 	f := Finding{Slug: slug, Name: slug, Type: typ, InstalledVersion: rawVersion}
+	if name := s.db.NameFor(slug); name != "" {
+		f.Name = name
+	}
 	v, ok := version.Parse(rawVersion)
 	if !ok {
 		return f
@@ -1958,14 +2152,16 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 				}
 				seen[rec.ID] = true
 				f.Vulnerabilities = append(f.Vulnerabilities, Vulnerability{
-					ID:             rec.ID,
-					Title:          rec.Title,
-					CVE:            rec.CVE,
-					CVSSScore:      rec.CVSS.Score,
-					Rating:         rec.CVSS.Rating,
-					Description:    rec.Description,
-					PublishedAt:    rec.PublishedAt,
-					AffectedLabels: []string{label},
+					ID:              rec.ID,
+					Title:           rec.Title,
+					CVE:             rec.CVE,
+					CVSSScore:       rec.CVSS.Score,
+					Rating:          rec.CVSS.Rating,
+					Description:     rec.Description,
+					PublishedAt:     rec.PublishedAt,
+					AffectedLabels:  []string{label},
+					Remediation:     sw.Remediation,
+					PatchedVersions: sw.PatchedVersions,
 				})
 				break
 			}
@@ -1994,20 +2190,29 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 	var ver string
 	var found bool
 	source := "readme"
+	var testedUpTo, requiresAtLeast string
 	switch j.kind {
 	case "plugin":
 		code, body, err := s.fetch(j.path)
 		if err == nil && code == http.StatusOK {
-			ver, found = ExtractVersionFromReadme(string(body))
+			bodyStr := string(body)
+			ver, found = ExtractVersionFromReadme(bodyStr)
 			if !found {
 				// Readme with no "Stable tag:" line: fall back to the first
 				// version heading in its Changelog section.
-				if clVer, ok := ExtractVersionFromChangelog(string(body)); ok {
+				if clVer, ok := ExtractVersionFromChangelog(bodyStr); ok {
 					ver, found = clVer, true
 					source = "readme-changelog"
 				}
 			}
 			found = found && looksLikeReadme(body)
+			if found {
+				// Readme header metadata: the "Tested up to:" and
+				// "Requires at least:" lines. Both stay empty when the
+				// headers are absent.
+				testedUpTo = ExtractTestedUpTo(bodyStr)
+				requiresAtLeast = ExtractRequiresAtLeast(bodyStr)
+			}
 		}
 		if !found {
 			// Readme missing or versionless: the plugin's composer.json
@@ -2021,15 +2226,26 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 	case "theme":
 		code, body, err := s.fetch(j.path)
 		if err == nil && code == http.StatusOK {
-			ver, found = ExtractVersionFromStyleCSS(string(body))
+			bodyStr := string(body)
+			ver, found = ExtractVersionFromStyleCSS(bodyStr)
 			source = "style.css"
 			found = found && looksLikeThemeCSS(body)
+			if found {
+				// style.css carries "Requires at least:" in its header too;
+				// "Tested up to" is a readme.txt-only header.
+				requiresAtLeast = ExtractRequiresAtLeast(bodyStr)
+			}
 		}
 	}
 	if !found {
 		return nil, nil
 	}
-	detected := []Detected{{Slug: j.slug, Name: j.slug, Type: j.kind, Version: ver, Source: source, Confidence: sourceConfidence(source)}}
+	name := j.slug
+	if n := s.db.NameFor(j.slug); n != "" {
+		name = n
+	}
+	detected := []Detected{{Slug: j.slug, Name: name, Type: j.kind, Version: ver, Source: source,
+		Confidence: sourceConfidence(source), TestedUpTo: testedUpTo, RequiresAtLeast: requiresAtLeast}}
 	f := s.matchDatabase(j.slug, j.kind, ver)
 	if len(f.Vulnerabilities) > 0 {
 		return detected, []Finding{f}
@@ -2099,6 +2315,11 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 			versions[slug] = ver
 		}
 	}
+	for slug, ver := range s.fourohfourVersions {
+		if _, ok := versions[slug]; !ok {
+			versions[slug] = ver
+		}
+	}
 	if len(versions) == 0 {
 		return
 	}
@@ -2115,6 +2336,8 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 	hp, ht := ExtractPassiveSlugsIn(s.homepage, s.contentDir)
 	reg(hp, "plugin")
 	reg(ht, "theme")
+	reg(s.fourohfourPlugins, "plugin")
+	reg(s.fourohfourThemes, "theme")
 	reg(s.sitemapPlugins, "plugin")
 	reg(s.sitemapThemes, "theme")
 
@@ -2174,7 +2397,7 @@ func (s *Scanner) Scan() (*Result, error) {
 		defer cancel()
 	}
 
-	res := &Result{Target: s.base}
+	res := &Result{Target: s.base, SchemaVersion: "1.0"}
 	scanStart := time.Now()
 	pr := s.progress
 	if pr != nil {
@@ -2315,6 +2538,29 @@ func (s *Scanner) Scan() (*Result, error) {
 	// the same --max-requests budget as enumeration.
 	if s.opts.CrawlPages > 0 && !s.opts.APIOnly && (s.mode == "mixed" || s.mode == "passive") {
 		s.discoverViaSitemap(s.opts.CrawlPages)
+	}
+
+	// WAF/challenge auto-detection (always-on, informational): a
+	// 403/429/503 homepage — or a 200 body carrying a challenge marker —
+	// hints that a WAF or bot-check sits in front of the target. Placed
+	// AFTER interestingFinders, which assigns res.Interesting wholesale;
+	// the entry is appended only when the target still passed the
+	// IsWordPress gate above.
+	if s.homepageCode != 0 {
+		if w := s.wafChallengeEntry(); w != "" {
+			res.Interesting = append(res.Interesting, w)
+			if pr != nil {
+				pr.LogInf("possible WAF block — consider --exclude-content-based <regex> or --stealth")
+			}
+		}
+	}
+
+	// 404-page passive discovery (--discover-404): one probe of a
+	// deliberately nonexistent path (WPScan urls_in_404_page parity) can
+	// surface wp-content references a normal homepage never carries. Runs
+	// before buildJobs so discovered slugs join the enumeration jobs.
+	if s.opts.Discover404 && (s.mode == "mixed" || s.mode == "passive") {
+		s.discover404()
 	}
 
 	jobs := s.buildJobs()

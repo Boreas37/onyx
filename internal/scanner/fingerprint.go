@@ -54,6 +54,14 @@ var (
 	// opmlGenRe parses the WordPress version from the generator attribute
 	// of wp-links-opml.php: generator="WordPress/X.Y".
 	opmlGenRe = regexp.MustCompile(`(?i)generator=["']WordPress/([0-9][0-9a-zA-Z.-]*)`)
+	// testedUpToRe matches a readme.txt / style.css header line
+	// "Tested up to: X" (case-insensitive, "=" separator tolerated,
+	// trailing spaces trimmed).
+	testedUpToRe = regexp.MustCompile(`(?im)^\s*tested\s*up\s*to\s*[:=]\s*(.+?)\s*$`)
+	// requiresAtLeastRe matches a readme.txt / style.css header line
+	// "Requires at least: Y" (case-insensitive, "=" separator tolerated,
+	// trailing spaces trimmed).
+	requiresAtLeastRe = regexp.MustCompile(`(?im)^\s*requires\s*at\s*least\s*[:=]\s*(.+?)\s*$`)
 )
 
 // sanitizeText makes a target-supplied string safe to embed in reports.
@@ -77,6 +85,33 @@ func ExtractVersionFromReadme(body string) (version string, found bool) {
 		return "", false
 	}
 	return sanitizeVersion(m[1]), true
+}
+
+// ExtractTestedUpTo parses the "Tested up to:" header line of a WordPress
+// readme.txt (or theme style.css header) and returns the WordPress version
+// the component was tested against, sanitized. It returns "" when the
+// header is absent. The match is case-insensitive, tolerates trailing
+// spaces (and the historical "Tested up to = X" separator spelling), and
+// never spans lines.
+func ExtractTestedUpTo(body string) string {
+	m := testedUpToRe.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return sanitizeVersion(strings.TrimSpace(m[1]))
+}
+
+// ExtractRequiresAtLeast parses the "Requires at least:" header line of a
+// WordPress readme.txt or theme style.css and returns the minimum WordPress
+// version required, sanitized. It returns "" when the header is absent. The
+// match is case-insensitive, tolerates trailing spaces (and the "Requires
+// at least = Y" separator spelling), and never spans lines.
+func ExtractRequiresAtLeast(body string) string {
+	m := requiresAtLeastRe.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return sanitizeVersion(strings.TrimSpace(m[1]))
 }
 
 // ExtractVersionFromChangelog parses the first version heading inside a
