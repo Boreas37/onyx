@@ -220,6 +220,8 @@ type scanOptions struct {
 	jobs                 int
 	discover404          bool
 	popularFile          string
+	popularThemes        bool
+	wpVersion            string
 	failOnRateLimited    bool
 	nucleiMinSeverity    string
 	outputs              []string
@@ -246,6 +248,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.contentDir = "wp-content"
 	o.pluginsDir = "wp-content/plugins"
 	o.popularSlugs = true
+	o.popularThemes = true
 	o.retries = 2
 	o.jobs = 1
 	o.discover404 = true
@@ -441,6 +444,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 				fmt.Fprintln(os.Stderr, "error: --jobs must be >= 1")
 				os.Exit(2)
 			}
+		case a == "--wp-version" && i+1 < len(args):
+			i++
+			o.wpVersion = args[i]
 		case a == "--no-discover-404":
 			o.discover404 = false
 		case a == "--fail-on-rate-limited":
@@ -552,11 +558,62 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		}
 	}
 	if o.enumerate != "" {
-		for _, c := range o.enumerate {
-			if !strings.ContainsRune("ptum", c) {
-				fmt.Fprintf(os.Stderr, "invalid --enumerate value %q (use p, t, u and/or m)\n", o.enumerate)
+		validToken := func(tok string) bool {
+			switch tok {
+			case "p", "vp", "ap", "t", "vt", "at", "u", "m":
+				return true
+			}
+			return false
+		}
+		tokens := strings.Split(o.enumerate, ",")
+		allTokens := true
+		for _, tok := range tokens {
+			if !validToken(strings.ToLower(strings.TrimSpace(tok))) {
+				allTokens = false
+				break
+			}
+		}
+		if !allTokens {
+			// Legacy bare-letter form ("ptum"): validate per rune and
+			// keep popular seeds on for both kinds.
+			if strings.Contains(o.enumerate, ",") {
+				fmt.Fprintf(os.Stderr, "invalid --enumerate value %q (use p, vp, ap, t, vt, at, u and/or m; comma-separated)\n", o.enumerate)
 				os.Exit(2)
 			}
+			for _, c := range o.enumerate {
+				if !strings.ContainsRune("ptum", c) {
+					fmt.Fprintf(os.Stderr, "invalid --enumerate value %q (use p, t, u and/or m)\n", o.enumerate)
+					os.Exit(2)
+				}
+			}
+		} else {
+			// Normalize the tokens back to the scanner's single-letter
+			// alphabet (p/t/u/m): the v/a prefixes only carry the
+			// popular-seed mapping above, and the scanner derives
+			// enumeration purely from substring presence.
+			var norm []byte
+			for _, tok := range tokens {
+				tok = strings.ToLower(strings.TrimSpace(tok))
+				switch tok {
+				case "p", "ap":
+					o.popularSlugs = true
+					norm = append(norm, 'p')
+				case "vp":
+					o.popularSlugs = false
+					norm = append(norm, 'p')
+				case "t", "at":
+					o.popularThemes = true
+					norm = append(norm, 't')
+				case "vt":
+					o.popularThemes = false
+					norm = append(norm, 't')
+				case "u":
+					norm = append(norm, 'u')
+				case "m":
+					norm = append(norm, 'm')
+				}
+			}
+			o.enumerate = string(norm)
 		}
 	}
 	switch o.format {
@@ -828,7 +885,7 @@ Scan flags:
   --rate-limit N     max requests per second (overrides --stealth)
   --verbose          full one-line-per-finding output (default: compact)
   --min-severity S   only show findings >= severity (critical|high|medium|low)
-  --enumerate M      enumerate p (plugins), t (themes), u (users), m (media); combine (default: pt)
+  --enumerate M      enumerate p/vp/ap (plugins), t/vt/at (themes), u (users), m (media); comma-separated (default: pt)
   --max-requests N   cap on brute-force enumeration requests (default: 500)
   --output FILE      write JSON results to FILE (CSV with --format csv; table still prints to stdout)
   --no-summary       omit the scan summary section (stats are in the JSON "summary" field otherwise)
@@ -1312,6 +1369,8 @@ func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Op
 		MaxRetries:           o.retries,
 		Discover404:          o.discover404,
 		PopularFile:          o.popularFile,
+		PopularThemes:        o.popularThemes,
+		CoreVersionOverride:  o.wpVersion,
 		BasicAuthUser:        o.basicAuthUser,
 		BasicAuthPass:        o.basicAuthPass,
 		Cookie:               o.cookie,

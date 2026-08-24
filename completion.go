@@ -24,7 +24,7 @@ var scanFlagList = []string{
 	"--strict-wp", "--crawl-pages", "--fail-on", "--no-intel",
 	"--fingerprint-db", "--no-popular", "--allow-foreign-redirect",
 	"--retries", "--jobs", "--no-discover-404", "--fail-on-rate-limited",
-	"--nuclei-min-severity", "--outputs",
+	"--nuclei-min-severity", "--outputs", "--wp-version",
 	"--targets", "--profile", "--connect-timeout", "--request-timeout",
 	"--format", "--db",
 	"--basic-auth", "--cookie", "--headers", "--vhost", "--force",

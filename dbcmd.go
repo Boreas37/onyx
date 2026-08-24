@@ -138,15 +138,48 @@ func dbDiff(d *db.DB, pathB string) int {
 			slugsRemoved = append(slugsRemoved, s)
 		}
 	}
+	shared := 0
+	for id := range ma {
+		if mb[id] {
+			shared++
+		}
+	}
 	sort.Strings(added)
 	sort.Strings(removed)
 	sort.Strings(slugsAdded)
 	sort.Strings(slugsRemoved)
+
 	fmt.Printf("db diff: %d records vs %d records\n", len(ma), len(mb))
+	fmt.Printf("  shared ids:      %d\n", shared)
 	fmt.Printf("  records added:   %d\n", len(added))
 	fmt.Printf("  records removed: %d\n", len(removed))
 	fmt.Printf("  slugs added:     %d\n", len(slugsAdded))
 	fmt.Printf("  slugs removed:   %d\n", len(slugsRemoved))
+	fmt.Printf("  per-type A:      %s\n", typeCounts(d))
+	fmt.Printf("  per-type B:      %s\n", typeCounts(b))
+	// Record-level detail, capped so huge feeds stay readable.
+	show := func(title string, list []string, from *db.DB) {
+		if len(list) == 0 {
+			return
+		}
+		fmt.Printf("  %s (first %d):\n", title, min(len(list), 50))
+		for i, id := range list {
+			if i >= 50 {
+				break
+			}
+			if r := recordByID(from, id); r != nil {
+				cve := r.CVE
+				if cve == "" {
+					cve = "no CVE"
+				}
+				fmt.Printf("    %s %s (%s)\n", id, cve, r.Title)
+			} else {
+				fmt.Printf("    %s\n", id)
+			}
+		}
+	}
+	show("added records", added, b)
+	show("removed records", removed, d)
 	for _, l := range slugsAdded {
 		fmt.Printf("  + %s\n", l)
 	}
@@ -154,6 +187,38 @@ func dbDiff(d *db.DB, pathB string) int {
 		fmt.Printf("  - %s\n", l)
 	}
 	return 0
+}
+
+// typeCounts tallies records by their first software type.
+func typeCounts(dd *db.DB) string {
+	counts := make(map[string]int)
+	for i := range dd.Records {
+		if len(dd.Records[i].Software) > 0 {
+			counts[dd.Records[i].Software[0].Type]++
+		} else {
+			counts["unknown"]++
+		}
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, counts[k]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// recordByID returns the record with the given id, or nil.
+func recordByID(dd *db.DB, id string) *db.Vuln {
+	for i := range dd.Records {
+		if dd.Records[i].ID == id {
+			return &dd.Records[i]
+		}
+	}
+	return nil
 }
 
 // dbStats prints an overview of the local database: record counts by
@@ -226,6 +291,9 @@ func dbLookup(d *db.DB, slug string) int {
 		}
 		if v.Software[0].Patched {
 			fmt.Printf("    patched in: %s\n", strings.Join(v.Software[0].PatchedVersions, ", "))
+		}
+		if v.Software[0].Remediation != "" {
+			fmt.Printf("    remediation: %s\n", v.Software[0].Remediation)
 		}
 	}
 	return 0
