@@ -98,6 +98,12 @@ onyx scan https://example.com
 | `--fail-on-rate-limited` | Exit `4` when the target's 429 throttling cut the scan short (CI: incomplete != clean) |
 | `--nuclei-min-severity S` | Only run nuclei templates of `S` or worse (`critical`/`high`/`medium`/`low`/`info`) |
 | `--outputs LIST` | Write extra report copies (`json,sarif,html,...`) as `<output>.<format>` files |
+| `--basic-auth USER:PASS` | HTTP Basic credentials for protected targets |
+| `--cookie "k=v; ..."` | Session cookie header for login-walled pages |
+| `--headers "Name: value, ..."` | Extra request headers (comma-separated) |
+| `--vhost HOST` | Override the Host header (shared-hosting scans) |
+| `--force` | Scan even when the target shows no WordPress fingerprints |
+| `--exclude-vulns LIST` | Drop findings with these vulnerability IDs (comma-separated) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -205,6 +211,27 @@ wraps the same data as a Slack webhook `{"text": ...}` message. Without
 checks.
 Scan flags like `--db`, `--threads`, `--enumerate`, `--max-requests` are
 honored.
+
+## Access control & targeting
+
+Protected targets are supported: `--basic-auth USER:PASS` (e.g. staging
+sites), `--cookie "wordpress_logged_in=..."` for login-walled pages,
+`--headers "X-API-Key: ..., ..."` for custom request headers and
+`--vhost HOST` when several sites share one IP (Host-header override).
+`--force` scans even when the target shows no WordPress fingerprints
+(odd builds, hard-won WAFs), and `--exclude-vulns` drops noisy records
+by vulnerability ID.
+
+## Cache management
+
+```bash
+onyx cache stats                 # dir, entry count, total size
+onyx cache purge                 # delete all cached responses
+```
+
+The HTTP response cache lives in `~/.cache/onyx/http` (or
+`$ONYX_CACHE_DIR`), uses `0600`/`0700` permissions, and is only active
+with `--cache-ttl`.
 
 ## Result diffing and config help
 
