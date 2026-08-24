@@ -159,6 +159,168 @@ func TestPrintJSONLWritesOneLinePerFinding(t *testing.T) {
 	}
 }
 
+// TestWriteTableVerboseShowsRemediation verifies the verbose table prints
+// an indented remediate line under a finding whose vulnerability carries
+// guidance, and nothing when it does not. The compact summary is untouched.
+func TestWriteTableVerboseShowsRemediation(t *testing.T) {
+	res := sampleResult()
+	res.Findings[0].Vulnerabilities[0].Remediation = "Update to >= 5.4.2"
+	var buf bytes.Buffer
+	writeTable(&buf, res, true, "")
+	if !strings.Contains(buf.String(), "    remediate: Update to >= 5.4.2") {
+		t.Errorf("verbose table missing remediate line:\n%s", buf.String())
+	}
+
+	res.Findings[0].Vulnerabilities[0].Remediation = ""
+	var clean bytes.Buffer
+	writeTable(&clean, res, true, "")
+	if strings.Contains(clean.String(), "remediate") {
+		t.Errorf("verbose table must not print remediate when guidance is empty:\n%s", clean.String())
+	}
+}
+
+// TestPrintSARIFRulesAndRuleIndexes verifies the full SARIF schema: a
+// rules[] array with one rule per distinct id (CVE or feed id), results
+// referencing rules by both id and index, per-rule helpURIs depending on
+// CVE presence, and level mapping for the mixed ratings.
+func TestPrintSARIFRulesAndRuleIndexes(t *testing.T) {
+	res := &scanner.Result{
+		Target: "https://example.test",
+		Findings: []scanner.Finding{
+			{
+				Slug: "elementor", Type: "plugin", InstalledVersion: "3.24.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{ID: "aaaaaaaa-0000-0000-0000-000000000001", CVE: "CVE-2024-1001",
+						Title: "Elementor SQL Injection", Rating: "critical"},
+					{ID: "bbbbbbbb-0000-0000-0000-000000000002", CVE: "CVE-2024-1001",
+						Title: "Elementor SQL Injection (duplicate CVE)", Rating: "high"},
+				},
+			},
+			{
+				Slug: "akismet", Type: "plugin", InstalledVersion: "4.0.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{ID: "cccccccc-0000-0000-0000-000000000003",
+						Title: "Akismet Stored XSS", Rating: "medium"},
+					{ID: "dddddddd-0000-0000-0000-000000000004",
+						Title: "Akismet Info Leak", Rating: "low"},
+				},
+			},
+		},
+	}
+	out := captureStdout(t, func() { PrintSARIF("0.2.0", res) })
+
+	var doc struct {
+		Version string `json:"version"`
+		Runs    []struct {
+			Tool struct {
+				Driver struct {
+					Name           string `json:"name"`
+					Version        string `json:"version"`
+					InformationURI string `json:"informationUri"`
+					Rules          []struct {
+						ID               string `json:"id"`
+						Name             string `json:"name"`
+						ShortDescription struct {
+							Text string `json:"text"`
+						} `json:"shortDescription"`
+						HelpURI    string `json:"helpURI"`
+						Properties struct {
+							Tags     []string `json:"tags"`
+							Severity string   `json:"onyx:severity"`
+						} `json:"properties"`
+					} `json:"rules"`
+				} `json:"driver"`
+			} `json:"tool"`
+			Results []struct {
+				RuleID    string `json:"ruleId"`
+				RuleIndex int    `json:"ruleIndex"`
+				Level     string `json:"level"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("sarif output is not valid JSON: %v\n%s", err, out)
+	}
+	if doc.Version != "2.1.0" || len(doc.Runs) != 1 {
+		t.Fatalf("sarif version/runs = %q/%d, want 2.1.0/1", doc.Version, len(doc.Runs))
+	}
+	drv := doc.Runs[0].Tool.Driver
+	if drv.Name != "onyx" || drv.Version != "0.2.0" {
+		t.Errorf("driver = %q %q, want onyx 0.2.0", drv.Name, drv.Version)
+	}
+	if drv.InformationURI != "https://github.com/Boreas37/onyx" {
+		t.Errorf("informationUri = %q, want the project URL", drv.InformationURI)
+	}
+
+	// One rule per distinct id: the duplicate CVE must not create a second
+	// rule, the two feed ids must.
+	wantRules := map[string]struct {
+		title, helpURI, severity string
+	}{
+		"CVE-2024-1001":                        {"Elementor SQL Injection", "https://nvd.nist.gov/vuln/detail/CVE-2024-1001", "critical"},
+		"cccccccc-0000-0000-0000-000000000003": {"Akismet Stored XSS", "https://wordfence.com/threat-intel/", "medium"},
+		"dddddddd-0000-0000-0000-000000000004": {"Akismet Info Leak", "https://wordfence.com/threat-intel/", "low"},
+	}
+	if len(drv.Rules) != len(wantRules) {
+		t.Fatalf("got %d rules, want %d:\n%s", len(drv.Rules), len(wantRules), out)
+	}
+	indexOf := make(map[string]int, len(drv.Rules))
+	for i, r := range drv.Rules {
+		if r.ID != r.Name {
+			t.Errorf("rule[%d].name = %q, want equal to id %q", i, r.Name, r.ID)
+		}
+		want, ok := wantRules[r.ID]
+		if !ok {
+			t.Errorf("unexpected rule id %q", r.ID)
+			continue
+		}
+		if r.ShortDescription.Text != want.title {
+			t.Errorf("rule %s shortDescription = %q, want %q", r.ID, r.ShortDescription.Text, want.title)
+		}
+		if r.HelpURI != want.helpURI {
+			t.Errorf("rule %s helpURI = %q, want %q", r.ID, r.HelpURI, want.helpURI)
+		}
+		if len(r.Properties.Tags) != 1 || r.Properties.Tags[0] != "security" {
+			t.Errorf("rule %s tags = %v, want [security]", r.ID, r.Properties.Tags)
+		}
+		if r.Properties.Severity != want.severity {
+			t.Errorf("rule %s onyx:severity = %q, want %q", r.ID, r.Properties.Severity, want.severity)
+		}
+		if _, dup := indexOf[r.ID]; dup {
+			t.Errorf("rule id %q appears more than once", r.ID)
+		}
+		indexOf[r.ID] = i
+	}
+
+	// Results reference valid rule indexes and carry the mapped level.
+	if len(doc.Runs[0].Results) != 4 {
+		t.Fatalf("got %d results, want 4:\n%s", len(doc.Runs[0].Results), out)
+	}
+	wantLevels := []struct{ ruleID, level string }{
+		{"CVE-2024-1001", "error"},
+		{"CVE-2024-1001", "error"},
+		{"cccccccc-0000-0000-0000-000000000003", "warning"},
+		{"dddddddd-0000-0000-0000-000000000004", "note"},
+	}
+	for i, r := range doc.Runs[0].Results {
+		if r.RuleID != wantLevels[i].ruleID || r.Level != wantLevels[i].level {
+			t.Errorf("result[%d] = %s/%s, want %s/%s",
+				i, r.RuleID, r.Level, wantLevels[i].ruleID, wantLevels[i].level)
+		}
+		if r.RuleIndex < 0 || r.RuleIndex >= len(drv.Rules) {
+			t.Fatalf("result[%d].ruleIndex = %d, out of rules range [0,%d)",
+				i, r.RuleIndex, len(drv.Rules))
+		}
+		if drv.Rules[r.RuleIndex].ID != r.RuleID {
+			t.Errorf("result[%d] ruleIndex %d points at rule %q, want %q",
+				i, r.RuleIndex, drv.Rules[r.RuleIndex].ID, r.RuleID)
+		}
+	}
+}
+
+// TestPrintSARIFMinimalStructure verifies the minimal SARIF 2.1.0 shape:
+// one run, the onyx driver, and one result per vulnerability with a
+// whitelisted level.
 func TestPrintSARIFMinimalStructure(t *testing.T) {
 	out := captureStdout(t, func() { PrintSARIF("0.1.0", sampleResult()) })
 

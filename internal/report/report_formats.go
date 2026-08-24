@@ -63,8 +63,21 @@ func WriteMarkdown(w io.Writer, res *scanner.Result) {
 			}
 			fmt.Fprintf(w, "| %s | %s | %s |\n",
 				mdCell(sevClass(v.Rating)), mdCell(cve), mdCell(v.Title))
+			if v.Remediation != "" {
+				fmt.Fprintf(w, "| Remediation | %s |\n", mdCell(v.Remediation))
+			}
 		}
 		fmt.Fprint(w, "\n")
+		patched := false
+		for _, v := range f.Vulnerabilities {
+			if len(v.PatchedVersions) > 0 {
+				fmt.Fprintf(w, "**Patched in:** %s\n", mdCell(strings.Join(v.PatchedVersions, ", ")))
+				patched = true
+			}
+		}
+		if patched {
+			fmt.Fprint(w, "\n")
+		}
 	}
 }
 
@@ -121,8 +134,16 @@ func WriteHTML(w io.Writer, res *scanner.Result) error {
 				sev := sevClass(v.Rating)
 				fmt.Fprintf(&b, "<tr><td class=\"sev-%s\">%s</td><td>%s</td><td>%s</td></tr>\n",
 					sev, sev, esc(v.CVE), esc(v.Title))
+				if v.Remediation != "" {
+					fmt.Fprintf(&b, "<tr><td>Remediation</td><td colspan=\"2\">%s</td></tr>\n", esc(v.Remediation))
+				}
 			}
 			b.WriteString("</table>\n")
+			for _, v := range f.Vulnerabilities {
+				if len(v.PatchedVersions) > 0 {
+					fmt.Fprintf(&b, "<p><strong>Patched in:</strong> %s</p>\n", esc(strings.Join(v.PatchedVersions, ", ")))
+				}
+			}
 		}
 	}
 	b.WriteString("</body></html>\n")
@@ -183,12 +204,23 @@ func WriteJUnit(w io.Writer, version string, res *scanner.Result) error {
 			if cve == "" {
 				cve = "no-cve"
 			}
+			message := strings.ToLower(v.Rating) + ": " + v.Title
+			if v.Remediation != "" {
+				message += " — " + sanitize.Text(v.Remediation, 500)
+			}
+			text := strings.Join(v.AffectedLabels, ", ")
+			if len(v.PatchedVersions) > 0 {
+				if text != "" {
+					text += ", "
+				}
+				text += "Patched in: " + strings.Join(v.PatchedVersions, ", ")
+			}
 			suite.Cases = append(suite.Cases, junitCase{
 				Name:      cve,
 				ClassName: res.Target,
 				Failure: &junitFailure{
-					Message: strings.ToLower(v.Rating) + ": " + v.Title,
-					Text:    strings.Join(v.AffectedLabels, ", "),
+					Message: message,
+					Text:    text,
 				},
 			})
 		}

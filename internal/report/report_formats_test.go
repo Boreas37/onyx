@@ -111,6 +111,75 @@ func TestWriteJUnit(t *testing.T) {
 	}
 }
 
+// remediationFixture carries remediation guidance and patched versions on
+// the first vulnerability only, so format tests can assert the new rows and
+// the omission on the second.
+func remediationFixture() *scanner.Result {
+	return &scanner.Result{
+		IsWordPress: true,
+		Target:      "http://lab.test",
+		Findings: []scanner.Finding{{
+			Slug:             "contact-form-7",
+			Type:             "plugin",
+			InstalledVersion: "5.3.2",
+			Vulnerabilities: []scanner.Vulnerability{
+				{CVE: "CVE-2025-3247", Rating: "Medium", Title: "Order Replay",
+					AffectedLabels:  []string{"*-5.3.2"},
+					Remediation:     "Update to >= 5.4.2 | latest",
+					PatchedVersions: []string{"5.4.2", "5.3.3"}},
+				{CVE: "CVE-2023-6449", Rating: "High", Title: "File Upload",
+					AffectedLabels: []string{"*-5.8.3"}},
+			},
+		}},
+	}
+}
+
+func TestWriteMarkdownRemediation(t *testing.T) {
+	var b bytes.Buffer
+	WriteMarkdown(&b, remediationFixture())
+	out := b.String()
+	for _, want := range []string{
+		"| Remediation | Update to >= 5.4.2 \\| latest |",
+		"**Patched in:** 5.4.2, 5.3.3",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("markdown missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestWriteHTMLRemediation(t *testing.T) {
+	var b bytes.Buffer
+	if err := WriteHTML(&b, remediationFixture()); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		`<tr><td>Remediation</td><td colspan="2">Update to &gt;= 5.4.2 | latest</td></tr>`,
+		`<p><strong>Patched in:</strong> 5.4.2, 5.3.3</p>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("html missing %q", want)
+		}
+	}
+}
+
+func TestWriteJUnitRemediation(t *testing.T) {
+	var b bytes.Buffer
+	if err := WriteJUnit(&b, "0.3.0", remediationFixture()); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		`message="medium: Order Replay — Update to &gt;= 5.4.2 | latest"`,
+		`*-5.3.2, Patched in: 5.4.2, 5.3.3</failure>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("junit missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // TestSevClass verifies the render-layer severity whitelist: only the
 // known labels pass through, everything else (markup, formulas, junk from
 // any source) collapses to "unknown".

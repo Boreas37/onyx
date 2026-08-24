@@ -1,6 +1,7 @@
 package report
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -146,6 +147,71 @@ func TestPrintCycloneDXSanitizesHostileInput(t *testing.T) {
 	ref, _ := c["bom-ref"].(string)
 	if ref != "pkg:wordpress/plugin/[31mplugin@"+strings.Repeat("9", 64) {
 		t.Errorf("bom-ref = %q, want sanitized lowercased-type ref", ref)
+	}
+}
+
+// TestWriteCycloneDXRemediationProperty verifies a finding's remediation is
+// attached to the matching detected component as an onyx:remediation
+// property, and components without matching findings keep only their
+// onyx:type property.
+func TestWriteCycloneDXRemediationProperty(t *testing.T) {
+	res := &scanner.Result{
+		Target: "https://example.com",
+		Detected: []scanner.Detected{
+			{Slug: "alpha", Name: "Alpha Plugin", Type: "plugin", Version: "2.0"},
+			{Slug: "zebra", Name: "Zebra Plugin", Type: "plugin", Version: "1.0"},
+		},
+		Findings: []scanner.Finding{
+			{
+				Slug: "alpha", Type: "plugin", InstalledVersion: "2.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{CVE: "CVE-2026-0001", Rating: "high", Title: "T", Remediation: "Update to 2.1"},
+					{CVE: "CVE-2026-0002", Rating: "low", Title: "U"},
+				},
+			},
+			{
+				Slug: "beta", Type: "plugin", InstalledVersion: "1.0",
+				Vulnerabilities: []scanner.Vulnerability{
+					{CVE: "CVE-2026-0003", Rating: "medium", Title: "V",
+						Remediation: "remediation for a component that is not detected"},
+				},
+			},
+		},
+	}
+	var buf bytes.Buffer
+	writeCycloneDX(&buf, "dev", res)
+	var doc cdxDoc
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("cyclonedx output is not valid JSON: %v\n%s", err, buf.String())
+	}
+	propsByRef := make(map[string][]map[string]any)
+	for _, c := range doc.Components {
+		ref, _ := c["bom-ref"].(string)
+		raw, _ := c["properties"].([]any)
+		var props []map[string]any
+		for _, p := range raw {
+			props = append(props, p.(map[string]any))
+		}
+		propsByRef[ref] = props
+	}
+
+	alpha := propsByRef["pkg:wordpress/plugin/alpha@2.0"]
+	if len(alpha) != 2 {
+		t.Fatalf("alpha properties = %v, want onyx:type + onyx:remediation", alpha)
+	}
+	var got string
+	for _, p := range alpha {
+		if p["name"] == "onyx:remediation" {
+			got, _ = p["value"].(string)
+		}
+	}
+	if got != "Update to 2.1" {
+		t.Errorf("alpha onyx:remediation = %q, want %q", got, "Update to 2.1")
+	}
+
+	zebra := propsByRef["pkg:wordpress/plugin/zebra@1.0"]
+	if len(zebra) != 1 || zebra[0]["name"] != "onyx:type" {
+		t.Errorf("zebra (no matching finding) must keep only onyx:type, got %v", zebra)
 	}
 }
 

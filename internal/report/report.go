@@ -169,6 +169,9 @@ func writeTable(w io.Writer, res *scanner.Result, verbose bool, minSeverity stri
 					}
 					fmt.Fprintf(w, "[%s] [%s:%s:%s] %s (%s)\n",
 						sev, c.f.Type, c.f.Slug, c.f.InstalledVersion, v.Title, cve)
+					if v.Remediation != "" {
+						fmt.Fprintf(w, "    remediate: %s\n", sanitize.Text(v.Remediation, 300))
+					}
 				}
 			}
 		} else {
@@ -364,12 +367,19 @@ func PrintSummary(res *scanner.Result) {
 	line("Users found", fmt.Sprintf("%d", s.Users))
 }
 
-// PrintJSONL prints res as JSON Lines: one compact JSON object per finding.
-func PrintJSONL(res *scanner.Result) {
-	enc := json.NewEncoder(os.Stdout)
+// WriteJSONL writes res as JSON Lines into w: one compact JSON object per
+// finding (used by --output / --outputs).
+func WriteJSONL(w io.Writer, res *scanner.Result) {
+	enc := json.NewEncoder(w)
 	for i := range res.Findings {
 		_ = enc.Encode(&res.Findings[i])
 	}
+}
+
+// PrintJSONL prints res as JSON Lines to stdout: one compact JSON object
+// per finding.
+func PrintJSONL(res *scanner.Result) {
+	WriteJSONL(os.Stdout, res)
 }
 
 // sarifLevel maps a CVSS rating to a SARIF result level.
@@ -386,27 +396,54 @@ func sarifLevel(rating string) string {
 	}
 }
 
-// PrintSARIF writes res as a minimal SARIF 2.1.0 report: a single run whose
-// tool driver is "onyx" and whose results are the scan findings.
+// WriteSARIF renders res as a SARIF 2.1.0 report into w (used by
+// --output / --outputs).
+func WriteSARIF(w io.Writer, version string, res *scanner.Result) {
+	writeSARIF(w, version, res)
+}
+
+// PrintSARIF writes res as a SARIF 2.1.0 report to stdout.
 func PrintSARIF(version string, res *scanner.Result) {
+	writeSARIF(os.Stdout, version, res)
+}
+
+// writeSARIF renders res as a SARIF 2.1.0 report into w: one rule per
+// distinct vulnerability id (CVE or feed id), with the severity recorded as
+// an onyx:severity property; results reference their rule by index as well
+// as by id. Split from PrintSARIF so tests can render into a buffer.
+func writeSARIF(w io.Writer, version string, res *scanner.Result) {
 	type location struct {
 		ArtifactLocation struct {
 			URI string `json:"uri"`
 		} `json:"artifactLocation"`
 	}
+	type message struct {
+		Text string `json:"text"`
+	}
+	type rule struct {
+		ID               string  `json:"id"`
+		Name             string  `json:"name"`
+		ShortDescription message `json:"shortDescription"`
+		HelpURI          string  `json:"helpURI"`
+		Properties       struct {
+			Tags     []string `json:"tags"`
+			Severity string   `json:"onyx:severity"`
+		} `json:"properties"`
+	}
 	type result struct {
-		RuleID  string `json:"ruleId"`
-		Level   string `json:"level"`
-		Message struct {
-			Text string `json:"text"`
-		} `json:"message"`
+		RuleID    string     `json:"ruleId"`
+		RuleIndex int        `json:"ruleIndex"`
+		Level     string     `json:"level"`
+		Message   message    `json:"message"`
 		Locations []location `json:"locations"`
 	}
 	type run struct {
 		Tool struct {
 			Driver struct {
-				Name    string `json:"name"`
-				Version string `json:"version"`
+				Name           string `json:"name"`
+				Version        string `json:"version"`
+				InformationURI string `json:"informationUri"`
+				Rules          []rule `json:"rules"`
 			} `json:"driver"`
 		} `json:"tool"`
 		Results []result `json:"results"`
@@ -424,6 +461,9 @@ func PrintSARIF(version string, res *scanner.Result) {
 	}
 	out.Runs[0].Tool.Driver.Name = "onyx"
 	out.Runs[0].Tool.Driver.Version = version
+	out.Runs[0].Tool.Driver.InformationURI = "https://github.com/Boreas37/onyx"
+
+	ruleIdx := make(map[string]int)
 	for i := range res.Findings {
 		f := &res.Findings[i]
 		for _, v := range f.Vulnerabilities {
@@ -431,8 +471,24 @@ func PrintSARIF(version string, res *scanner.Result) {
 			if ruleID == "" {
 				ruleID = v.ID
 			}
+			idx, ok := ruleIdx[ruleID]
+			if !ok {
+				r := rule{ID: ruleID, Name: ruleID}
+				r.ShortDescription.Text = v.Title
+				if v.CVE != "" {
+					r.HelpURI = "https://nvd.nist.gov/vuln/detail/" + v.CVE
+				} else {
+					r.HelpURI = "https://wordfence.com/threat-intel/"
+				}
+				r.Properties.Tags = []string{"security"}
+				r.Properties.Severity = v.Rating
+				idx = len(out.Runs[0].Tool.Driver.Rules)
+				out.Runs[0].Tool.Driver.Rules = append(out.Runs[0].Tool.Driver.Rules, r)
+				ruleIdx[ruleID] = idx
+			}
 			r := result{
 				RuleID:    ruleID,
+				RuleIndex: idx,
 				Level:     sarifLevel(v.Rating),
 				Locations: []location{{}},
 			}
@@ -441,7 +497,7 @@ func PrintSARIF(version string, res *scanner.Result) {
 			out.Runs[0].Results = append(out.Runs[0].Results, r)
 		}
 	}
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
 }

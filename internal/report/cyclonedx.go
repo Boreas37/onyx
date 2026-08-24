@@ -16,8 +16,9 @@ import (
 
 // Length caps for target-controlled strings embedded in the BOM.
 const (
-	cdxMaxName    = 200
-	cdxMaxVersion = 64
+	cdxMaxName        = 200
+	cdxMaxVersion     = 64
+	cdxMaxRemediation = 500
 )
 
 // cdxComponent is one entry of the CycloneDX components array.
@@ -82,6 +83,26 @@ func cdxRef(kind, slug, version string) string {
 	return ref
 }
 
+// componentRemediation returns the first non-empty remediation recorded for
+// the component (slug, type). The BOM is keyed by detected component while
+// remediation lives on vulnerabilities, so the closest component-level
+// equivalent is the first matching finding's guidance; empty when the
+// component has none.
+func componentRemediation(res *scanner.Result, slug, typ string) string {
+	for i := range res.Findings {
+		f := &res.Findings[i]
+		if f.Slug != slug || f.Type != typ {
+			continue
+		}
+		for _, v := range f.Vulnerabilities {
+			if v.Remediation != "" {
+				return v.Remediation
+			}
+		}
+	}
+	return ""
+}
+
 // writeCycloneDX writes res as a CycloneDX 1.5 JSON BOM to w: one
 // application component per detected plugin/theme, ordered by slug then
 // type, with onyx:type properties. Target-controlled strings are stripped
@@ -125,10 +146,19 @@ func writeCycloneDX(w io.Writer, toolVersion string, res *scanner.Result) {
 			version = ""
 		}
 		c := cdxComponent{
-			Type:       "application",
-			Name:       slug,
-			Version:    version,
-			Properties: []cdxProperty{{Name: "onyx:type", Value: strings.ToLower(sanitize.Text(d.Type, cdxMaxName))}},
+			Type:    "application",
+			Name:    slug,
+			Version: version,
+			Properties: []cdxProperty{{
+				Name:  "onyx:type",
+				Value: strings.ToLower(sanitize.Text(d.Type, cdxMaxName)),
+			}},
+		}
+		if rem := componentRemediation(res, d.Slug, d.Type); rem != "" {
+			c.Properties = append(c.Properties, cdxProperty{
+				Name:  "onyx:remediation",
+				Value: sanitize.Text(rem, cdxMaxRemediation),
+			})
 		}
 		c.BomRef = cdxRef(d.Type, slug, version)
 		bom.Components = append(bom.Components, c)
@@ -140,6 +170,12 @@ func writeCycloneDX(w io.Writer, toolVersion string, res *scanner.Result) {
 		return
 	}
 	fmt.Fprintln(w, string(out))
+}
+
+// WriteCycloneDX writes res as a CycloneDX 1.5 JSON BOM to w (used by
+// --output).
+func WriteCycloneDX(w io.Writer, toolVersion string, res *scanner.Result) {
+	writeCycloneDX(w, toolVersion, res)
 }
 
 // PrintCycloneDX writes res as a CycloneDX 1.5 JSON BOM to stdout.

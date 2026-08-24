@@ -23,9 +23,10 @@ const goldenUUIDStr = "00000000-0000-4000-8000-000000000000"
 
 // goldenResult is a fixed, realistic scan result exercising every section a
 // report format can render: two findings with mixed-severity
-// vulnerabilities including an empty-CVE record, interesting findings,
-// users, a nuclei result, and detected components with a known and an
-// unknown version.
+// vulnerabilities including an empty-CVE record, remediation guidance and
+// patched versions on some records only, interesting findings, users, a
+// nuclei result, and detected components with a known and an unknown
+// version.
 func goldenResult() *scanner.Result {
 	return &scanner.Result{
 		Target:           "https://shop.example.test",
@@ -53,13 +54,16 @@ func goldenResult() *scanner.Result {
 				Vulnerabilities: []scanner.Vulnerability{
 					{ID: "aaaaaaaa-0000-0000-0000-000000000001", CVE: "CVE-2024-0001",
 						Title: "Elementor < 3.25.0 - SQL Injection", CVSSScore: 9.1, Rating: "critical",
-						AffectedLabels: []string{"1.0.0 - 3.24.9"}},
+						AffectedLabels:  []string{"1.0.0 - 3.24.9"},
+						Remediation:     "Update to Elementor 3.25.0 or newer",
+						PatchedVersions: []string{"3.25.0"}},
 					{ID: "bbbbbbbb-0000-0000-0000-000000000002", CVE: "CVE-2024-0002",
 						Title: "Elementor < 3.23.9 - Stored XSS", CVSSScore: 6.1, Rating: "medium",
 						AffectedLabels: []string{"1.0.0 - 3.23.8"}},
 					{ID: "cccccccc-0000-0000-0000-000000000003", CVE: "",
 						Title: "Arbitrary file download in Elementor", CVSSScore: 3.4, Rating: "low",
-						AffectedLabels: []string{"3.20.0 - 3.23.8"}},
+						AffectedLabels: []string{"3.20.0 - 3.23.8"},
+						Remediation:    "Update the plugin to the latest release"},
 				},
 			},
 			{
@@ -67,7 +71,8 @@ func goldenResult() *scanner.Result {
 				Vulnerabilities: []scanner.Vulnerability{
 					{ID: "dddddddd-0000-0000-0000-000000000004", CVE: "CVE-2024-0003",
 						Title: "Akismet < 5.0 - Comment Spam Bypass", CVSSScore: 7.5, Rating: "high",
-						AffectedLabels: []string{"1.0.0 - 4.9.9"}},
+						AffectedLabels:  []string{"1.0.0 - 4.9.9"},
+						PatchedVersions: []string{"5.0"}},
 				},
 			},
 		},

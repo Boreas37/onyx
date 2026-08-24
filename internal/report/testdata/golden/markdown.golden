@@ -16,12 +16,18 @@
 | Severity | CVE | Title |
 |---|---|---|
 | critical | CVE-2024-0001 | Elementor < 3.25.0 - SQL Injection |
+| Remediation | Update to Elementor 3.25.0 or newer |
 | medium | CVE-2024-0002 | Elementor < 3.23.9 - Stored XSS |
 | low | - | Arbitrary file download in Elementor |
+| Remediation | Update the plugin to the latest release |
+
+**Patched in:** 3.25.0
 
 ### plugin/akismet @ 4.0.0 (1)
 
 | Severity | CVE | Title |
 |---|---|---|
 | high | CVE-2024-0003 | Akismet < 5.0 - Comment Spam Bypass |
+
+**Patched in:** 5.0
 

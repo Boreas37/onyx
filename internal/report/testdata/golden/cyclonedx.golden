@@ -30,6 +30,10 @@
         {
           "name": "onyx:type",
           "value": "plugin"
+        },
+        {
+          "name": "onyx:remediation",
+          "value": "Update to Elementor 3.25.0 or newer"
         }
       ]
     },
