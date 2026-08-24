@@ -20,8 +20,15 @@ import (
 )
 
 // runTimeout caps a single nuclei invocation (templates may take a long
-// time against hostile or slow targets).
+// time against hostile or slow targets). Each template batch gets a fresh
+// budget, so one hostile template cannot consume the whole verification
+// window and discard every result.
 const runTimeout = 60 * time.Second
+
+// templatesPerBatch caps how many templates a single nuclei invocation
+// carries. Templates are executed in batches of this size, each with its
+// own runTimeout.
+const templatesPerBatch = 10
 
 // ErrBinaryNotFound is returned by Run when no usable nuclei binary can be
 // resolved (neither $NUCLEI_BIN nor `nuclei` on PATH). The pipeline treats
@@ -114,15 +121,59 @@ func NucleiBinary() (string, error) {
 //
 //	nuclei -target <target> -t <t1> -t <t2> ... -json -silent [extra args...]
 //
-// and parses the JSON Lines stdout into stable NucleiResults.
+// once per batch of templatesPerBatch templates, and parses the JSON Lines
+// stdout into stable NucleiResults, merged in template order.
+//
+// Error semantics: a failing batch (timeout, non-zero exit) is recorded and
+// the next batch still runs. The call returns nil error whenever at least
+// one batch produced results or no batch failed — partial coverage is
+// better than nothing, so the caller can show whatever matched and only
+// loses the batches that never ran. An error is returned only when every
+// batch failed (the first batch error is surfaced). ErrBinaryNotFound is
+// returned unchanged when no nuclei binary can be resolved.
 func Run(target string, templates []string, extraArgs []string) ([]NucleiResult, error) {
 	bin, err := NucleiBinary()
 	if err != nil {
 		return nil, err
 	}
 
+	var results []NucleiResult
+	var firstErr error
+	batches, failed := 0, 0
+	for start := 0; start < len(templates); start += templatesPerBatch {
+		end := start + templatesPerBatch
+		if end > len(templates) {
+			end = len(templates)
+		}
+		batches++
+		rs, err := runBatch(bin, target, templates[start:end], extraArgs)
+		if err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("batch %d: %w", batches, err)
+			}
+			continue
+		}
+		results = append(results, rs...)
+	}
+
+	// Every batch failed: nothing to report, surface the first batch error
+	// so the caller knows verification did not run at all. Empty template
+	// lists run no batch and succeed vacuously.
+	if batches > 0 && failed == batches {
+		return nil, firstErr
+	}
+	// At least one batch succeeded (or none failed): return the merged
+	// matches. Batches that failed are skipped; partial coverage beats
+	// dropping everything because one hostile template blew its budget.
+	return results, nil
+}
+
+// runBatch executes one nuclei invocation for a single template batch with
+// a fresh runTimeout and parses the JSON Lines stdout into NucleiResults.
+func runBatch(bin, target string, batch []string, extraArgs []string) ([]NucleiResult, error) {
 	args := []string{"-target", target}
-	for _, t := range templates {
+	for _, t := range batch {
 		args = append(args, "-t", t)
 	}
 	args = append(args, "-json", "-silent")

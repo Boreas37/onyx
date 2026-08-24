@@ -45,7 +45,7 @@ func goldenResult() *scanner.Result {
 			Name:       "WordPress Readme Disclosure",
 		}},
 		Detected: []scanner.Detected{
-			{Slug: "elementor", Name: "Elementor", Type: "plugin", Version: "3.24.0", Source: "rest"},
+			{Slug: "elementor", Name: "Elementor", Type: "plugin", Version: "3.24.0", Source: "rest", ActiveInstalls: 4000000},
 			{Slug: "theme-x", Name: "Theme X", Type: "theme", Version: "unknown", Source: "style.css"},
 		},
 		Findings: []scanner.Finding{

@@ -215,6 +215,54 @@ func TestWriteCycloneDXRemediationProperty(t *testing.T) {
 	}
 }
 
+// TestWriteCycloneDXActiveInstalls verifies a detected component's active
+// install count is attached as an onyx:active-installs property, and that
+// components without a known count (0) keep only their onyx:type property.
+func TestWriteCycloneDXActiveInstalls(t *testing.T) {
+	res := &scanner.Result{
+		Target: "https://example.com",
+		Detected: []scanner.Detected{
+			{Slug: "alpha", Name: "Alpha Plugin", Type: "plugin", Version: "2.0", ActiveInstalls: 4000000},
+			{Slug: "zebra", Name: "Zebra Plugin", Type: "plugin", Version: "1.0"},
+		},
+	}
+	var buf bytes.Buffer
+	writeCycloneDX(&buf, "dev", res)
+	var doc cdxDoc
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("cyclonedx output is not valid JSON: %v\n%s", err, buf.String())
+	}
+	propsByRef := make(map[string][]map[string]any)
+	for _, c := range doc.Components {
+		ref, _ := c["bom-ref"].(string)
+		raw, _ := c["properties"].([]any)
+		var props []map[string]any
+		for _, p := range raw {
+			props = append(props, p.(map[string]any))
+		}
+		propsByRef[ref] = props
+	}
+
+	alpha := propsByRef["pkg:wordpress/plugin/alpha@2.0"]
+	if len(alpha) != 2 {
+		t.Fatalf("alpha properties = %v, want onyx:type + onyx:active-installs", alpha)
+	}
+	var got string
+	for _, p := range alpha {
+		if p["name"] == "onyx:active-installs" {
+			got, _ = p["value"].(string)
+		}
+	}
+	if got != "4000000" {
+		t.Errorf("alpha onyx:active-installs = %q, want %q", got, "4000000")
+	}
+
+	zebra := propsByRef["pkg:wordpress/plugin/zebra@1.0"]
+	if len(zebra) != 1 || zebra[0]["name"] != "onyx:type" {
+		t.Errorf("zebra (unknown install count) must keep only onyx:type, got %v", zebra)
+	}
+}
+
 func TestUUIDV4UniqueAndShaped(t *testing.T) {
 	seen := make(map[string]bool)
 	for i := 0; i < 100; i++ {

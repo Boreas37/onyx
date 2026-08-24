@@ -32,6 +32,10 @@
           "value": "plugin"
         },
         {
+          "name": "onyx:active-installs",
+          "value": "4000000"
+        },
+        {
           "name": "onyx:remediation",
           "value": "Update to Elementor 3.25.0 or newer"
         }

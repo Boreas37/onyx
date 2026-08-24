@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,7 +106,9 @@ func componentRemediation(res *scanner.Result, slug, typ string) string {
 
 // writeCycloneDX writes res as a CycloneDX 1.5 JSON BOM to w: one
 // application component per detected plugin/theme, ordered by slug then
-// type, with onyx:type properties. Target-controlled strings are stripped
+// type, with onyx:type properties. A component's active install count is
+// attached as an onyx:active-installs property when known (0 or unset
+// components carry only onyx:type). Target-controlled strings are stripped
 // of control characters and length-capped before embedding so a hostile
 // target cannot corrupt the document.
 func writeCycloneDX(w io.Writer, toolVersion string, res *scanner.Result) {
@@ -153,6 +156,12 @@ func writeCycloneDX(w io.Writer, toolVersion string, res *scanner.Result) {
 				Name:  "onyx:type",
 				Value: strings.ToLower(sanitize.Text(d.Type, cdxMaxName)),
 			}},
+		}
+		if d.ActiveInstalls > 0 {
+			c.Properties = append(c.Properties, cdxProperty{
+				Name:  "onyx:active-installs",
+				Value: strconv.Itoa(d.ActiveInstalls),
+			})
 		}
 		if rem := componentRemediation(res, d.Slug, d.Type); rem != "" {
 			c.Properties = append(c.Properties, cdxProperty{

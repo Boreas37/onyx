@@ -92,6 +92,153 @@ printf '%s\n' '{"template-id":"http-missing-security-headers","info":{"name":"Mi
 	return script
 }
 
+// writeBatchingMockNuclei creates an executable "nuclei" script that emits
+// one JSONL match per -t template (template-id = template basename, in argv
+// order) and whose failure behavior is driven by env vars: NUCLEI_FAIL_ALL=1
+// makes every invocation exit 1, and NUCLEI_FAIL_IF_COUNT=<n> makes
+// invocations carrying exactly <n> templates exit 1. When
+// NUCLEI_INVOCATION_LOG is set, each invocation appends its template list.
+func writeBatchingMockNuclei(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	script := filepath.Join(tmp, "nuclei")
+	body := `#!/bin/sh
+ids=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-t" ]; then
+    b=$(basename "$a"); b=${b%.yaml}
+    ids="$ids $b"
+  fi
+  prev="$a"
+done
+if [ -n "$NUCLEI_INVOCATION_LOG" ]; then
+  echo "$ids" >> "$NUCLEI_INVOCATION_LOG"
+fi
+count=$(printf '%s' "$ids" | wc -w | tr -d ' ')
+if [ -n "$NUCLEI_FAIL_IF_COUNT" ] && [ "$count" = "$NUCLEI_FAIL_IF_COUNT" ]; then
+  echo "mock: failing batch with $count templates" >&2
+  exit 1
+fi
+if [ -n "$NUCLEI_FAIL_ALL" ]; then
+  echo "mock: failing all" >&2
+  exit 1
+fi
+for id in $ids; do
+  printf '%s\n' "{\"template-id\":\"$id\",\"info\":{\"name\":\"Mock $id\",\"severity\":\"low\"},\"matched-at\":\"https://host/\",\"matcher-name\":\"m\"}"
+done
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NUCLEI_BIN", script)
+	return script
+}
+
+// makeTemplates writes n placeholder template files named T01.yaml..T0n.yaml
+// and returns their paths in order.
+func makeTemplates(t *testing.T, n int) []string {
+	t.Helper()
+	dir := t.TempDir()
+	var tpls []string
+	for i := 1; i <= n; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("T%02d.yaml", i))
+		if err := os.WriteFile(p, []byte("id: T%02d\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tpls = append(tpls, p)
+	}
+	return tpls
+}
+
+// TestRunBatchesPartialFailure covers > templatesPerBatch templates where
+// the second batch exits non-zero: the first batch's results must survive
+// and the error must be nil (partial coverage is better than nothing).
+func TestRunBatchesPartialFailure(t *testing.T) {
+	t.Setenv("NUCLEI_FAIL_IF_COUNT", "2")
+	writeBatchingMockNuclei(t)
+	tpls := makeTemplates(t, 12)
+
+	results, err := Run("https://host/", tpls, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != 10 {
+		t.Fatalf("len(results) = %d, want 10 (first batch preserved)", len(results))
+	}
+	for i, r := range results {
+		if want := fmt.Sprintf("T%02d", i+1); r.TemplateID != want {
+			t.Errorf("results[%d].TemplateID = %q, want %q", i, r.TemplateID, want)
+		}
+	}
+}
+
+// TestRunBatchesAllFail covers the total-failure path: every batch exits
+// non-zero, so Run must return the first batch error and no results.
+func TestRunBatchesAllFail(t *testing.T) {
+	t.Setenv("NUCLEI_FAIL_ALL", "1")
+	writeBatchingMockNuclei(t)
+	tpls := makeTemplates(t, 12)
+
+	results, err := Run("https://host/", tpls, nil)
+	if err == nil {
+		t.Fatal("Run = nil error, want error when every batch fails")
+	}
+	if len(results) != 0 {
+		t.Fatalf("len(results) = %d, want 0", len(results))
+	}
+	if !strings.Contains(err.Error(), "nuclei failed") {
+		t.Errorf("error = %v, want nuclei failure", err)
+	}
+}
+
+// TestRunBatchesOrderAndComposition verifies templates are split into
+// templatesPerBatch-sized invocations (10, 10, 5 for 25 templates) and the
+// merged results keep template order across batches.
+func TestRunBatchesOrderAndComposition(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "invocations.txt")
+	t.Setenv("NUCLEI_INVOCATION_LOG", log)
+	writeBatchingMockNuclei(t)
+	tpls := makeTemplates(t, 25)
+
+	results, err := Run("https://host/", tpls, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != 25 {
+		t.Fatalf("len(results) = %d, want 25", len(results))
+	}
+	for i, r := range results {
+		if want := fmt.Sprintf("T%02d", i+1); r.TemplateID != want {
+			t.Errorf("results[%d].TemplateID = %q, want %q (order must follow template order)", i, r.TemplateID, want)
+		}
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(mustReadFile(t, log))), "\n")
+	wantBatches := []string{
+		"T01 T02 T03 T04 T05 T06 T07 T08 T09 T10",
+		"T11 T12 T13 T14 T15 T16 T17 T18 T19 T20",
+		"T21 T22 T23 T24 T25",
+	}
+	if len(lines) != len(wantBatches) {
+		t.Fatalf("invocations = %d, want %d (25 templates / 10 per batch)", len(lines), len(wantBatches))
+	}
+	for i, want := range wantBatches {
+		if strings.TrimSpace(lines[i]) != want {
+			t.Errorf("invocation[%d] = %q, want %q", i, lines[i], want)
+		}
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestRunMockNuclei(t *testing.T) {
 	dump := filepath.Join(t.TempDir(), "args.txt")
 	writeMockNuclei(t, dump)
