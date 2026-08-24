@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,12 +13,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Boreas37/onyx/internal/db"
@@ -97,6 +100,8 @@ func main() {
 		}
 	case "db":
 		os.Exit(runDB(os.Args[2:]))
+	case "cache":
+		os.Exit(runCache(os.Args[2:]))
 	case "doctor":
 		os.Exit(runDoctor(os.Args[2:]))
 	case "diff":
@@ -218,6 +223,14 @@ type scanOptions struct {
 	failOnRateLimited    bool
 	nucleiMinSeverity    string
 	outputs              []string
+
+	basicAuthUser string
+	basicAuthPass string
+	cookie        string
+	headers       map[string]string
+	vhost         string
+	force         bool
+	excludeVulns  []string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -467,6 +480,33 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
+		case a == "--basic-auth" && i+1 < len(args):
+			i++
+			user, pass, err := splitBasicAuth(args[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --basic-auth %q (use USER:PASS)\n", args[i])
+				os.Exit(2)
+			}
+			o.basicAuthUser, o.basicAuthPass = user, pass
+		case a == "--cookie" && i+1 < len(args):
+			i++
+			o.cookie = args[i]
+		case a == "--headers" && i+1 < len(args):
+			i++
+			hdr, err := parseHeaders(args[i])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: invalid --headers: %v\n", err)
+				os.Exit(2)
+			}
+			o.headers = hdr
+		case a == "--vhost" && i+1 < len(args):
+			i++
+			o.vhost = args[i]
+		case a == "--force":
+			o.force = true
+		case a == "--exclude-vulns" && i+1 < len(args):
+			i++
+			o.excludeVulns = parseExcludeVulns(args[i])
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
@@ -691,6 +731,52 @@ func atoi(s string, def int) int {
 	return n
 }
 
+// splitBasicAuth splits a USER:PASS value on the first colon; a value
+// without a colon is malformed.
+func splitBasicAuth(v string) (user, pass string, err error) {
+	parts := strings.SplitN(v, ":", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("expected USER:PASS")
+	}
+	return parts[0], parts[1], nil
+}
+
+// parseHeaders parses a comma-separated "Name: value,Name2: value2"
+// header list into a map. Names and values are trimmed; a pair without a
+// colon or with an empty header name is malformed. Empty list parts
+// (trailing commas) are ignored.
+func parseHeaders(v string) (map[string]string, error) {
+	h := make(map[string]string)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pair := strings.SplitN(part, ":", 2)
+		if len(pair) != 2 {
+			return nil, fmt.Errorf("malformed header %q (use \"Name: value\")", part)
+		}
+		name := strings.TrimSpace(pair[0])
+		if name == "" {
+			return nil, fmt.Errorf("empty header name in %q", part)
+		}
+		h[name] = strings.TrimSpace(pair[1])
+	}
+	return h, nil
+}
+
+// parseExcludeVulns splits a comma-separated vulnerability ID list,
+// dropping empty entries.
+func parseExcludeVulns(v string) []string {
+	var ids []string
+	for _, id := range strings.Split(v, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // dbAgeDays returns how many whole days have passed since the database at
 // dbPath was last downloaded, or -1 when its age cannot be determined. The
 // age is measured from the .sha256 sidecar (written on every real
@@ -756,6 +842,12 @@ Scan flags:
   --proxy-target-only  use the proxy only for the scanned target host (other connections direct)
   --tls-fingerprint MODE  TLSClientConfig variation: chrome, firefox or random (per-request rotation)
   --per-host-rate-limit N  max requests per second per host (each host gets its own limiter)
+  --basic-auth USER:PASS  send HTTP Basic authentication (admin:secret) on every request
+  --cookie COOKIE         send a raw Cookie header, e.g. "wordpress_sec=abc; wp_lang=en"
+  --headers LIST          send extra request headers, comma-separated "Name: value" pairs
+  --vhost HOST            use HOST as the HTTP Host header (virtual-host scanning)
+  --force                 scan anyway when the target does not look like WordPress
+  --exclude-vulns LIST    drop vulnerability IDs from the report (comma-separated)
   --no-xmlrpc        skip the XML-RPC (xmlrpc.php) ping check
   --checks LIST      run extra checks: cb (config backups), dbe (db exports), timthumb; combine with commas
   --connect-timeout S  TCP connect timeout in seconds (default: 10)
@@ -810,6 +902,10 @@ Watch mode:
 Database inspection:
   onyx db stats|lookup SLUG|top [N]|search QUERY|diff B.json [--db PATH]
 
+Cache management:
+  onyx cache stats               show the HTTP cache directory, entry count, total size and entry ages
+  onyx cache purge               delete all cached HTTP responses (and the cache dir when empty)
+
 Diagnostics & helpers:
   onyx doctor [--db PATH] [--network]   local health checks (offline by default)
   onyx diff A.json B.json               compare two saved scan results
@@ -827,7 +923,29 @@ Update flags:
 `, defaultDB, defaultDB)
 }
 
+// scanSignalContext returns a context cancelled on SIGINT or SIGTERM so
+// an interactive interrupt stops the in-flight scan cleanly instead of
+// killing the process mid-request.
+func scanSignalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// scannerOptionsForRun builds the scanner options for a single runScan
+// invocation, attaching the signal-based context unless a scan-wide
+// deadline is configured: when MaxScanDuration > 0 the scanner builds
+// its own timeout ctx, which requestCtx() prefers over Options.Context.
+func scannerOptionsForRun(o scanOptions, findings chan scanner.Finding, ctx context.Context) scanner.Options {
+	opts := scannerOptionsFrom(o, findings)
+	if o.maxScanDuration == 0 {
+		opts.Context = ctx
+	}
+	return opts
+}
+
 func runScan(target string, o scanOptions) int {
+	ctx, cancel := scanSignalContext()
+	defer cancel()
+
 	if _, err := os.Stat(o.dbPath); err != nil {
 		if o.noUpdate {
 			fmt.Fprintf(os.Stderr, "error: database not found at %s (--no-update given — run 'onyx update' first)\n", o.dbPath)
@@ -889,7 +1007,7 @@ func runScan(target string, o scanOptions) int {
 		}()
 	}
 
-	sc, err := scanner.NewScanner(database, target, scannerOptionsFrom(o, findings))
+	sc, err := scanner.NewScanner(database, target, scannerOptionsForRun(o, findings, ctx))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
@@ -906,6 +1024,12 @@ func runScan(target string, o scanOptions) int {
 	if streamDone != nil {
 		<-streamDone
 	}
+	// An interrupted scan is not a hard failure: the scanner treats ctx
+	// cancellation like a scan-wide deadline (workers stop, res.TimedOut
+	// may be set), so warn and keep reporting whatever was collected.
+	if ctx.Err() != nil && res != nil {
+		fmt.Fprintln(os.Stderr, "[WARN] scan interrupted — results may be incomplete")
+	}
 	if res != nil && res.TimedOut {
 		spec := o.maxScanDurationSpec
 		if spec == "" {
@@ -914,6 +1038,9 @@ func runScan(target string, o scanOptions) int {
 		fmt.Fprintf(os.Stderr, "[WARN] scan timed out after %s — results may be incomplete\n", spec)
 	}
 	if err != nil && res == nil {
+		if ctx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "[WARN] scan interrupted")
+		}
 		fmt.Fprintln(os.Stderr, "scan failed:", err)
 		return 2
 	}
@@ -1185,6 +1312,13 @@ func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Op
 		MaxRetries:           o.retries,
 		Discover404:          o.discover404,
 		PopularFile:          o.popularFile,
+		BasicAuthUser:        o.basicAuthUser,
+		BasicAuthPass:        o.basicAuthPass,
+		Cookie:               o.cookie,
+		Headers:              o.headers,
+		VHost:                o.vhost,
+		Force:                o.force,
+		ExcludeVulns:         o.excludeVulns,
 	}
 }
 

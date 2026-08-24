@@ -27,10 +27,13 @@ var scanFlagList = []string{
 	"--nuclei-min-severity", "--outputs",
 	"--targets", "--profile", "--connect-timeout", "--request-timeout",
 	"--format", "--db",
+	"--basic-auth", "--cookie", "--headers", "--vhost", "--force",
+	"--exclude-vulns",
 }
 
-var onyxSubcommands = []string{"scan", "update", "version", "db", "watch", "doctor", "diff", "example-config", "completion"}
+var onyxSubcommands = []string{"scan", "update", "version", "db", "cache", "watch", "doctor", "diff", "example-config", "completion"}
 var dbSubcommands = []string{"stats", "lookup", "top", "search", "diff"}
+var cacheSubcommands = []string{"stats", "purge"}
 
 func runCompletion(args []string) int {
 	if len(args) != 1 {
@@ -62,15 +65,19 @@ _onyx_completions() {
   local i sub=""
   for ((i=1; i < COMP_CWORD; i++)); do
     case "${COMP_WORDS[i]}" in
-      scan|update|version|db|watch|completion) sub="${COMP_WORDS[i]}" ;;
+      scan|update|version|db|cache|watch|completion) sub="${COMP_WORDS[i]}" ;;
     esac
   done
   if [[ -z "$sub" ]]; then
-    COMPREPLY=( $(compgen -W "scan update version db watch completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "scan update version db cache watch completion" -- "$cur") )
     return
   fi
   if [[ "$sub" == "db" ]]; then
     COMPREPLY=( $(compgen -W "stats lookup top search --db" -- "$cur") )
+    return
+  fi
+  if [[ "$sub" == "cache" ]]; then
+    COMPREPLY=( $(compgen -W "stats purge" -- "$cur") )
     return
   fi
   if [[ "$cur" == -* ]]; then
@@ -94,6 +101,9 @@ func writeZshCompletion(b *strings.Builder, flags []string) {
     db)
       _values 'db command' %s
       ;;
+    cache)
+      _values 'cache command' %s
+      ;;
     scan)
       local -a flags
       flags=(%s)
@@ -106,7 +116,7 @@ func writeZshCompletion(b *strings.Builder, flags []string) {
   esac
 }
 compdef _onyx onyx
-`, strings.Join(quoteWords(dbSubcommands), " "), strings.Join(quoteWords(flags), " "))
+`, strings.Join(quoteWords(dbSubcommands), " "), strings.Join(quoteWords(cacheSubcommands), " "), strings.Join(quoteWords(flags), " "))
 }
 
 func writeFishCompletion(b *strings.Builder, flags []string) {
@@ -116,6 +126,9 @@ func writeFishCompletion(b *strings.Builder, flags []string) {
 	}
 	for _, s := range dbSubcommands {
 		fmt.Fprintf(b, "complete -c onyx -n '__fish_seen_subcommand_from db' -a '%s'\n", s)
+	}
+	for _, s := range cacheSubcommands {
+		fmt.Fprintf(b, "complete -c onyx -n '__fish_seen_subcommand_from cache' -a '%s'\n", s)
 	}
 	for _, f := range flags {
 		if strings.HasPrefix(f, "--") {
