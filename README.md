@@ -63,7 +63,7 @@ onyx scan https://example.com
 | `--enumerate M` | What to probe: `p`/`vp`/`ap` plugins, `t`/`vt`/`at` themes, `u` users, `m` media — comma-separated (default `pt`; `vp`/`vt` probe vulnerable components without the popular-seed lists) |
 | `--detection-mode M` | `passive`, `aggressive`, or `mixed` (default: mixed) |
 | `--min-severity S` | Only show findings >= `critical`/`high`/`medium`/`low` |
-| `--format F` | Output format: `table`, `json`, `jsonl`, `sarif`, `csv`, `cyclonedx`, `markdown`/`md`, `html`, `junit` (default: table) |
+| `--format F` | Output format: `table`, `json`, `jsonl`, `sarif`, `csv`, `cyclonedx`, `markdown`/`md`, `html`, `junit`, `gitlab-sast` (default: table) |
 | `--rate-limit N` | Max requests per second |
 | `--stealth` | One request per second + random user agent |
 | `--user-agent S` | Set a fixed User-Agent header |
@@ -105,6 +105,8 @@ onyx scan https://example.com
 | `--force` | Scan even when the target shows no WordPress fingerprints |
 | `--exclude-vulns LIST` | Drop findings with these vulnerability IDs (comma-separated) |
 | `--wp-version X.Y.Z` | Skip version detection and report this core version (e.g. when meta tags are stripped) |
+| `--disable-tls-checks` | Skip TLS certificate verification (MITM proxies / self-signed hosts) |
+| `--update-db` | Refresh a database older than 14 days before scanning (network failures degrade to a warning) |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
@@ -278,6 +280,14 @@ onyx scan https://example.com --format junit   > junit.xml       # CI test repor
 JUnit marks one failing testcase per vulnerability, so GitLab/Jenkins test
 widgets light up per finding; a clean scan emits a passing testcase so the
 report is always structurally valid. `--output FILE` honors these formats.
+
+## GitLab SAST
+
+`--format gitlab-sast` emits a `gl-sast-report.json`-compatible document
+(version 15.x) with one vulnerability per record: severity, scanner
+metadata and CVE identifiers linked to the NVD — ready for GitLab SAST
+pipeline consumption. Results also carry a `scanned_at` timestamp and
+findings are severity-ordered before enrichment.
 
 ## Component inventory output
 
