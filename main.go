@@ -54,6 +54,7 @@ func main() {
 	updDB := updCmd.String("db", defaultDB, "destination database path")
 	updFeed := updCmd.String("feed", feedProduction, "feed to fetch (production or scanner)")
 	updForce := updCmd.Bool("force", false, "skip the checksum check and always rewrite the database")
+	updCheck := updCmd.Bool("check", false, "check if an update is available without downloading")
 
 	if len(os.Args) < 2 {
 		usage()
@@ -79,6 +80,19 @@ func main() {
 		if feed != feedProduction && feed != feedScanner {
 			fmt.Fprintf(os.Stderr, "error: invalid --feed %q (use production or scanner)\n", feed)
 			os.Exit(2)
+		}
+		if *updCheck {
+			avail, err := updateCheck(*updDB, feed)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "check failed:", err)
+				os.Exit(2)
+			}
+			if avail {
+				fmt.Println("update available")
+				os.Exit(1)
+			}
+			fmt.Println("already up to date")
+			os.Exit(0)
 		}
 		if err := update(*updDB, feed, *updForce); err != nil {
 			fmt.Fprintln(os.Stderr, "update failed:", err)
@@ -1886,6 +1900,30 @@ func update(dst, feed string, force bool) error {
 		updateOptionalAssets(dst, rel)
 	}
 	return nil
+}
+
+// updateCheck reports whether an update is available for the database
+// at dst without downloading it. For the production feed it compares the
+// local sidecar against the mirror manifest; for the scanner feed it
+// always reports available (no manifest).
+func updateCheck(dst, feed string) (bool, error) {
+	if feed == feedScanner {
+		return true, nil
+	}
+	prev, err := os.ReadFile(dst + ".sha256")
+	if err != nil || strings.TrimSpace(string(prev)) == "" {
+		return true, nil
+	}
+	localSHA := strings.TrimSpace(string(prev))
+	raw, err := dbupdate.FetchManifestRaw(http.DefaultClient, manifestURL())
+	if err != nil {
+		return false, err
+	}
+	m, err := dbupdate.ParseManifest(raw)
+	if err != nil {
+		return false, err
+	}
+	return m.Full.Sha256 != localSHA, nil
 }
 
 // dbPubKeyPath returns the minisign public key path configured for
