@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	onyxVersion     = "0.9.0"
+	onyxVersion     = "1.0.0"
 	defaultDB       = "data/wordfence.json"
 	feedProduction  = "production"
 	feedScanner     = "scanner"
