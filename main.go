@@ -1846,14 +1846,16 @@ func generatePoCs(res *scanner.Result, o scanOptions, sc *scanner.Scanner) ([]sc
 		Model:    o.llmModel,
 		APIKey:   apiKey,
 		Endpoint: o.llmEndpoint,
-		Timeout:  90,
+		Timeout:  120,
 	})
 	if err != nil {
 		return nil, []string{fmt.Sprintf("llm provider: %v", err)}
 	}
 	tc := pocgen.BuildTargetCtx(res, contentDir, pluginsDir)
 	// Use a bounded context so one slow LLM call does not hang the scan.
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	// 5 CVEs * 3 LLM calls (raw analyze + generate + post-analyze) at 90s
+	// each can exceed 120s, so allow 10 minutes for bulk generation.
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 	defer cancel()
 	gen, warns := pocgen.Generate(ctx, res, tc, provider, pocgen.Options{
 		OutputDir:  outputDir,
