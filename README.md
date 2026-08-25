@@ -236,6 +236,15 @@ The HTTP response cache lives in `~/.cache/onyx/http` (or
 `$ONYX_CACHE_DIR`), uses `0600`/`0700` permissions, and is only active
 with `--cache-ttl`.
 
+## Core version sources
+
+The core version is detected from the first source that answers:
+generator meta tag → RSS/Atom feed generator → OPML generator → core
+asset `?ver=` values → `readme.html` → MD5 fingerprint table — or pinned
+with `--wp-version`. User discovery tries the REST list, then the author
+sitemap (`wp-sitemap-users-1.xml`), then single-user lookups and finally
+`?author=N` probing.
+
 ## Enumerate tokens
 
 `--enumerate` accepts WPScan-style tokens: `p`/`ap` (plugins, including

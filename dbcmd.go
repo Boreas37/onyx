@@ -289,11 +289,17 @@ func dbLookup(d *db.DB, slug string) int {
 		if len(labels) > 0 {
 			fmt.Printf("    affected: %s\n", strings.Join(labels, ", "))
 		}
-		if v.Software[0].Patched {
-			fmt.Printf("    patched in: %s\n", strings.Join(v.Software[0].PatchedVersions, ", "))
-		}
-		if v.Software[0].Remediation != "" {
-			fmt.Printf("    remediation: %s\n", v.Software[0].Remediation)
+		for si := range v.Software {
+			sw := &v.Software[si]
+			if sw.Slug != slug && len(v.Software) > 1 {
+				continue // other components of a multi-component record
+			}
+			if sw.Patched && len(sw.PatchedVersions) > 0 {
+				fmt.Printf("    patched in: %s\n", strings.Join(sw.PatchedVersions, ", "))
+			}
+			if sw.Remediation != "" {
+				fmt.Printf("    remediation: %s\n", sw.Remediation)
+			}
 		}
 	}
 	return 0

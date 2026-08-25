@@ -22,6 +22,12 @@ jobs:
         run: go vet ./...
       - name: Test (race detector)
         run: go test -race ./...
+      - name: Coverage
+        run: |
+          go test -coverprofile=coverage.txt ./... >/dev/null
+          total=$(go tool cover -func=coverage.txt | tail -1 | awk '{print $3}')
+          echo "total coverage: $total"
+          echo "coverage=$total" >> "$GITHUB_STEP_SUMMARY"
 
   lint:
     runs-on: ubuntu-latest
