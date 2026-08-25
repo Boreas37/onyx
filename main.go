@@ -1846,7 +1846,7 @@ func generatePoCs(res *scanner.Result, o scanOptions, sc *scanner.Scanner) ([]sc
 		Model:    o.llmModel,
 		APIKey:   apiKey,
 		Endpoint: o.llmEndpoint,
-		Timeout:  120,
+		Timeout:  180,
 	})
 	if err != nil {
 		return nil, []string{fmt.Sprintf("llm provider: %v", err)}
