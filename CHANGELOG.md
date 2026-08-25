@@ -2,6 +2,18 @@
 
 All notable changes to `onyx`. Versions follow semver; dates are UTC.
 
+## 1.1.1 — 2026-08-25
+
+### Fixed
+- Front-controller false-positive: `pluginMainVersion` now requires `Plugin Name:` header (looksLikePluginPHP), closing the `Version: 8.8.8` homepage forgery that made every missing plugin appear installed (`TestScanJobGuardRejectsRewrittenHomepage` was failing).
+- Known-locations 401/403/500 are now treated as presence (WPScan parity) — `scanJob` forges an `unknown` detection instead of missing a 403-hardened readme/style.css.
+- `backupFolderPaths` dead code activated: `--checks bf` backup-folder finder with `Index of` / `Parent Directory` markers and whitelist entry.
+
+### Changed
+- `--plugins-threshold` / `--themes-threshold` flags (WPScan 100/20 parity) — warnings in `Result.Errors` when the count meets the threshold.
+- `cacheKey` 64→128-bit (2^64 vs 2^32 birthday bound), `watch.SaveState` 0755/0644→0700/0600, `csvSafe` now trims leading spaces (`  =2+2` bypass closed).
+- Update path now uses a 30s `httpClient` and `FetchManifestRaw(nil)` so `ONYX_MANIFEST_URL` and release lookups cannot hang `onyx update` forever; `popular.json`/`fingerprints.json` stale files are removed on bad signature when `ONYX_DB_PUBKEY` is set.
+
 ## 0.9.0 — unreleased
 
 ### Added
