@@ -2417,7 +2417,7 @@ func mediaIDsFor(enum string) int {
 // to the running binary, printing a human line and returning non-nil
 // when an update is available (caller exits 2).
 func runVersionCheck() error {
-	rel, err := latestReleaseAssets("https://api.github.com/repos/" + productionRepo + "/releases/latest")
+	rel, err := latestReleaseAssets("https://api.github.com/repos/Boreas37/onyx/releases/latest")
 	if err != nil {
 		return fmt.Errorf("version check failed: %w", err)
 	}
