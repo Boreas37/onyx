@@ -555,7 +555,9 @@ func semanticFeedDigest(path string) (string, error) {
 	sort.Strings(ids)
 	h := sha256.New()
 	for _, id := range ids {
-		io.WriteString(h, id)
+		if _, err := io.WriteString(h, id); err != nil {
+			return "", err
+		}
 		h.Write([]byte{0})
 		h.Write(recs[id])
 		h.Write([]byte{'\n'})

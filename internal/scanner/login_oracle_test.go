@@ -96,10 +96,10 @@ func TestLoginOracleStopsAfterFoundMasked(t *testing.T) {
 		n := hits
 		mu.Unlock()
 		_ = r.ParseForm()
-		switch {
-		case n == 1: // admin confirmed first
+		switch n {
+		case 1: // admin confirmed first
 			_, _ = w.Write([]byte(`<div id="login_error">ERROR: The password you entered for the username <strong>admin</strong> is incorrect.</div>`))
-		case n == 2: // then the login page goes quiet (protection plugin)
+		case 2: // then the login page goes quiet (protection plugin)
 			_, _ = w.Write([]byte(`<div id="loginform">User Login</div>`))
 		default:
 			_, _ = w.Write([]byte(`<div id="login_error">ERROR: Invalid username.</div>`))

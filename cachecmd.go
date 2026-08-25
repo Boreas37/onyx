@@ -67,7 +67,7 @@ func cacheStats() int {
 	var total int64
 	var oldest, newest time.Time
 	var walkErr error
-	filepath.WalkDir(dir, func(p string, d fs.DirEntry, werr error) error {
+	if err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
 		}
@@ -89,7 +89,9 @@ func cacheStats() int {
 			newest = m
 		}
 		return nil
-	})
+	}); err != nil && walkErr == nil {
+		walkErr = err
+	}
 	if walkErr != nil {
 		fmt.Fprintln(os.Stderr, "cache stats:", walkErr)
 		return 2
