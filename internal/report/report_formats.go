@@ -75,8 +75,12 @@ func WriteMarkdown(w io.Writer, res *scanner.Result) {
 			if v.CVSSVector != "" {
 				sev += " (CVSS: " + mdCell(v.CVSSVector) + ")"
 			}
+			cveCell := mdCell(cve)
+			if v.CVE != "" && strings.HasPrefix(cve, "CVE-") {
+				cveCell = fmt.Sprintf("[%s](https://nvd.nist.gov/vuln/detail/%s)", mdCell(cve), mdCell(cve))
+			}
 			fmt.Fprintf(w, "| %s | %s | %s |\n",
-				sev, mdCell(cve), mdCell(v.Title))
+				sev, cveCell, mdCell(v.Title))
 			if v.Remediation != "" {
 				fmt.Fprintf(w, "| Remediation | %s |\n", mdCell(v.Remediation))
 			}

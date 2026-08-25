@@ -290,6 +290,13 @@ var timthumbPaths = []string{
 	"/timthumb.php",
 }
 
+// backupFolderPaths are directory names that commonly contain site
+// backups; a 200 response with a directory-listing marker is flagged.
+var backupFolderPaths = []string{
+	"/backup/", "/old/", "/bak/", "/backups/", "/bkp/", "/oldsite/",
+	"/wordpress_backup/", "/wp-backup/", "/sitebackup/", "/backup_wordpress/",
+}
+
 // timthumbFinder probes for an exposed TimThumb image-resizer copy: any of
 // timthumbPaths answering 200 with a body mentioning timthumb. When the
 // body also carries a recognizable release marker (see

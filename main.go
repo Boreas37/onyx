@@ -93,6 +93,13 @@ func main() {
 		}
 		os.Exit(runWatch(target, opts, wopts))
 	case "version":
+		if slices.Contains(os.Args[2:], "--check") {
+			if err := runVersionCheck(); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+			os.Exit(0)
+		}
 		if slices.Contains(os.Args[2:], "--json") {
 			fmt.Println(versionJSON())
 		} else {
@@ -1847,6 +1854,11 @@ func update(dst, feed string, force bool) error {
 				if _, iErr := db.LoadCached(dst); iErr != nil {
 					fmt.Fprintf(os.Stderr, "[WARN] index warm-up failed (scans will build it lazily): %v\n", iErr)
 				}
+				// Mirror optional data assets (popular lists, fingerprints) next to
+				// the database so scans auto-use them. Every failure is a warning.
+				if rel, rerr := latestReleaseAssets("https://api.github.com/repos/" + productionRepo + "/releases/latest"); rerr == nil {
+					updateOptionalAssets(dst, rel)
+				}
 				return nil
 			}
 		}
@@ -1867,6 +1879,11 @@ func update(dst, feed string, force bool) error {
 	// first scan after an update does not pay the full parse cost.
 	if _, iErr := db.LoadCached(dst); iErr != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] index warm-up failed (scans will build it lazily): %v\n", iErr)
+	}
+	// Mirror optional data assets (popular lists, fingerprints) next to
+	// the database so scans auto-use them (best-effort, warnings only).
+	if rel, rerr := latestReleaseAssets("https://api.github.com/repos/" + productionRepo + "/releases/latest"); rerr == nil {
+		updateOptionalAssets(dst, rel)
 	}
 	return nil
 }
@@ -2394,4 +2411,26 @@ func mediaIDsFor(enum string) int {
 		return 15
 	}
 	return 0
+}
+
+// runVersionCheck fetches the latest GitHub release tag and compares it
+// to the running binary, printing a human line and returning non-nil
+// when an update is available (caller exits 2).
+func runVersionCheck() error {
+	rel, err := latestReleaseAssets("https://api.github.com/repos/" + productionRepo + "/releases/latest")
+	if err != nil {
+		return fmt.Errorf("version check failed: %w", err)
+	}
+	latest := strings.TrimSpace(rel.TagName)
+	if latest == "" {
+		return fmt.Errorf("version check: empty tag in release metadata")
+	}
+	latest = strings.TrimPrefix(latest, "v")
+	if latest == onyxVersion {
+		fmt.Printf("onyx %s is up to date (latest: %s)\n", onyxVersion, rel.TagName)
+		return nil
+	}
+	fmt.Printf("onyx %s — update available: %s (https://github.com/%s/releases/tag/%s)\n",
+		onyxVersion, rel.TagName, productionRepo, rel.TagName)
+	return nil
 }

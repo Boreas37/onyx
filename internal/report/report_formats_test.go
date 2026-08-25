@@ -36,7 +36,7 @@ func TestWriteMarkdown(t *testing.T) {
 	out := b.String()
 	for _, want := range []string{
 		"# onyx scan — http://lab.test", "**WordPress core:** 7.1",
-		"### plugin/contact-form-7 @ 5.3.2 (2)", "| medium | CVE-2025-3247 | Order Replay \\| <injection> |",
+		"### plugin/contact-form-7 @ 5.3.2 (2)", "| medium | [CVE-2025-3247](https://nvd.nist.gov/vuln/detail/CVE-2025-3247) | Order Replay \\| <injection> |",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("markdown missing %q:\n%s", want, out)
@@ -349,8 +349,8 @@ func TestWriteMarkdownHostileSeverityPipes(t *testing.T) {
 	if n := strings.Count(row, "|"); n != 4 {
 		t.Errorf("hostile rating changed column count: %d pipes in %q (want 4)", n, row)
 	}
-	if !strings.HasPrefix(row, "| unknown | CVE-2026-9999 | T |") {
-		t.Errorf("severity cell = %q, want whitelisted \"unknown\"", row)
+	if !strings.Contains(row, "| unknown | [CVE-2026-9999](https://nvd.nist.gov/vuln/detail/CVE-2026-9999) | T |") {
+		t.Errorf("severity cell = %q, want whitelisted \"unknown\" with CVE link", row)
 	}
 }
 
