@@ -22,13 +22,12 @@ type OpenAI struct {
 }
 
 // NewOpenAI returns an OpenAI provider. Model defaults to
-// muse-spark-1.2-contributor (opencode go, cheap) via
-// https://opencode.ai/zen/go/v1, timeout 60s. Override with --llm-model
-// and --llm-endpoint for OpenAI etc.
+// deepseek-v4-flash (cheap) via https://opencode.ai/zen/go/v1, timeout
+// 60s. Override with --llm-model and --llm-endpoint for other models.
 func NewOpenAI(opts Options) (*OpenAI, error) {
 	model := opts.Model
 	if model == "" {
-		model = "muse-spark-1.2-contributor"
+		model = "deepseek-v4-flash"
 	}
 	endpoint := opts.Endpoint
 	if endpoint == "" {
