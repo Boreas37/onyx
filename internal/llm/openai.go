@@ -21,16 +21,18 @@ type OpenAI struct {
 	client   *http.Client
 }
 
-// NewOpenAI returns an OpenAI provider. Model defaults to gpt-4o, endpoint
-// to https://api.openai.com, timeout to 60s.
+// NewOpenAI returns an OpenAI provider. Model defaults to
+// muse-spark-1.2-contributor (opencode go, cheap) via
+// https://opencode.ai/zen/go/v1, timeout 60s. Override with --llm-model
+// and --llm-endpoint for OpenAI etc.
 func NewOpenAI(opts Options) (*OpenAI, error) {
 	model := opts.Model
 	if model == "" {
-		model = "gpt-4o"
+		model = "muse-spark-1.2-contributor"
 	}
 	endpoint := opts.Endpoint
 	if endpoint == "" {
-		endpoint = "https://api.openai.com/v1/chat/completions"
+		endpoint = "https://opencode.ai/zen/go/v1/chat/completions"
 	}
 	if opts.APIKey == "" {
 		return nil, fmt.Errorf("openai provider requires API key (set OPENAI_API_KEY or --llm-api-key)")

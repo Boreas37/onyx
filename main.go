@@ -990,9 +990,9 @@ Scan flags:
   --no-pocs          skip PoC reference lookup (nuclei findings only)
   --poc-generate     adapt the top PoC for each CVE to the target via LLM (needs --force, Boreas37/CVE-PoC-Tracker)
   --poc-output DIR   where generated PoCs are written (default ./pocs)
-  --llm-provider P   llm backend: openai, anthropic or ollama (default openai)
-  --llm-model M      llm model name (default gpt-4o / claude-3-5-sonnet / llama3.2)
-  --llm-endpoint URL override LLM API endpoint
+  --llm-provider P   llm backend: openai, anthropic or ollama (default openai, opencode go)
+  --llm-model M      llm model name (default muse-spark-1.2-contributor)
+  --llm-endpoint URL override LLM API endpoint (default https://opencode.ai/zen/go/v1/chat/completions)
   --llm-api-key KEY  LLM API key (or set OPENAI_API_KEY / ANTHROPIC_API_KEY)
   --passwords FILE   wordlist of passwords (one per line) — enables the wp-login brute force (needs --usernames FILE or --enumerate u)
   --usernames FILE   wordlist of usernames (one per line) for brute-force attacks
