@@ -171,6 +171,13 @@ type Options struct {
 	// or unparseable file falls back to the built-ins with a one-time
 	// warning, never an error. Empty when unused.
 	PopularFile string
+	// PluginsThreshold aborts enumeration with a warning when at least
+	// this many plugins are found (0 = disabled, matching WPScan's
+	// --plugins-threshold default 100; WPScan errors, onyx warns so the
+	// scan still reports partial results). ThemesThreshold is the same
+	// for themes (WPScan default 20).
+	PluginsThreshold int
+	ThemesThreshold  int
 }
 
 // Scanner drives one scan against a single target.
@@ -315,6 +322,29 @@ func (s *Scanner) timthumbFinder() []string {
 				p += " (TimThumb " + v + ")"
 			}
 			found = append(found, p)
+		}
+	}
+	return found
+}
+
+// backupFolderFinder probes the common backup directory names at the site
+// root. A 200 response whose body contains an Apache/nginx directory
+// listing marker is flagged as an exposed backup folder. Front-controller
+// rewrites are harmless: a rewritten homepage never contains the listing
+// markers, so it cannot forge a hit.
+func (s *Scanner) backupFolderFinder() []string {
+	var found []string
+	for _, p := range backupFolderPaths {
+		code, body, err := s.fetch(p)
+		if err != nil || code != http.StatusOK {
+			continue
+		}
+		b := string(body)
+		// Directory listings are identified by the same markers used for
+		// mu-plugins exposure (Index of / Parent Directory), which are
+		// stable across Apache and nginx.
+		if strings.Contains(b, "Index of") || strings.Contains(b, "Parent Directory") || strings.Contains(b, "<title>Directory listing") {
+			found = append(found, strings.Trim(p, "/")+" directory listing")
 		}
 	}
 	return found
@@ -561,8 +591,8 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 			if c == "" {
 				continue
 			}
-			if c != "cb" && c != "dbe" && c != "timthumb" {
-				return nil, fmt.Errorf("invalid --checks value %q (use cb, dbe and/or timthumb)", c)
+			if c != "cb" && c != "dbe" && c != "timthumb" && c != "bf" {
+				return nil, fmt.Errorf("invalid --checks value %q (use cb, dbe, bf and/or timthumb)", c)
 			}
 			checks[c] = true
 		}
@@ -1479,10 +1509,13 @@ func (s *Scanner) scanDone() bool {
 	return s.ctx != nil && s.ctx.Err() != nil
 }
 
-// cacheKey hashes a URL into a flat file name for the HTTP cache.
+// cacheKey hashes a URL into a flat file name for the HTTP cache. The
+// full 256-bit digest is hex-encoded as 32 bytes (128-bit truncation) so
+// collision resistance is 2^64 (vs 2^32 for the old 64-bit key), while
+// keeping file names short enough for every filesystem.
 func cacheKey(u string) string {
 	h := sha256.Sum256([]byte(u))
-	return hex.EncodeToString(h[:8])
+	return hex.EncodeToString(h[:16])
 }
 
 // cacheGet serves u from the disk cache when a fresh (within TTL) response
@@ -1662,6 +1695,17 @@ func looksLikeReadme(body []byte) bool {
 // homepage HTML do not.
 func looksLikeThemeCSS(body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "theme name:")
+}
+
+// looksLikePluginPHP reports whether body looks like a genuine WordPress
+// plugin main file: it must carry the "Plugin Name:" header mandated by
+// the plugin handbook. Front-controller rewrites land on homepage HTML
+// which never carries this combination, so the bare "Version:" regex alone
+// (which fires on homepage HTML containing "Version: 8.8.8") cannot be
+// abused to forge phantom plugins. Used as the authenticity gate for
+// pluginMainVersion, mirroring looksLikeReadme / looksLikeThemeCSS.
+func looksLikePluginPHP(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "plugin name:")
 }
 
 // configBackupFinder probes every wp-config backup name at the site root.
@@ -2680,15 +2724,23 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 // body without a parseable version — returns NO detection at all: guessing
 // "unknown" from untrusted markup pollutes the inventory with rewritten
 // homepages. A non-200 answer keeps its historical behaviour of returning
-// nothing as well.
+// nothing as well, except for 401/403/500 which WPScan treats as presence
+// (hardened directories often deny readme/style.css but the component is
+// still installed). Those codes forge an "unknown" detection so a 403-ed
+// plugin is not missed.
 func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 	var ver string
 	var found bool
 	source := "readme"
 	var testedUpTo, requiresAtLeast string
+	// probeCode remembers the initial readme/style.css status for the
+	// 401/403/500 presence fallback after all version sources are exhausted.
+	var probeCode int
+	var probeErr error
 	switch j.kind {
 	case "plugin":
 		code, body, err := s.fetch(j.path)
+		probeCode, probeErr = code, err
 		if err == nil && code == http.StatusOK {
 			bodyStr := string(body)
 			ver, found = ExtractVersionFromReadme(bodyStr)
@@ -2726,8 +2778,13 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 				source = "plugin-main"
 			}
 		}
+		if !found && probeErr == nil && (probeCode == http.StatusUnauthorized || probeCode == http.StatusForbidden || probeCode == http.StatusInternalServerError) {
+			ver, found = "unknown", true
+			source = "readme"
+		}
 	case "theme":
 		code, body, err := s.fetch(j.path)
+		probeCode, probeErr = code, err
 		if err == nil && code == http.StatusOK {
 			bodyStr := string(body)
 			ver, found = ExtractVersionFromStyleCSS(bodyStr)
@@ -2738,6 +2795,10 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 				// "Tested up to" is a readme.txt-only header.
 				requiresAtLeast = ExtractRequiresAtLeast(bodyStr)
 			}
+		}
+		if !found && probeErr == nil && (probeCode == http.StatusUnauthorized || probeCode == http.StatusForbidden || probeCode == http.StatusInternalServerError) {
+			ver, found = "unknown", true
+			source = "style.css"
 		}
 	}
 	if !found {
@@ -2758,11 +2819,18 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 
 // pluginMainVersion fetches <pluginsDir>/<slug>/<slug>.php and extracts its
 // "Version: X.Y.Z" header. Used as a last resort when readme.txt and
-// composer.json yield no version.
+// composer.json yield no version. A 200 body must also pass the
+// response-authenticity check (looksLikePluginPHP): front-controller
+// rewrites answer missing files with 200 + homepage HTML, and that HTML
+// can contain a bare "Version:" line that would otherwise forge a phantom
+// plugin.
 func (s *Scanner) pluginMainVersion(slug string) (string, bool) {
 	path := "/" + s.pluginsDir + "/" + slug + "/" + slug + ".php"
 	code, body, err := s.fetch(path)
 	if err != nil || code != http.StatusOK {
+		return "", false
+	}
+	if !looksLikePluginPHP(body) {
 		return "", false
 	}
 	m := styleVerRe.FindStringSubmatch(string(body))
@@ -3053,13 +3121,18 @@ func (s *Scanner) Scan() (*Result, error) {
 		}
 	}
 
-	// Optional file-based checks: config backups (cb), DB exports (dbe)
-	// and exposed TimThumb copies (timthumb).
+	// Optional file-based checks: config backups (cb), DB exports (dbe),
+	// backup folders (bf) and exposed TimThumb copies (timthumb).
 	if s.checks["cb"] {
 		res.ConfigBackups = s.configBackupFinder()
 	}
 	if s.checks["dbe"] {
 		res.DBExports = s.dbExportFinder()
+	}
+	if s.checks["bf"] {
+		if bf := s.backupFolderFinder(); len(bf) > 0 {
+			res.Interesting = append(res.Interesting, bf...)
+		}
 	}
 	if s.checks["timthumb"] && len(s.timthumbFinder()) > 0 {
 		res.Interesting = append(res.Interesting, "timthumb.php exposed")
@@ -3420,6 +3493,37 @@ func (s *Scanner) Scan() (*Result, error) {
 	// the counts map for its type (first match wins; the built-in lists
 	// carry no counts).
 	s.attachActiveInstalls(res.Detected)
+
+	// Threshold guard (WPScan parity): when --plugins-threshold or
+	// --themes-threshold is set and the corresponding count meets it,
+	// record a warning so the operator knows enumeration was capped by
+	// list size rather than max-requests. The scan still returns partial
+	// results (unlike WPScan's hard error) so findings are not lost.
+	if s.opts.PluginsThreshold > 0 || s.opts.ThemesThreshold > 0 {
+		plugins, themes := 0, 0
+		for _, d := range res.Detected {
+			switch d.Type {
+			case "plugin":
+				plugins++
+			case "theme":
+				themes++
+			}
+		}
+		if s.opts.PluginsThreshold > 0 && plugins >= s.opts.PluginsThreshold {
+			msg := fmt.Sprintf("plugins threshold %d reached (%d found) — enumeration may be incomplete", s.opts.PluginsThreshold, plugins)
+			res.Errors = append(res.Errors, msg)
+			if pr := s.progress; pr != nil {
+				pr.LogInf("[WARN] %s", msg)
+			}
+		}
+		if s.opts.ThemesThreshold > 0 && themes >= s.opts.ThemesThreshold {
+			msg := fmt.Sprintf("themes threshold %d reached (%d found) — enumeration may be incomplete", s.opts.ThemesThreshold, themes)
+			res.Errors = append(res.Errors, msg)
+			if pr := s.progress; pr != nil {
+				pr.LogInf("[WARN] %s", msg)
+			}
+		}
+	}
 
 	res.RateLimitHits = s.rateLimitHits()
 	res.TimedOut = s.scanDone()

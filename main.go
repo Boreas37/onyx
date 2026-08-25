@@ -249,13 +249,15 @@ type scanOptions struct {
 	nucleiMinSeverity    string
 	outputs              []string
 
-	basicAuthUser string
-	basicAuthPass string
-	cookie        string
-	headers       map[string]string
-	vhost         string
-	force         bool
-	excludeVulns  []string
+	basicAuthUser    string
+	basicAuthPass    string
+	cookie           string
+	headers          map[string]string
+	vhost            string
+	force            bool
+	excludeVulns     []string
+	pluginsThreshold int
+	themesThreshold  int
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -540,6 +542,12 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--exclude-vulns" && i+1 < len(args):
 			i++
 			o.excludeVulns = parseExcludeVulns(args[i])
+		case a == "--plugins-threshold" && i+1 < len(args):
+			i++
+			o.pluginsThreshold = atoi(args[i], 0)
+		case a == "--themes-threshold" && i+1 < len(args):
+			i++
+			o.themesThreshold = atoi(args[i], 0)
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
@@ -932,8 +940,10 @@ Scan flags:
   --vhost HOST            use HOST as the HTTP Host header (virtual-host scanning)
   --force                 scan anyway when the target does not look like WordPress
   --exclude-vulns LIST    drop vulnerability IDs from the report (comma-separated)
+  --plugins-threshold N   warn when >= N plugins found (default 0 = off, WPScan default 100)
+  --themes-threshold N    warn when >= N themes found (default 0 = off, WPScan default 20)
   --no-xmlrpc        skip the XML-RPC (xmlrpc.php) ping check
-  --checks LIST      run extra checks: cb (config backups), dbe (db exports), timthumb; combine with commas
+  --checks LIST      run extra checks: cb (config backups), dbe (db exports), bf (backup folders), timthumb; combine with commas
   --connect-timeout S  TCP connect timeout in seconds (default: 10)
   --request-timeout S  per-request timeout in seconds (default: 10; --timeout is an alias)
   --wp-content-dir PATH  wp-content directory (default: wp-content)
@@ -1421,6 +1431,8 @@ func scannerOptionsFrom(o scanOptions, findings chan scanner.Finding) scanner.Op
 		VHost:                o.vhost,
 		Force:                o.force,
 		ExcludeVulns:         o.excludeVulns,
+		PluginsThreshold:     o.pluginsThreshold,
+		ThemesThreshold:      o.themesThreshold,
 	}
 }
 
@@ -1915,7 +1927,7 @@ func updateCheck(dst, feed string) (bool, error) {
 		return true, nil
 	}
 	localSHA := strings.TrimSpace(string(prev))
-	raw, err := dbupdate.FetchManifestRaw(http.DefaultClient, manifestURL())
+	raw, err := dbupdate.FetchManifestRaw(nil, manifestURL())
 	if err != nil {
 		return false, err
 	}
@@ -1935,6 +1947,12 @@ func dbPubKeyPath() string {
 	return ""
 }
 
+// httpClient is a 30s-timeout client for update/manifest downloads. Using
+// http.DefaultClient (no timeout) would let a slow mirror hang an `onyx
+// update` forever; the scanner's own http.Client is separate and carries
+// per-request timeouts.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 // downloadToFile streams url into path without any re-encoding.
 func downloadToFile(url, path string) error {
 	req, err := http.NewRequest("GET", url, nil)
@@ -1942,7 +1960,7 @@ func downloadToFile(url, path string) error {
 		return err
 	}
 	req.Header.Set("User-Agent", "onyx")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -2082,7 +2100,7 @@ func updateViaDelta(dst string) (bool, error) {
 	}
 	localSHA := strings.TrimSpace(string(prevBytes))
 
-	raw, err := dbupdate.FetchManifestRaw(http.DefaultClient, manifestURL())
+	raw, err := dbupdate.FetchManifestRaw(nil, manifestURL())
 	if err != nil {
 		return false, fmt.Errorf("manifest: %w", err)
 	}
@@ -2182,7 +2200,7 @@ func productionAssetURL() (string, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "onyx")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("release lookup: %w", err)
 	}
@@ -2224,7 +2242,7 @@ func latestReleaseAssets(relURL string) (*releaseInfo, error) {
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "onyx")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("release lookup: %w", err)
 	}
@@ -2279,11 +2297,13 @@ func updateOptionalAssets(dst string, rel *releaseInfo) {
 		if pub := dbPubKeyPath(); pub != "" {
 			sigTmp := tmpName + ".sig"
 			if dErr := downloadToFile(url+".minisig", sigTmp); dErr != nil {
-				fmt.Fprintf(os.Stderr, "[WARN] %s signature fetch: %v — skipping\n", asset.name, dErr)
+				fmt.Fprintf(os.Stderr, "[WARN] %s signature fetch (pubkey configured): %v — removing stale %s\n", asset.name, dErr, asset.out)
+				_ = os.Remove(outPath)
 				continue
 			}
 			if vErr := dbupdate.VerifyMinisign(pub, sigTmp, tmpName); vErr != nil {
-				fmt.Fprintf(os.Stderr, "[WARN] %s signature verification FAILED: %v — skipping\n", asset.name, vErr)
+				fmt.Fprintf(os.Stderr, "[WARN] %s signature verification FAILED: %v — removing stale %s\n", asset.name, vErr, asset.out)
+				_ = os.Remove(outPath)
 				continue
 			}
 		}

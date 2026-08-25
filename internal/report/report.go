@@ -273,12 +273,25 @@ var csvHeader = []string{
 // with =, +, - or @ (or a tab/CR that Excel also treats as formula start)
 // gets a leading single quote so opening the CSV in Excel/Sheets cannot
 // execute it. Target-controlled fields (slugs, versions, titles from feeds)
-// make this reachable in practice.
+// make this reachable in practice. Leading spaces are trimmed before
+// the check because Excel ignores them before evaluating a formula (e.g.
+// " =2+2" still executes); a leading tab/CR is itself a formula trigger
+// and is checked directly without trimming.
 func csvSafe(s string) string {
 	if s == "" {
 		return s
 	}
-	switch s[0] {
+	// Excel strips leading spaces before formula evaluation, so
+	// " =2+2" must be neutralized. Tabs/CRs are formula starts
+	// themselves and are handled by the switch below.
+	trimmed := s
+	for len(trimmed) > 0 && trimmed[0] == ' ' {
+		trimmed = trimmed[1:]
+	}
+	if trimmed == "" {
+		return s
+	}
+	switch trimmed[0] {
 	case '=', '+', '-', '@', '\t', '\r':
 		return "'" + s
 	}

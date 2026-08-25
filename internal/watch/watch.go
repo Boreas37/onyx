@@ -197,10 +197,12 @@ func DiffToJSON(d *Diff) ([]byte, error) {
 
 // SaveState atomically writes st to path: the parent directory is created if
 // needed, the JSON is written to a temporary file in the same directory and
-// renamed over path, so readers never observe a partial state file.
+// renamed over path, so readers never observe a partial state file. The
+// state directory is 0700 and the file is 0600 so vulnerability data is not
+// world-readable on multi-user hosts (mirroring the HTTP cache permissions).
 func SaveState(path string, st *State) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("watch: create state dir: %w", err)
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
@@ -220,7 +222,7 @@ func SaveState(path string, st *State) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("watch: write temp state: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return fmt.Errorf("watch: chmod temp state: %w", err)
 	}
 	if err := os.Rename(tmpName, path); err != nil {
