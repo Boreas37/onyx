@@ -294,6 +294,71 @@ func TestIndexUnsupportedVersionFallsBack(t *testing.T) {
 	compareDBs(t, got, want)
 }
 
+// TestIndexLegacyUncompressedSidecarIsAMiss hand-builds a payload exactly
+// as pre-gzip versions of SaveIndex wrote it: a plain, uncompressed gob
+// stream of indexFile with a valid schema version and the correct source
+// hash. The modern reader sniffs for the gzip magic instead of decoding,
+// so this file is treated as legacy/corrupt — never served — and
+// LoadCached falls back to Load, rebuilding correct data and refreshing
+// the sidecar in gzip form.
+func TestIndexLegacyUncompressedSidecarIsAMiss(t *testing.T) {
+	path := indexFixtureFeed(t)
+	want, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha, err := fileSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	legacy := indexFile{
+		Version:   indexFormatVersion,
+		SourceSHA: sha,
+		Skipped:   want.Skipped(),
+		Records: []indexVuln{{
+			ID:          "11111111-0000-0000-0000-000000000001",
+			Title:       "Structured Plugin < 1.37 - XSS",
+			Description: "Structured fields.",
+			CVE:         "CVE-2026-1001",
+			CVSS:        CVSS{Vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", Score: 9.8, Rating: "critical"},
+			PublishedAt: "2026-01-01T00:00:00+00:00",
+			Software: []indexSoftware{{
+				Type: "plugin",
+				Name: "Structured Plugin",
+				Slug: "structured-plugin",
+				AffectedVersions: map[string]indexAffectedVersion{
+					"*-1.37": {
+						Label:  "*-1.37",
+						Ranges: []indexRange{{FromIncl: true, ToIncl: true}},
+					},
+				},
+			}},
+		}},
+	}
+	if err := gob.NewEncoder(&buf).Encode(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".idx", buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readIndexFile(path); err == nil {
+		t.Fatal("readIndexFile served a legacy uncompressed sidecar; want a cache miss")
+	}
+	got, err := LoadCached(path)
+	if err != nil {
+		t.Fatalf("LoadCached over legacy uncompressed sidecar must fall back, got error: %v", err)
+	}
+	compareDBs(t, got, want)
+	idxBytes, err := os.ReadFile(path + ".idx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(idxBytes, gzipMagic[:]) {
+		t.Fatalf("refreshed sidecar does not start with the gzip magic: % X", idxBytes[:min(len(idxBytes), len(gzipMagic))])
+	}
+}
+
 func TestSaveIndexMissingSource(t *testing.T) {
 	// SaveIndex hashes the source feed first, so a missing source is an
 	// error rather than a sidecar with a bogus hash.

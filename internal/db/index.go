@@ -1,7 +1,9 @@
 package db
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/gob"
 	"encoding/hex"
@@ -15,10 +17,11 @@ import (
 
 // SaveIndex writes a pre-built index of the loaded DB d as <path>.idx,
 // next to the source feed at path (e.g. data/wordfence.json.idx for
-// data/wordfence.json). The index is a gob stream — see indexFile for the
-// exact layout. It is safe to write over an existing sidecar; the write is
-// atomic (temp file + rename), so readers only ever observe a complete
-// file.
+// data/wordfence.json). The payload is a gzip-compressed gob stream (best
+// compression) — see indexFile for the exact layout; the schema itself
+// stays at version 1, only the container changes. It is safe to write
+// over an existing sidecar; the write is atomic (temp file + rename), so
+// readers only ever observe a complete file.
 //
 // The sidecar records the sha256 of the source feed's raw bytes at save
 // time; LoadCached re-hashes the feed and refuses the sidecar when the
@@ -75,8 +78,18 @@ func SaveIndex(path string, d *DB) error {
 	}
 
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(f); err != nil {
+	// Best-compression gzip around the gob stream: identical input yields
+	// byte-identical sidecar bytes (Go writes a zero ModTime header), so
+	// the container adds no nondeterminism of its own.
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+	if err != nil {
+		return fmt.Errorf("creating index compressor: %w", err)
+	}
+	if err := gob.NewEncoder(zw).Encode(f); err != nil {
 		return fmt.Errorf("encoding index: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("compressing index: %w", err)
 	}
 	if err := writeFileAtomic(path+".idx", buf.Bytes()); err != nil {
 		return fmt.Errorf("writing index: %w", err)
@@ -95,9 +108,10 @@ func SaveIndex(path string, d *DB) error {
 //     sha256 matches the current bytes of <path> while the sidecar's
 //     mtime is not older than the feed's, it is deserialized and returned,
 //     skipping the full JSON re-parse;
-//   - in every other case — no sidecar, stale or corrupt sidecar, unknown
-//     format version, or source-hash mismatch — LoadCached calls
-//     Load(path) and, best-effort, refreshes the sidecar via SaveIndex;
+//   - in every other case — no sidecar, stale or corrupt sidecar, legacy
+//     uncompressed sidecar (see readIndexFile), unknown format version, or
+//     source-hash mismatch — LoadCached calls Load(path) and, best-effort,
+//     refreshes the sidecar via SaveIndex;
 //   - the cache path NEVER produces an error: only Load's own errors
 //     (missing or malformed feed) surface. A cache miss silently degrades
 //     to a full load.
@@ -118,12 +132,12 @@ func LoadCached(path string) (*DB, error) {
 	return d, nil
 }
 
-// indexFile is the gob-serialized payload of a pre-built database index
-// sidecar. Only exported fields are stored because encoding/gob cannot
-// encode unexported fields — and the in-memory DB is NOT gob-safe as a
-// whole, since AffectedVersion holds []version.Range whose version.Version
-// internals (parts, raw) are unexported. This gob-friendly mirror is what
-// makes the sidecar serializable.
+// indexFile is the payload of a pre-built database index sidecar: a gob
+// stream wrapped in gzip by SaveIndex. Only exported fields are stored
+// because encoding/gob cannot encode unexported fields — and the in-memory
+// DB is NOT gob-safe as a whole, since AffectedVersion holds []version.Range
+// whose version.Version internals (parts, raw) are unexported. This
+// gob-friendly mirror is what makes the sidecar serializable.
 //
 // Layout (version 1):
 //
@@ -196,8 +210,15 @@ type indexRange struct {
 // indexFormatVersion is the indexFile layout version written by SaveIndex.
 const indexFormatVersion = 1
 
+// gzipMagic is the two-byte header every gzip stream starts with. Sidecars
+// written by SaveIndex begin with it; anything else on <path>.idx is a
+// legacy uncompressed sidecar or garbage, and is rejected as a cache miss.
+var gzipMagic = [2]byte{0x1f, 0x8b}
+
 // readIndexFile validates and decodes the sidecar for path. It returns an
 // error — a cache miss — on ANY problem: missing file, corrupt payload,
+// legacy uncompressed payload (sidecars written before the gzip container
+// are detected by sniffing the two-byte gzip magic rather than decoded),
 // unknown format version, a sidecar older than the feed, or a recorded
 // source hash that disagrees with the feed's current bytes. Callers treat
 // every error identically and fall back to Load.
@@ -225,8 +246,27 @@ func readIndexFile(path string) (*indexFile, error) {
 		return nil, err
 	}
 	defer f.Close()
+
+	// Sniff the container: gzip-compressed payloads are unwrapped; anything
+	// else — legacy plain-gob sidecars included — is rejected outright so
+	// it reads as a miss and gets rewritten by the fallback in the new
+	// format instead of being served in the old one.
+	br := bufio.NewReader(f)
+	magic, err := br.Peek(len(gzipMagic))
+	if err != nil {
+		return nil, fmt.Errorf("reading index %s: %w", idxPath, err)
+	}
+	if magic[0] != gzipMagic[0] || magic[1] != gzipMagic[1] {
+		return nil, fmt.Errorf("index %s: not a gzip-compressed index (legacy or corrupt)", idxPath)
+	}
+	zr, err := gzip.NewReader(br)
+	if err != nil {
+		return nil, fmt.Errorf("decoding index %s: %w", idxPath, err)
+	}
+	defer zr.Close()
+
 	var idx indexFile
-	if err := gob.NewDecoder(f).Decode(&idx); err != nil {
+	if err := gob.NewDecoder(zr).Decode(&idx); err != nil {
 		return nil, fmt.Errorf("decoding index %s: %w", idxPath, err)
 	}
 	if idx.Version != indexFormatVersion {
