@@ -18,6 +18,7 @@ import (
 
 	"github.com/Boreas37/onyx/internal/llm"
 	"github.com/Boreas37/onyx/internal/pocs"
+	"github.com/Boreas37/onyx/internal/sandbox"
 	"github.com/Boreas37/onyx/internal/sanitize"
 	"github.com/Boreas37/onyx/internal/scanner"
 )
@@ -174,6 +175,19 @@ func GenerateForFinding(ctx context.Context, provider llm.Provider, tc TargetCtx
 				}
 			}
 		}
+		// Sandbox pre-check: raw PoC may be malicious (backdoored public PoC).
+		if raw != "" {
+			if risk, reasons := sandbox.StaticCheck(raw); risk == sandbox.RiskHigh {
+				warns = append(warns, fmt.Sprintf("%s raw PoC STATIC HIGH: %s", cve, strings.Join(reasons, ", ")))
+			}
+			if provider != nil {
+				subCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+				if a, _ := sandbox.AnalyzeWithLLM(subCtx, provider, raw); a.Risk == sandbox.RiskHigh {
+					warns = append(warns, fmt.Sprintf("%s raw PoC LLM HIGH: %s — %s", cve, strings.Join(a.Reasons, ", "), a.Summary))
+				}
+				cancel()
+			}
+		}
 		// If raw still empty, Generate will produce a checker.
 		sysP := systemPrompt
 		userP := userPrompt(tc, vuln, f.Slug, f.Type, f.InstalledVersion, raw)
@@ -182,13 +196,33 @@ func GenerateForFinding(ctx context.Context, provider llm.Provider, tc TargetCtx
 			warns = append(warns, fmt.Sprintf("%s llm: %v", cve, err))
 			continue
 		}
-		// Sanitize filename: slug-cve.py
+		// Sandbox post-check: generated script must also be clean. Static is
+		// always checked; LLM re-analysis is best-effort.
+		flagged := false
+		if risk, reasons := sandbox.StaticCheck(script); risk == sandbox.RiskHigh {
+			warns = append(warns, fmt.Sprintf("%s generated PoC STATIC HIGH: %s — manual review required", cve, strings.Join(reasons, ", ")))
+			flagged = true
+		}
+		if provider != nil {
+			subCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			if a, _ := sandbox.AnalyzeWithLLM(subCtx, provider, script); a.Risk == sandbox.RiskHigh {
+				warns = append(warns, fmt.Sprintf("%s generated PoC LLM HIGH: %s — %s", cve, strings.Join(a.Reasons, ", "), a.Summary))
+				flagged = true
+			}
+			cancel()
+		}
+		// Sanitize filename: slug-cve.py, flagged gets _FLAGGED suffix.
 		safeSlug := sanitize.Text(f.Slug, 100)
 		safeSlug = strings.ReplaceAll(safeSlug, "/", "_")
 		safeCVE := sanitize.Text(cve, 64)
 		fname := fmt.Sprintf("%s-%s.py", safeSlug, safeCVE)
 		if safeCVE == "" {
 			fname = fmt.Sprintf("%s-%s.py", safeSlug, sanitize.Text(vuln.ID, 64))
+		}
+		if flagged {
+			ext := filepath.Ext(fname)
+			base := strings.TrimSuffix(fname, ext)
+			fname = base + "_FLAGGED" + ext
 		}
 		path := filepath.Join(opts.OutputDir, fname)
 		// Write 0600, header already in script but ensure file is not world-readable.
