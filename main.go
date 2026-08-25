@@ -26,7 +26,9 @@ import (
 	"github.com/Boreas37/onyx/internal/db"
 	"github.com/Boreas37/onyx/internal/dbupdate"
 	"github.com/Boreas37/onyx/internal/intel"
+	"github.com/Boreas37/onyx/internal/llm"
 	"github.com/Boreas37/onyx/internal/nuclei"
+	"github.com/Boreas37/onyx/internal/pocgen"
 	"github.com/Boreas37/onyx/internal/pocs"
 	"github.com/Boreas37/onyx/internal/progress"
 	"github.com/Boreas37/onyx/internal/report"
@@ -258,6 +260,13 @@ type scanOptions struct {
 	excludeVulns     []string
 	pluginsThreshold int
 	themesThreshold  int
+	// pocgen / llm
+	pocGenerate bool
+	pocOutput   string
+	llmProvider string
+	llmModel    string
+	llmEndpoint string
+	llmAPIKey   string
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -548,6 +557,23 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--themes-threshold" && i+1 < len(args):
 			i++
 			o.themesThreshold = atoi(args[i], 0)
+		case a == "--poc-generate":
+			o.pocGenerate = true
+		case a == "--poc-output" && i+1 < len(args):
+			i++
+			o.pocOutput = args[i]
+		case a == "--llm-provider" && i+1 < len(args):
+			i++
+			o.llmProvider = strings.ToLower(args[i])
+		case a == "--llm-model" && i+1 < len(args):
+			i++
+			o.llmModel = args[i]
+		case a == "--llm-endpoint" && i+1 < len(args):
+			i++
+			o.llmEndpoint = args[i]
+		case a == "--llm-api-key" && i+1 < len(args):
+			i++
+			o.llmAPIKey = args[i]
 		case strings.HasPrefix(a, "-"):
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
@@ -962,6 +988,12 @@ Scan flags:
   --nuclei-args ARGS extra arguments passed to nuclei (shell-free split, quotes supported)
   --poc-tracker-dir PATH  local clone of CVE-PoC-Tracker (default: ~/projects/cve-tracker or $POC_TRACKER_DIR)
   --no-pocs          skip PoC reference lookup (nuclei findings only)
+  --poc-generate     adapt the top PoC for each CVE to the target via LLM (needs --force, Boreas37/CVE-PoC-Tracker)
+  --poc-output DIR   where generated PoCs are written (default ./pocs)
+  --llm-provider P   llm backend: openai, anthropic or ollama (default openai)
+  --llm-model M      llm model name (default gpt-4o / claude-3-5-sonnet / llama3.2)
+  --llm-endpoint URL override LLM API endpoint
+  --llm-api-key KEY  LLM API key (or set OPENAI_API_KEY / ANTHROPIC_API_KEY)
   --passwords FILE   wordlist of passwords (one per line) — enables the wp-login brute force (needs --usernames FILE or --enumerate u)
   --usernames FILE   wordlist of usernames (one per line) for brute-force attacks
   --user USER        single username for the XML-RPC multicall attack (--xmlrpc-brute)
@@ -1170,6 +1202,34 @@ func runScan(target string, o scanOptions) int {
 		verifyWithNuclei(res, o)
 		if !o.noPocs {
 			collectPoCs(res, o)
+		}
+	}
+
+	// --poc-generate: read the original PoC from Boreas37/CVE-PoC-Tracker
+	// (via --poc-tracker-dir) and ask the LLM to adapt it to the target's
+	// fingerprint (contentDir, version, WAF). Off by default, requires
+	// --force and writes files for manual review, never auto-executes.
+	if o.pocGenerate && res != nil {
+		if !o.force {
+			fmt.Fprintln(os.Stderr, "[WARN] --poc-generate requires --force (targets you own) — skipping")
+		} else if len(res.Findings) == 0 {
+			fmt.Fprintln(os.Stderr, "[WARN] --poc-generate: no findings to generate PoCs for")
+		} else {
+			gen, warns := generatePoCs(res, o, sc)
+			if len(gen) > 0 {
+				res.GeneratedPoCs = gen
+				if pr := sc.Progress(); pr != nil {
+					pr.LogInf("pocgen: %d PoC(s) written", len(gen))
+				} else {
+					fmt.Fprintf(os.Stderr, "[INF] pocgen: %d PoC(s) written\n", len(gen))
+				}
+				for _, g := range gen {
+					fmt.Fprintf(os.Stderr, "  - %s (%s) -> %s\n", g.Slug, g.CVE, g.Output)
+				}
+			}
+			for _, w := range warns {
+				fmt.Fprintf(os.Stderr, "[WARN] pocgen: %s\n", w)
+			}
 		}
 	}
 
@@ -1722,6 +1782,86 @@ func collectPoCs(res *scanner.Result, o scanOptions) {
 		}
 		res.PoCs = append(res.PoCs, top...)
 	}
+}
+
+// generatePoCs adapts the top PoC for every CVE in res.Findings to the
+// target fingerprint via the configured LLM. It is the --poc-generate
+// backend; all failures are soft (warnings) so the scan result is never
+// discarded because the LLM is missing or rate-limited.
+func generatePoCs(res *scanner.Result, o scanOptions, sc *scanner.Scanner) ([]scanner.GeneratedPoC, []string) {
+	// Resolve tracker dir (same cascade as collectPoCs).
+	trackerDir := o.pocTrackerDir
+	if trackerDir == "" {
+		trackerDir = os.Getenv("POC_TRACKER_DIR")
+	}
+	if trackerDir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			trackerDir = filepath.Join(home, "projects", "cve-tracker")
+		}
+	}
+	// Fallback to the Boreas37/CVE-PoC-Tracker clone path used in this
+	// workspace when the home-based path does not exist (keeps the
+	// hermetic e2e and local dev setups working without env).
+	if trackerDir != "" {
+		if _, err := os.Stat(trackerDir); err != nil {
+			alt := "/Users/boreas/Documents/Default Project/CVE-PoC-Tracker"
+			if _, err2 := os.Stat(alt); err2 == nil {
+				trackerDir = alt
+			}
+		}
+	}
+	trackerDir = expandHome(trackerDir)
+
+	providerName := o.llmProvider
+	if providerName == "" {
+		providerName = "openai"
+	}
+	apiKey := o.llmAPIKey
+	if apiKey == "" {
+		switch providerName {
+		case "openai":
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		case "anthropic":
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		case "ollama":
+			// no key needed
+		default:
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
+	}
+	outputDir := o.pocOutput
+	if outputDir == "" {
+		outputDir = "./pocs"
+	}
+	contentDir := o.contentDir
+	if contentDir == "" {
+		contentDir = "wp-content"
+	}
+	pluginsDir := o.pluginsDir
+	if pluginsDir == "" {
+		pluginsDir = "wp-content/plugins"
+	}
+	provider, err := llm.NewProvider(providerName, llm.Options{
+		Model:    o.llmModel,
+		APIKey:   apiKey,
+		Endpoint: o.llmEndpoint,
+		Timeout:  90,
+	})
+	if err != nil {
+		return nil, []string{fmt.Sprintf("llm provider: %v", err)}
+	}
+	tc := pocgen.BuildTargetCtx(res, contentDir, pluginsDir)
+	// Use a bounded context so one slow LLM call does not hang the scan.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	gen, warns := pocgen.Generate(ctx, res, tc, provider, pocgen.Options{
+		OutputDir:  outputDir,
+		TrackerDir: trackerDir,
+	})
+	// Progress logging is handled by the caller; just return warns.
+	_ = sc
+	return gen, warns
 }
 
 // splitNucleiArgs splits a --nuclei-args string into direct exec arguments

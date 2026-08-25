@@ -1165,6 +1165,10 @@ type Result struct {
 	LoginBrutes      []LoginBrute `json:"login_brutes,omitempty"` // valid credentials found by brute force
 	AuthStatus       string       `json:"auth_status,omitempty"`  // --wp-auth: authenticated | failed | ""
 	Summary          *Summary     `json:"summary,omitempty"`      // scan statistics; nil with --no-summary
+	// GeneratedPoCs are target-specific PoCs produced by --poc-generate
+	// (pocgen). They are written to disk for manual review and never
+	// auto-executed. Omitted when the feature is off.
+	GeneratedPoCs []GeneratedPoC `json:"generated_pocs,omitempty"`
 	// ScannedAt records when the scan finished (UTC); added in schema 1.0
 	// so saved results carry their own timestamp.
 	ScannedAt time.Time `json:"scanned_at"`
@@ -1172,6 +1176,16 @@ type Result struct {
 	// consumers can detect breaking output changes. "1.0" is the first
 	// versioned shape (onyx 0.5.0+); always present.
 	SchemaVersion string `json:"schema_version"`
+}
+
+// GeneratedPoC is one target-specific PoC produced by pocgen.
+type GeneratedPoC struct {
+	CVE       string `json:"cve"`
+	Slug      string `json:"slug"`
+	Type      string `json:"type"`
+	Version   string `json:"version"`
+	SourceURL string `json:"source_url"`
+	Output    string `json:"output"`
 }
 
 // sendRequest issues one HTTP request through client, re-running the full
