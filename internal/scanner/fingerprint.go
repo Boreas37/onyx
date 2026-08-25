@@ -504,3 +504,18 @@ func ExtractTimthumbVersion(body string) (string, bool) {
 	}
 	return "", false
 }
+
+// versionPHPRe matches the $wp_version assignment in wp-includes/version.php:
+// $wp_version = '6.4.2';  The value is captured without quotes.
+var versionPHPRe = regexp.MustCompile(`(?i)\$wp_version\s*=\s*['"]([0-9][0-9a-zA-Z.-]*)['"]`)
+
+// ExtractVersionFromVersionPHP parses the WordPress core version from a
+// wp-includes/version.php source body (the $wp_version assignment).
+// found is false when the assignment is absent.
+func ExtractVersionFromVersionPHP(body string) (string, bool) {
+	m := versionPHPRe.FindStringSubmatch(body)
+	if m == nil {
+		return "", false
+	}
+	return sanitizeVersion(m[1]), true
+}

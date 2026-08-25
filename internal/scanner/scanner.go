@@ -911,6 +911,7 @@ const (
 	confReadmeChangelog = 70 // plugin readme.txt Changelog heading
 	confStyleCSS        = 90 // theme style.css "Version:" header
 	confComposer        = 75 // plugin composer.json "version" field
+	confPluginMain      = 80 // plugin main file Version: header
 	confMetaGenerator   = 90 // core generator meta tag
 	confRSSGenerator    = 85 // core RSS feed generator element
 	confOPMLGenerator   = 80 // core wp-links-opml.php generator attribute
@@ -920,6 +921,7 @@ const (
 	confREST            = 100
 	confAuthREST        = 100
 	confRestRoutes      = 85 // plugin namespace from the wp-json route index
+	confVersionPHP      = 100 // wp-includes/version.php $wp_version (source of truth)
 	confFingerprint     = 85 // core asset md5 fingerprint table
 )
 
@@ -935,6 +937,8 @@ func sourceConfidence(source string) int {
 		return confStyleCSS
 	case "composer":
 		return confComposer
+	case "plugin-main":
+		return confPluginMain
 	case "meta":
 		return confMetaGenerator
 	case "rss":
@@ -953,6 +957,8 @@ func sourceConfidence(source string) int {
 		return confAuthREST
 	case "fingerprint":
 		return confFingerprint
+	case "version.php":
+		return confVersionPHP
 	}
 	return 0
 }
@@ -2237,6 +2243,20 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 		}
 	}
 
+	// wp-includes/version.php — when exposed it is the source of
+	// truth for the core version (constant $wp_version). One request
+	// on hardened installs where it 403s/404s; interestingFinders
+	// probes the same path when it is exposed.
+	if coreVersion == "" {
+		if code, body, err := s.fetch("/wp-includes/version.php"); err == nil && code == http.StatusOK {
+			if v, ok := ExtractVersionFromVersionPHP(string(body)); ok {
+				coreVersion = v
+				evidence = append(evidence, "wp-includes/version.php ($wp_version "+v+")")
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "version.php", Version: v, Confidence: confVersionPHP})
+			}
+		}
+	}
+
 	// Final core-version fallback: the optional --fingerprint-db md5 table.
 	// Only consulted when every cheaper source came up empty and a table was
 	// configured; it adds up to maxFingerprintProbes requests.
@@ -2698,6 +2718,14 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 				source = "composer"
 			}
 		}
+		if !found {
+			// Last resort for plugins: the main plugin file
+			// (<slug>/<slug>.php) carries a "Version: X.Y.Z" header.
+			if v, ok := s.pluginMainVersion(j.slug); ok {
+				ver, found = v, true
+				source = "plugin-main"
+			}
+		}
 	case "theme":
 		code, body, err := s.fetch(j.path)
 		if err == nil && code == http.StatusOK {
@@ -2726,6 +2754,26 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 		return detected, []Finding{f}
 	}
 	return detected, nil
+}
+
+// pluginMainVersion fetches <pluginsDir>/<slug>/<slug>.php and extracts its
+// "Version: X.Y.Z" header. Used as a last resort when readme.txt and
+// composer.json yield no version.
+func (s *Scanner) pluginMainVersion(slug string) (string, bool) {
+	path := "/" + s.pluginsDir + "/" + slug + "/" + slug + ".php"
+	code, body, err := s.fetch(path)
+	if err != nil || code != http.StatusOK {
+		return "", false
+	}
+	m := styleVerRe.FindStringSubmatch(string(body))
+	if m == nil {
+		return "", false
+	}
+	v := sanitizeVersion(m[1])
+	if v == "" {
+		return "", false
+	}
+	return v, true
 }
 
 // composerVersion fetches <pluginsDir>/<slug>/composer.json and returns its
