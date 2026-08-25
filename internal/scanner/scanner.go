@@ -908,6 +908,7 @@ const (
 	confRSSGenerator    = 85 // core RSS feed generator element
 	confOPMLGenerator   = 80 // core wp-links-opml.php generator attribute
 	confAssetVer        = 70 // core asset ?ver= cache-buster (wp-emoji-release etc.)
+	confReadmeHTML      = 75 // core readme.html "Version X.Y.Z" heading
 	confPassiveVer      = 60 // passive asset ?ver= query string
 	confREST            = 100
 	confAuthREST        = 100
@@ -933,6 +934,8 @@ func sourceConfidence(source string) int {
 		return confRSSGenerator
 	case "opml":
 		return confOPMLGenerator
+	case "readme-html":
+		return confReadmeHTML
 	case "passive-ver":
 		return confPassiveVer
 	case "rest":
@@ -1012,9 +1015,10 @@ type Detected struct {
 // CoreEvidence records one WordPress core version observation together with
 // the source that produced it: "meta" (generator meta tag), "rss" (feed
 // generator element), "opml" (wp-links-opml.php generator attribute),
-// "asset-ver" (core-released asset ?ver= cache-buster) or "fingerprint"
-// (core asset md5 table). Confidence carries the same 0..100 reliability
-// score used by Detected.
+// "asset-ver" (core-released asset ?ver= cache-buster), "readme-html"
+// (readme.html "Version X.Y.Z" heading) or "fingerprint" (core asset md5
+// table). Confidence carries the same 0..100 reliability score used by
+// Detected.
 type CoreEvidence struct {
 	Source     string `json:"source"`
 	Version    string `json:"version"`
@@ -1693,6 +1697,12 @@ func (s *Scanner) dbExportFinder() []string {
 	return found
 }
 
+// maxWPCronBodyLen caps how large a 200 /wp-cron.php response body may be
+// before it is considered a rewritten page rather than the real wp-cron
+// endpoint (which answers empty — WP-Cron produces no output when triggered
+// externally). Real wp-cron responses never come close to this.
+const maxWPCronBodyLen = 200
+
 // interestingFinders runs the always-on file checks (WPScan-style): each is
 // a simple GET plus a status/content rule flagging exposed files and
 // directory listings.
@@ -1743,6 +1753,17 @@ func (s *Scanner) interestingFinders() []string {
 	code, body, err = s.fetch("/wp-includes/version.php")
 	if err == nil && code == http.StatusOK && len(body) > 0 {
 		out = append(out, "wp-includes/version.php exposed")
+	}
+
+	// wp-cron.php is special-cased the same way (WPScan wp_cron finding):
+	// stock WordPress answers 200 with an EMPTY or tiny body when external
+	// cron triggering is enabled (WP-Cron runs on any request, so hitting
+	// it directly produces no output). A 403/404 means cron is blocked or
+	// disabled, and a large 200 body means a front-controller rewrite
+	// landed the probe on a real page — neither counts as reachable.
+	code, body, err = s.fetch("/wp-cron.php")
+	if err == nil && code == http.StatusOK && len(body) < maxWPCronBodyLen {
+		out = append(out, "wp-cron.php reachable (external cron triggers possible)")
 	}
 	return out
 }
@@ -1795,8 +1816,17 @@ func restPath(path string) []string {
 // a parseable JSON user list wins; auth rejections, wrong status codes and
 // unparseable bodies fall through to the next form. The returned errors
 // name every path actually tried.
+//
+// When every candidate was rejected with 401/403, a single-user fallback
+// runs before giving up: /users/1 .. /users/<maxSingleUserProbes> are probed
+// under the spelling that reached the locked-down listing, because some
+// hardening plugins block only the list endpoint while leaving individual
+// accounts public (up to maxSingleUserProbes extra requests). If none of
+// those answer either, the original "requires authentication" errors are
+// preserved verbatim.
 func (s *Scanner) usersFromAPI() ([]User, []string) {
 	var errs []string
+	authForm := "" // spelling of the first 401/403-rejected listing URL
 	for _, path := range restPath("/wp/v2/users") {
 		code, body, err := s.fetch(path)
 		if err != nil {
@@ -1807,21 +1837,15 @@ func (s *Scanner) usersFromAPI() ([]User, []string) {
 			// A hardening plugin may only cover one URL spelling, so note
 			// the rejection and let the other form answer before giving up.
 			errs = append(errs, path+" requires authentication (skipped)")
+			if authForm == "" {
+				authForm = path
+			}
 			continue
 		}
 		if code != http.StatusOK {
 			continue // e.g. 404 on the pretty form: the fallback may still work
 		}
-		// WordPress can prepend PHP Deprecated/Warning notices to the JSON
-		// payload; skip everything before the first '[' or '{' so the JSON
-		// decoder never sees the noise.
-		start := -1
-		for i, b := range body {
-			if b == '[' || b == '{' {
-				start = i
-				break
-			}
-		}
+		start := jsonPayloadStart(body)
 		if start < 0 {
 			errs = append(errs, path+" returned unparseable data")
 			continue
@@ -1833,19 +1857,81 @@ func (s *Scanner) usersFromAPI() ([]User, []string) {
 		}
 		return users, nil
 	}
+	// Single-user REST fallback: when the listing was rejected with 401/403
+	// on every form, some installs still leave INDIVIDUAL accounts public
+	// (/wp-json/wp/v2/users/<id>). Probe ids 1..maxSingleUserProbes using
+	// the URL spelling that reached the locked-down listing; per-probe
+	// failures stay silent. Success here replaces the auth errors — a found
+	// user is worth more than the note that listing was blocked.
+	if authForm != "" {
+		if singles := s.usersFromAPISingle(authForm); len(singles) > 0 {
+			return singles, nil
+		}
+	}
 	return nil, errs
 }
 
-// usersFromJSON decodes a wp-json users payload into sanitized User entries.
-func usersFromJSON(body []byte) []User {
-	var items []struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-		Slug string `json:"slug"`
+// maxSingleUserProbes caps the single-user REST fallback at five requests:
+// /users/1 .. /users/5 covers the admin account every WordPress install
+// creates first without letting the probe balloon.
+const maxSingleUserProbes = 5
+
+// usersFromAPISingle probes /wp/v2/users/<id> for id 1..maxSingleUserProbes,
+// reusing the URL spelling (pretty permalink vs ?rest_route=) that reached
+// the locked-down user listing — whichever spelling answered 401/403 proves
+// the API itself is reachable under that form. Every probe that does not
+// answer 200 with a parseable user payload is silently skipped; the
+// survivors are returned together.
+func (s *Scanner) usersFromAPISingle(listPath string) []User {
+	useRestRoute := strings.HasPrefix(listPath, "/?rest_route=")
+	var out []User
+	for id := 1; id <= maxSingleUserProbes; id++ {
+		p := "/wp/v2/users/" + strconv.Itoa(id)
+		path := "/wp-json" + p
+		if useRestRoute {
+			path = "/?rest_route=" + p
+		}
+		code, body, err := s.fetch(path)
+		if err != nil || code != http.StatusOK {
+			continue
+		}
+		start := jsonPayloadStart(body)
+		if start < 0 {
+			continue // rewritten homepage HTML or similar: not a user payload
+		}
+		users, perr := usersFromJSONSingle(body[start:])
+		if perr != nil {
+			continue
+		}
+		out = append(out, users...)
 	}
-	if err := json.Unmarshal(body, &items); err != nil {
-		return nil
+	return out
+}
+
+// jsonPayloadStart returns the index of the first '[' or '{' byte in body,
+// skipping any PHP Deprecated/Warning notice text WordPress may prepend to
+// a REST payload; -1 when the body carries no JSON at all.
+func jsonPayloadStart(body []byte) int {
+	for i, b := range body {
+		if b == '[' || b == '{' {
+			return i
+		}
 	}
+	return -1
+}
+
+// restUser mirrors the fields of a wp-json users payload entry that end up
+// in reports.
+type restUser struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
+// sanitizeRESTUsers converts decoded payload entries into report-safe User
+// values: slugs and display names are sanitized and entries without a slug
+// are dropped.
+func sanitizeRESTUsers(items []restUser) []User {
 	var out []User
 	for _, it := range items {
 		slug := sanitizeText(it.Slug, maxSlugLen)
@@ -1853,6 +1939,73 @@ func usersFromJSON(body []byte) []User {
 			continue
 		}
 		out = append(out, User{ID: it.ID, Slug: slug, Name: sanitizeText(it.Name, maxNameLen)})
+	}
+	return out
+}
+
+// usersFromJSON decodes a wp-json users payload (a JSON array of user
+// objects) into sanitized User entries. A body that does not parse as an
+// array — or carries no entry with a usable slug — yields nil.
+func usersFromJSON(body []byte) []User {
+	var items []restUser
+	if err := json.Unmarshal(body, &items); err != nil {
+		return nil
+	}
+	users := sanitizeRESTUsers(items)
+	if len(users) == 0 {
+		return nil
+	}
+	return users
+}
+
+// usersFromJSONSingle decodes a wp-json users payload carrying either a list
+// of user objects ([{...}, ...], the /users listing shape) or exactly one
+// user object ({...}, the /users/<id> shape); the array shape is tried
+// first. Unparseable bodies return an error; a body that parses but has no
+// usable slug yields an empty result and no error.
+func usersFromJSONSingle(body []byte) ([]User, error) {
+	var items []restUser
+	if err := json.Unmarshal(body, &items); err == nil {
+		return sanitizeRESTUsers(items), nil
+	}
+	var one restUser
+	if err := json.Unmarshal(body, &one); err != nil {
+		return nil, err
+	}
+	return sanitizeRESTUsers([]restUser{one}), nil
+}
+
+// usersFromAuthorSitemap pulls usernames from the WordPress core user
+// sitemap (/wp-sitemap-users-1.xml, which wp-sitemap.xml links whenever
+// public author archives exist): each <loc> entry points at an author
+// archive (/author/<slug>/), so the slugs are extracted with the same
+// authorSlugRe used for ?author=N redirects. Exactly one request; every
+// failure mode (transport error, non-200, foreign-host or slug-less
+// locations) degrades silently to no users so the classic probing below
+// still runs unchanged. Slugs are sanitized (sanitizeText, maxSlugLen) and
+// deduplicated; IDs are unknown from this source and stay 0.
+func (s *Scanner) usersFromAuthorSitemap() []User {
+	code, body, err := s.fetch("/wp-sitemap-users-1.xml")
+	if err != nil || code != http.StatusOK {
+		return nil
+	}
+	var out []User
+	seen := make(map[string]bool)
+	for _, loc := range parseSitemapLocs(body) {
+		p, ok := sitemapSitePath(loc, s.base)
+		if !ok {
+			continue // foreign hosts and malformed locations never count
+		}
+		m := authorSlugRe.FindStringSubmatch(p)
+		if m == nil {
+			continue
+		}
+		slug := sanitizeText(m[1], maxSlugLen)
+		if slug == "" || seen[slug] {
+			continue
+		}
+		seen[slug] = true
+		out = append(out, User{Slug: slug})
 	}
 	return out
 }
@@ -1968,10 +2121,14 @@ func normalizeUsers(lists ...[]User) []User {
 // The core version comes from the first source that answers, tried in
 // order: generator meta tag → RSS/Atom feed generator element (/?feed=rss2,
 // then /feed/, then /feed/atom) → wp-links-opml.php generator attribute →
-// core-released asset ?ver= cache-buster → optional --fingerprint-db md5
-// table. The fallback fetches only run when the meta tag did not yield a
-// version, keeping the request count low; whichever source wins is recorded
-// in s.coreEvidence.
+// core-released asset ?ver= cache-buster → readme.html version heading →
+// optional --fingerprint-db md5 table. The fallback fetches only run when
+// the meta tag did not yield a version, keeping the request count low;
+// whichever source wins is recorded in s.coreEvidence. The readme.html
+// candidate costs one extra request ONLY when every cheaper source failed —
+// a trade-off worth making because WordPress ships a version-stamped
+// readme.html ("<h1 id="version">Version X.Y.Z</h1>") that survives even
+// when generators and feeds are stripped.
 func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr error) {
 	code, body, err := s.fetch("/")
 	if err != nil {
@@ -2054,6 +2211,22 @@ func (s *Scanner) detectWP() (coreVersion string, evidence []string, fatalErr er
 			coreVersion = v
 			evidence = append(evidence, "core asset ?ver= (WordPress "+v+")")
 			s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "asset-ver", Version: v, Confidence: confAssetVer})
+		}
+	}
+
+	// readme.html fallback: WordPress ships a version-stamped readme.html
+	// with every release ("<h1 id="version">Version X.Y.Z</h1>"; older
+	// releases carry a bare "Version X.Y.Z" element). Only consulted when
+	// every cheaper source failed, so the cost is exactly one extra
+	// request on hardened installs — and interestingFinders probes the
+	// same path afterwards anyway when it is exposed.
+	if coreVersion == "" {
+		if code, body, err := s.fetch("/readme.html"); err == nil && code == http.StatusOK {
+			if v, ok := ExtractCoreVersionFromReadmeHTML(string(body)); ok {
+				coreVersion = v
+				evidence = append(evidence, "readme.html version heading (WordPress "+v+")")
+				s.coreEvidence = append(s.coreEvidence, CoreEvidence{Source: "readme-html", Version: v, Confidence: confReadmeHTML})
+			}
 		}
 	}
 
@@ -3063,18 +3236,34 @@ func (s *Scanner) Scan() (*Result, error) {
 		if pr != nil {
 			pr.AddDone(1)
 		}
+		// Author-sitemap discovery: ONE request to /wp-sitemap-users-1.xml,
+		// run after REST and before the ?author=N redirect probing. When it
+		// yields usernames the redirect probing is SKIPPED entirely — the
+		// sitemap already names every public author, so spending up to
+		// maxAuthorChecks more requests would only re-find them (trading a
+		// little depth for a much smaller request footprint). A missing or
+		// empty sitemap is silent and leaves the classic probing untouched.
+		var sitemapUsers []User
+		if !s.opts.APIOnly {
+			if pr != nil {
+				pr.SetCurrent("user:wp-sitemap-users")
+			}
+			sitemapUsers = s.usersFromAuthorSitemap()
+		}
 		var authorUsers []User
-		if authorPlan > 0 {
+		if authorPlan > 0 && len(sitemapUsers) == 0 {
 			if pr != nil {
 				pr.SetCurrent(fmt.Sprintf("user:author=1..%d", authorPlan))
 			}
 			authorUsers, userErrs = s.usersFromAuthors(authorPlan)
 			res.Errors = append(res.Errors, userErrs...)
-			if pr != nil {
-				pr.AddDone(int64(authorPlan))
-			}
 		}
-		res.Users = normalizeUsers(apiUsers, authorUsers)
+		// Close out the author probing's planned progress units whether it
+		// ran or was skipped in favour of the sitemap, so the bar finishes.
+		if pr != nil && authorPlan > 0 {
+			pr.AddDone(int64(authorPlan))
+		}
+		res.Users = normalizeUsers(apiUsers, sitemapUsers, authorUsers)
 		// Login-error username oracle: when REST and author enumeration came
 		// up empty, wp-login.php's #login_error message can still confirm
 		// accounts. Candidates come from the --usernames wordlist when

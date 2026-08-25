@@ -280,6 +280,37 @@ func ExtractCoreVersionFromAssets(html string) (version string, found bool) {
 	return sanitizeVersion(m[1]), true
 }
 
+// readmeH1VersionRe matches the version heading of a stock WordPress
+// readme.html: <h1 id="version">Version X.Y.Z</h1>. The capture starts at
+// a digit and tolerates letters, dots and dashes afterwards so pre-release
+// suffixes ("6.5-RC2") survive intact.
+var readmeH1VersionRe = regexp.MustCompile(`(?i)<h1[^>]*id="version"[^>]*>\s*Version\s+([0-9][0-9a-zA-Z.-]*)`)
+
+// looseReadmeVersionRe is the fallback for older readme.html releases that
+// stamp the version without the id="version" anchor ("Version X.Y.Z" inside
+// any element): the version token must sit between an element boundary and
+// the next tag, so prose mentioning a version never matches.
+var looseReadmeVersionRe = regexp.MustCompile(`(?i)>\s*Version\s+([0-9][0-9a-zA-Z.-]*)<`)
+
+// ExtractCoreVersionFromReadmeHTML parses the WordPress core version out of
+// a served readme.html document: the canonical <h1 id="version"> heading
+// first, then the looser ">Version X.Y.Z<" element form used by older
+// releases. The candidate is sanitized via sanitizeVersion (control
+// characters stripped, capped at maxVersionLen runes). found is false when
+// neither marker matches or the sanitized result is empty.
+func ExtractCoreVersionFromReadmeHTML(body string) (string, bool) {
+	for _, re := range []*regexp.Regexp{readmeH1VersionRe, looseReadmeVersionRe} {
+		m := re.FindStringSubmatch(body)
+		if m == nil {
+			continue
+		}
+		if v := sanitizeVersion(m[1]); v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 // ExtractPassiveVersions parses plugin and theme versions from asset URLs
 // in HTML: any wp-content/plugins/<slug>/...?ver=1.2.3 or
 // wp-content/themes/<slug>/...?ver=1.2.3 reference counts as evidence of

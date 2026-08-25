@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // xmlrpcMethodNameRe is the character set of extracted XML-RPC method
@@ -151,6 +152,30 @@ func FuzzExtractTimthumbVersion(f *testing.F) {
 		v, _ := ExtractTimthumbVersion(body)
 		if len(v) > maxVersionLen {
 			t.Fatalf("version %d chars exceeds cap %d", len(v), maxVersionLen)
+		}
+		for _, r := range v {
+			if r < 0x20 || r == 0x7f {
+				t.Fatalf("control char %q in version %q", r, v)
+			}
+		}
+	})
+}
+
+// FuzzExtractCoreVersionFromReadmeHTML pins the readme.html core-version
+// extractor: arbitrary bytes never panic, and any extracted version is
+// sanitized to at most maxVersionLen runes without control characters.
+func FuzzExtractCoreVersionFromReadmeHTML(f *testing.F) {
+	f.Add(`<!DOCTYPE html><html><body><h1 id="version">Version 6.4.2</h1></body></html>`)
+	f.Add(`<html><body><p align="center"><strong>Versions</strong></p><h1 style="text-align:center">Version 5.2</h1></body></html>`)
+	f.Add(`<h1 id='version'>VERSION 4.9.10</h1>`)
+	f.Add(`<h1 id="version">Version 9.` + strings.Repeat("9", 10000) + `</h1>`)
+	f.Add("<h1 id=\"version\">Version 6.4.\x01\x1b[31mx</h1>")
+	f.Add("no version marker here")
+	f.Add("")
+	f.Fuzz(func(t *testing.T, body string) {
+		v, _ := ExtractCoreVersionFromReadmeHTML(body)
+		if n := utf8.RuneCountInString(v); n > maxVersionLen {
+			t.Fatalf("version %d runes exceeds cap %d", n, maxVersionLen)
 		}
 		for _, r := range v {
 			if r < 0x20 || r == 0x7f {

@@ -1393,6 +1393,9 @@ func TestInterestingFinders(t *testing.T) {
 		"uploads directory listing",
 		"wp-config.php.bak exposed",
 		"wp-includes/version.php exposed",
+		// This fixture's catch-all answers /wp-cron.php with a 200 and a
+		// tiny body, which is exactly the externally-triggerable shape.
+		"wp-cron.php reachable (external cron triggers possible)",
 	}
 	if len(res.Interesting) != len(want) {
 		t.Fatalf("Interesting = %+v, want %+v", res.Interesting, want)
