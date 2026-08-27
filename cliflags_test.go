@@ -138,8 +138,8 @@ func TestScannerOptionsForRunContextWiring(t *testing.T) {
 	}
 
 	o := scanOptions{maxScanDuration: 30 * time.Second}
-	if got := scannerOptionsForRun(o, nil, ctx).Context; got != nil {
-		t.Errorf("Context with MaxScanDuration = %v, want nil (scanner builds its own deadline ctx)", got)
+	if got := scannerOptionsForRun(o, nil, ctx).Context; got != ctx {
+		t.Errorf("Context with MaxScanDuration = %v, want signal ctx as timeout parent", got)
 	}
 }
 

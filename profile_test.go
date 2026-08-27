@@ -27,6 +27,7 @@ func TestResolveProfileBuiltins(t *testing.T) {
 func TestResolveProfileFromFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
 	customDir := filepath.Join(dir, ".onyx", "profiles")
 	if mErr := os.MkdirAll(customDir, 0o755); mErr != nil {
 		t.Fatal(mErr)
@@ -50,6 +51,7 @@ func TestResolveProfileFromFile(t *testing.T) {
 func TestProfileAppliesAndCliWins(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
 
 	target, o := parseScanArgs([]string{"http://example.test", "--profile", "stealth"})
 	if o.threads != 1 || !o.stealth || o.maxReq != 300 || !o.randomUA {

@@ -12,10 +12,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
+          cache: false
       - name: Build
         run: go build ./...
       - name: Vet
@@ -24,7 +25,7 @@ jobs:
         run: go test -race ./...
       - name: Coverage
         run: |
-          go test -coverprofile=coverage.txt ./... >/dev/null
+          go test -coverprofile=coverage.txt ./...
           total=$(go tool cover -func=coverage.txt | tail -1 | awk '{print $3}')
           echo "total coverage: $total"
           echo "coverage=$total" >> "$GITHUB_STEP_SUMMARY"
@@ -32,10 +33,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: stable
-      - uses: golangci/golangci-lint-action@v8
+          go-version-file: go.mod
+          cache: false
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13.1

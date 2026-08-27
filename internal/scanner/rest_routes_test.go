@@ -33,8 +33,8 @@ func routeIndexJSON(routes ...string) []byte {
 // deduplicated.
 func TestExtractRESTRoutePluginsMixedRoutes(t *testing.T) {
 	body := routeIndexJSON(
-		"contact-form-7/v1/contact-forms",
-		"elementor/v1",
+		"/contact-form-7/v1/contact-forms",
+		"/elementor/v1",
 		"acme/endpoint",
 		"hello-dolly/v2/messages",
 		"woocommerce/v3/orders",
@@ -43,6 +43,7 @@ func TestExtractRESTRoutePluginsMixedRoutes(t *testing.T) {
 		"oembed/1.0/embed",
 		"wp-site-health/v1/tests",
 		"wp/block-directory/v1/items",
+		"/batch/v1",
 		// The same slug reached through two namespaces dedupes to one.
 		"contact-form-7/v2/settings",
 	)
@@ -174,9 +175,8 @@ Contact Form 7 can manage multiple contact forms.
 }
 
 // TestScanRESTRoutePluginDetection verifies the integration flow: a plugin
-// whose ONLY evidence is its wp-json route namespace is reported with
-// Source "rest-routes" and confidence 85, while the core wp namespace is
-// never reported.
+// whose route namespace is corroborated by an authentic readme is reported
+// as version-unknown, while core namespaces are never reported.
 func TestScanRESTRoutePluginDetection(t *testing.T) {
 	srv := restRouteServer(t)
 	defer srv.Close()
@@ -200,8 +200,8 @@ func TestScanRESTRoutePluginDetection(t *testing.T) {
 	if d0.Slug != "contact-form-7" || d0.Type != "plugin" {
 		t.Errorf("Detected[0] = %+v, want slug contact-form-7 / type plugin", d0)
 	}
-	if d0.Source != "rest-routes" || d0.Confidence != confRestRoutes {
-		t.Errorf("Detected[0] source/confidence = %q/%d, want rest-routes/%d", d0.Source, d0.Confidence, confRestRoutes)
+	if d0.Source != "readme" || d0.Confidence != confReadmeStableTag {
+		t.Errorf("Detected[0] source/confidence = %q/%d, want readme/%d", d0.Source, d0.Confidence, confReadmeStableTag)
 	}
 	if d0.Version != "unknown" {
 		t.Errorf("Detected[0] version = %q, want unknown (readme carries no version)", d0.Version)

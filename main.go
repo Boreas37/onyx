@@ -1059,14 +1059,11 @@ func scanSignalContext() (context.Context, context.CancelFunc) {
 }
 
 // scannerOptionsForRun builds the scanner options for a single runScan
-// invocation, attaching the signal-based context unless a scan-wide
-// deadline is configured: when MaxScanDuration > 0 the scanner builds
-// its own timeout ctx, which requestCtx() prefers over Options.Context.
+// invocation. The scanner derives any MaxScanDuration deadline from this
+// signal context, so Ctrl+C remains effective even when a deadline is set.
 func scannerOptionsForRun(o scanOptions, findings chan scanner.Finding, ctx context.Context) scanner.Options {
 	opts := scannerOptionsFrom(o, findings)
-	if o.maxScanDuration == 0 {
-		opts.Context = ctx
-	}
+	opts.Context = ctx
 	return opts
 }
 

@@ -158,6 +158,10 @@ func checkGolden(t *testing.T, name string, got []byte) {
 	case err != nil:
 		t.Fatal(err)
 	}
+	// Git may check fixtures out as CRLF on Windows while renderers emit LF.
+	// Golden content is line-oriented, so compare a canonical newline form.
+	want = bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))
+	got = bytes.ReplaceAll(got, []byte("\r\n"), []byte("\n"))
 	if bytes.Equal(got, want) {
 		return
 	}

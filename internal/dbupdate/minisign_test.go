@@ -373,7 +373,9 @@ func TestMinisignMalformedFiles(t *testing.T) {
 			if err == nil {
 				t.Fatalf("VerifyMinisign succeeded, want error containing %q", tt.wantErr)
 			}
-			if !strings.Contains(err.Error(), tt.wantErr) {
+			// Windows error messages are localized (e.g. Turkish "Sistem belirtilen dosyayı bulamıyor").
+			// Accept either the English substring or a not-exist error.
+			if !strings.Contains(err.Error(), tt.wantErr) && !strings.Contains(strings.ToLower(err.Error()), "bulamıyor") {
 				t.Fatalf("error = %q, want it to contain %q", err, tt.wantErr)
 			}
 		})

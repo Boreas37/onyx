@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	htmlpkg "html"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -115,9 +116,9 @@ type Options struct {
 	// ("{"files": {path: {md5hex: [versions]}}}") used as a final core
 	// version fallback when meta/RSS/OPML sources all fail. A missing or
 	// unparseable table is silently skipped. Disabled when empty.
-	// Context, when set, overrides the scan-wide context used by
-	// requestCtx() (signal-based cancellation etc.). MaxScanDuration
-	// takes precedence when both are set.
+	// Context, when set, is the parent scan context used by requestCtx()
+	// (signal-based cancellation etc.). MaxScanDuration adds a deadline to
+	// that context rather than replacing it.
 	Context context.Context
 
 	FingerprintDB string
@@ -195,10 +196,11 @@ type Scanner struct {
 
 	coreEvidence []CoreEvidence // core version observations (meta/rss/opml)
 
-	sitemapPlugins  []string          // slugs discovered by --crawl-pages sitemap crawling
-	sitemapThemes   []string          //
-	sitemapVersions map[string]string // slug -> ?ver= version from sitemap pages
-	sitemapRequests int               // HTTP requests spent on sitemap discovery
+	sitemapPlugins     []string          // slugs discovered by --crawl-pages sitemap crawling
+	sitemapThemes      []string          //
+	sitemapVersions    map[string]string // slug -> ?ver= version from sitemap pages
+	sitemapVersionRefs map[componentRef]string
+	sitemapRequests    int // HTTP requests spent on sitemap discovery
 
 	// restRoutePlugins holds the plugin slugs extracted from the wp-json
 	// route index during detectWP (Source "rest-routes", confidence 85).
@@ -258,9 +260,10 @@ type Scanner struct {
 	// parity); they join passive enumeration exactly like homepage
 	// references. fourohfourVersions carries the ?ver= versions found on
 	// that page so they can be matched against the database.
-	fourohfourPlugins  []string
-	fourohfourThemes   []string
-	fourohfourVersions map[string]string
+	fourohfourPlugins     []string
+	fourohfourThemes      []string
+	fourohfourVersions    map[string]string
+	fourohfourVersionRefs map[componentRef]string
 
 	popularOnce sync.Once // guards the --popular-file load (one-time warning)
 	// popularCountsPlugins / popularCountsThemes hold the active-install
@@ -465,30 +468,36 @@ func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
-func (r *rateLimiter) wait() {
+func (r *rateLimiter) wait(ctx context.Context) bool {
 	if r == nil || r.interval <= 0 {
-		return
+		return true
 	}
 	for {
 		r.mu.Lock()
 		now := time.Now()
 		if wait := r.last.Add(r.interval).Sub(now); wait > 0 {
 			r.mu.Unlock()
-			time.Sleep(wait)
+			t := time.NewTimer(wait)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return false
+			}
 			continue
 		}
 		r.last = now
 		r.mu.Unlock()
-		return
+		return true
 	}
 }
 
 // perHostWait throttles on the --per-host-rate-limit limiter for the host
 // of u, keyed by scheme://host:port. Every unique host gets its own lazily
 // created limiter, so one busy host never throttles another.
-func (s *Scanner) perHostWait(u string) {
+func (s *Scanner) perHostWait(u string) bool {
 	if s.perHostLim == nil {
-		return
+		return true
 	}
 	key := perHostKey(u)
 	s.perHostMu.Lock()
@@ -498,7 +507,7 @@ func (s *Scanner) perHostWait(u string) {
 		s.perHostLim[key] = lim
 	}
 	s.perHostMu.Unlock()
-	lim.wait()
+	return lim.wait(s.requestCtx())
 }
 
 // perHostKey maps a full URL onto its scheme://host[:port] limiter key.
@@ -563,6 +572,9 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	u, err := url.Parse(base)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("invalid target URL %q", base)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid target URL %q: query and fragment are not allowed", base)
 	}
 	if opts.Threads <= 0 {
 		opts.Threads = 5
@@ -950,9 +962,9 @@ const (
 	confPassiveVer      = 60 // passive asset ?ver= query string
 	confREST            = 100
 	confAuthREST        = 100
-	confRestRoutes      = 85 // plugin namespace from the wp-json route index
+	confRestRoutes      = 85  // plugin namespace from the wp-json route index
 	confVersionPHP      = 100 // wp-includes/version.php $wp_version (source of truth)
-	confFingerprint     = 85 // core asset md5 fingerprint table
+	confFingerprint     = 85  // core asset md5 fingerprint table
 )
 
 // sourceConfidence maps a Detected/CoreEvidence source onto its canonical
@@ -1202,8 +1214,9 @@ func (s *Scanner) sendRequest(client *http.Client, makeReq func() (*http.Request
 		maxRetries = 0
 	}
 	for attempt := 0; ; attempt++ {
-		s.rateLimitGate()
-		s.claimSendSlot()
+		if !s.rateLimitGate() || !s.claimSendSlot() {
+			return nil, s.requestCtx().Err()
+		}
 		req, err := makeReq()
 		if err != nil {
 			return nil, err // request-build/parse failure: not retryable
@@ -1215,7 +1228,24 @@ func (s *Scanner) sendRequest(client *http.Client, makeReq func() (*http.Request
 		}
 		backoff := time.Duration(200*(1<<uint(attempt))) * time.Millisecond
 		jitter := time.Duration(rand.IntN(151)) * time.Millisecond
-		time.Sleep(backoff + jitter)
+		if !s.sleepContext(backoff + jitter) {
+			return nil, s.requestCtx().Err()
+		}
+	}
+}
+
+// sleepContext waits for d or returns early when the scan is cancelled.
+func (s *Scanner) sleepContext(d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-s.requestCtx().Done():
+		return false
 	}
 }
 
@@ -1236,10 +1266,14 @@ func retryableNetworkError(err error) bool {
 }
 
 func (s *Scanner) fetch(path string) (int, []byte, error) {
-	s.lim.wait()
+	if !s.lim.wait(s.requestCtx()) {
+		return 0, nil, s.requestCtx().Err()
+	}
 	u := s.base + path
-	s.perHostWait(u)
-	if s.opts.CacheTTL > 0 {
+	if !s.perHostWait(u) {
+		return 0, nil, s.requestCtx().Err()
+	}
+	if s.opts.CacheTTL > 0 && !s.opts.RandomUA {
 		if code, body, ok := s.cacheGet(u); ok {
 			return code, body, nil
 		}
@@ -1257,7 +1291,7 @@ func (s *Scanner) fetch(path string) (int, []byte, error) {
 			s.noteSuccess()
 			body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 			resp.Body.Close()
-			if err == nil && cacheableStatus(resp.StatusCode) && s.opts.CacheTTL > 0 {
+			if err == nil && cacheableStatus(resp.StatusCode) && s.opts.CacheTTL > 0 && !s.opts.RandomUA {
 				s.cachePut(u, resp.StatusCode, body)
 			}
 			return resp.StatusCode, body, err
@@ -1291,16 +1325,17 @@ const consecOKReset = 25
 
 // rateLimitGate blocks until any open 429 cooldown expires. Called before
 // every outbound request so the whole worker pool pauses together.
-func (s *Scanner) rateLimitGate() {
+func (s *Scanner) rateLimitGate() bool {
 	s.rlMu.Lock()
 	until := s.cooldownUntil
 	s.rlMu.Unlock()
 	if until.IsZero() {
-		return
+		return true
 	}
 	if d := time.Until(until); d > 0 {
-		time.Sleep(d)
+		return s.sleepContext(d)
 	}
+	return true
 }
 
 // maxAdaptiveSpacing caps the permanent politeness delay inserted between
@@ -1367,7 +1402,7 @@ func (s *Scanner) rateLimitAbort() bool {
 
 // claimSendSlot reserves the next outbound-send instant, enforcing the
 // adaptive spacing so N workers collectively emit at one polite rate.
-func (s *Scanner) claimSendSlot() {
+func (s *Scanner) claimSendSlot() bool {
 	s.rlMu.Lock()
 	now := time.Now()
 	t := s.sendSlot
@@ -1377,8 +1412,9 @@ func (s *Scanner) claimSendSlot() {
 	s.sendSlot = t.Add(s.spacing)
 	s.rlMu.Unlock()
 	if d := time.Until(t); d > 0 {
-		time.Sleep(d)
+		return s.sleepContext(d)
 	}
+	return true
 }
 
 // noteRateLimited records a 429: bumps counters, advances the shared
@@ -1472,9 +1508,13 @@ func cacheableStatus(code int) bool {
 // fetchNoRedirect GETs path without following redirects so the raw 30x
 // Location header from the author-enumeration redirect chain can be read.
 func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error) {
-	s.lim.wait()
+	if !s.lim.wait(s.requestCtx()) {
+		return 0, nil, nil, s.requestCtx().Err()
+	}
 	u := s.base + path
-	s.perHostWait(u)
+	if !s.perHostWait(u) {
+		return 0, nil, nil, s.requestCtx().Err()
+	}
 	client := *s.client
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -1504,9 +1544,9 @@ func (s *Scanner) fetchNoRedirect(path string) (int, http.Header, []byte, error)
 	return http.StatusTooManyRequests, nil, nil, nil
 }
 
-// requestCtx returns the scan-wide context: the MaxScanDuration context
-// wins when set, otherwise Options.Context (signal-based cancellation),
-// otherwise a background context.
+// requestCtx returns the scan-wide context. A MaxScanDuration context is
+// derived from Options.Context, so deadlines and signals remain effective
+// together.
 func (s *Scanner) requestCtx() context.Context {
 	if s.ctx != nil {
 		return s.ctx
@@ -1517,10 +1557,9 @@ func (s *Scanner) requestCtx() context.Context {
 	return context.Background()
 }
 
-// scanDone reports whether the scan-wide context (--max-scan-duration)
-// has expired.
+// scanDone reports whether the scan-wide context has been cancelled.
 func (s *Scanner) scanDone() bool {
-	return s.ctx != nil && s.ctx.Err() != nil
+	return s.requestCtx().Err() != nil
 }
 
 // cacheKey hashes a URL into a flat file name for the HTTP cache. The
@@ -1539,7 +1578,7 @@ func cacheKey(u string) string {
 // (best-effort unlink) so a long-lived cache directory does not grow
 // without bound.
 func (s *Scanner) cacheGet(u string) (int, []byte, bool) {
-	path := filepath.Join(s.cacheDir, cacheKey(u))
+	path := filepath.Join(s.cacheDir, cacheKey(s.cacheIdentity(u)))
 	fi, err := os.Stat(path)
 	if err != nil {
 		return 0, nil, false
@@ -1579,7 +1618,30 @@ func (s *Scanner) cachePut(u string, code int, body []byte) {
 	data := make([]byte, 0, len(body)+16)
 	data = append(data, fmt.Sprintf("HTTP %d\n", code)...)
 	data = append(data, body...)
-	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(u)), data, 0o600)
+	_ = os.WriteFile(filepath.Join(s.cacheDir, cacheKey(s.cacheIdentity(u))), data, 0o600)
+}
+
+// cacheIdentity includes request decorations that can change the response.
+// Values are only ever persisted through cacheKey's SHA-256 digest.
+func (s *Scanner) cacheIdentity(u string) string {
+	if s.opts.BasicAuthUser == "" && s.opts.Cookie == "" && len(s.opts.Headers) == 0 &&
+		s.opts.VHost == "" && s.opts.UserAgent == "" && !s.opts.RandomUA {
+		return u
+	}
+	var b strings.Builder
+	b.WriteString(u)
+	fmt.Fprintf(&b, "\nbasic=%s:%s\ncookie=%s\nvhost=%s\nua=%s\nrandom-ua=%t",
+		s.opts.BasicAuthUser, s.opts.BasicAuthPass, s.opts.Cookie, s.opts.VHost,
+		s.opts.UserAgent, s.opts.RandomUA)
+	keys := make([]string, 0, len(s.opts.Headers))
+	for k := range s.opts.Headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "\nheader:%s=%s", strings.ToLower(k), s.opts.Headers[k])
+	}
+	return b.String()
 }
 
 // maxXMLRPCMethods caps how many method names checkXMLRPC reports from a
@@ -1626,17 +1688,22 @@ func extractXMLRPCMethods(body string) []string {
 // shares the scan-wide pacing: 429 cooldown gate, adaptive send slot and
 // the request counter.
 func (s *Scanner) checkXMLRPC() (enabled bool, pingback bool, methods []string) {
-	s.lim.wait()
+	if !s.lim.wait(s.requestCtx()) {
+		return false, false, nil
+	}
 	const payload = `<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>`
 	u := s.base + "/xmlrpc.php"
-	s.perHostWait(u)
+	if !s.perHostWait(u) {
+		return false, false, nil
+	}
 	req, err := http.NewRequestWithContext(s.requestCtx(), http.MethodPost, u, strings.NewReader(payload))
 	if err != nil {
 		return false, false, nil
 	}
 	req.Header.Set("Content-Type", "text/xml")
-	s.rateLimitGate()
-	s.claimSendSlot()
+	if !s.rateLimitGate() || !s.claimSendSlot() {
+		return false, false, nil
+	}
 	s.requests.Add(1)
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -1879,6 +1946,135 @@ func (s *Scanner) wafChallengeEntry() string {
 // Callers try the candidates in order until one yields usable data.
 func restPath(path string) []string {
 	return []string{"/wp-json" + path, "/?rest_route=" + path}
+}
+
+type componentRef struct {
+	typ  string
+	slug string
+}
+
+var passiveURLAttrRe = regexp.MustCompile("(?is)\\b(src|href|data-src|data-lazy-src|srcset)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s\"'=<>`]+))")
+
+// passiveRefs extracts only URL-bearing HTML attributes that point back to
+// the scanned authority. This prevents third-party assets, comments and
+// documentation snippets from becoming installed components for the target.
+func (s *Scanner) passiveRefs(body string) (plugins, themes []string, versions map[string]string) {
+	plugins, themes, typed := s.passiveRefsByType(body)
+	return plugins, themes, flattenVersionRefs(typed)
+}
+
+func flattenVersionRefs(typed map[componentRef]string) map[string]string {
+	versions := make(map[string]string)
+	refs := make([]componentRef, 0, len(typed))
+	for ref := range typed {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].slug != refs[j].slug {
+			return refs[i].slug < refs[j].slug
+		}
+		return refs[i].typ < refs[j].typ
+	})
+	for _, ref := range refs {
+		if _, exists := versions[ref.slug]; !exists {
+			versions[ref.slug] = typed[ref]
+		}
+	}
+	return versions
+}
+
+func (s *Scanner) passiveRefsByType(body string) (plugins, themes []string, versions map[componentRef]string) {
+	baseURL, err := url.Parse(s.base)
+	if err != nil {
+		return nil, nil, nil
+	}
+	logicalHost := baseURL.Host
+	if s.opts.VHost != "" {
+		logicalHost = s.opts.VHost
+	}
+	wantAuthority := normalizeAuthority(logicalHost, baseURL.Scheme)
+	seenP := make(map[string]bool)
+	seenT := make(map[string]bool)
+	versions = make(map[componentRef]string)
+	needle := "/" + strings.ToLower(strings.Trim(s.contentDir, "/")) + "/"
+	for _, match := range passiveURLAttrRe.FindAllStringSubmatch(body, -1) {
+		value := ""
+		for _, candidate := range match[2:] {
+			if candidate != "" {
+				value = candidate
+				break
+			}
+		}
+		candidates := []string{value}
+		if strings.EqualFold(match[1], "srcset") {
+			candidates = candidates[:0]
+			for _, entry := range strings.Split(value, ",") {
+				if fields := strings.Fields(entry); len(fields) > 0 {
+					candidates = append(candidates, fields[0])
+				}
+			}
+		}
+		for _, rawRef := range candidates {
+			rawRef = htmlpkg.UnescapeString(strings.TrimSpace(rawRef))
+			u, err := url.Parse(rawRef)
+			if err != nil || u.User != nil {
+				continue
+			}
+			if u.Host != "" {
+				scheme := u.Scheme
+				if scheme == "" {
+					scheme = baseURL.Scheme
+				}
+				if !strings.EqualFold(scheme, baseURL.Scheme) ||
+					!sameAuthority(normalizeAuthority(u.Host, scheme), wantAuthority) {
+					continue
+				}
+			}
+			path := u.Path
+			if !strings.HasPrefix(path, "/") {
+				path = "/" + path
+			}
+			lowerPath := strings.ToLower(path)
+			i := strings.Index(lowerPath, needle)
+			if i < 0 {
+				continue
+			}
+			parts := strings.SplitN(lowerPath[i+len(needle):], "/", 3)
+			if len(parts) < 3 || !restSlugRe.MatchString(parts[1]) {
+				continue
+			}
+			ref := componentRef{typ: strings.TrimSuffix(parts[0], "s"), slug: parts[1]}
+			switch ref.typ {
+			case "plugin":
+				seenP[ref.slug] = true
+			case "theme":
+				seenT[ref.slug] = true
+			default:
+				continue
+			}
+			if _, exists := versions[ref]; exists || len(versions) >= maxPassiveVersions {
+				continue
+			}
+			for key, values := range u.Query() {
+				if !strings.EqualFold(key, "ver") || len(values) == 0 {
+					continue
+				}
+				if v := sanitizeVersion(values[0]); v != "" {
+					versions[ref] = v
+				}
+				break
+			}
+		}
+	}
+	for slug := range seenP {
+		plugins = append(plugins, slug)
+	}
+	for slug := range seenT {
+		themes = append(themes, slug)
+	}
+	sort.Strings(plugins)
+	sort.Strings(themes)
+	return plugins, themes, versions
 }
 
 // usersFromAPI queries the REST users endpoint, trying the pretty
@@ -2425,8 +2621,8 @@ func (s *Scanner) discover404() {
 	if !strings.Contains(strings.ToLower(string(body)), strings.ToLower(s.contentDir)) {
 		return
 	}
-	s.fourohfourPlugins, s.fourohfourThemes = ExtractPassiveSlugsIn(string(body), s.contentDir)
-	s.fourohfourVersions = ExtractPassiveVersionsIn(string(body), s.contentDir)
+	s.fourohfourPlugins, s.fourohfourThemes, s.fourohfourVersionRefs = s.passiveRefsByType(string(body))
+	s.fourohfourVersions = flattenVersionRefs(s.fourohfourVersionRefs)
 }
 
 func (s *Scanner) buildJobs() []job {
@@ -2437,7 +2633,7 @@ func (s *Scanner) buildJobs() []job {
 
 	// Passive detection: slugs referenced in the homepage HTML (WPScan-style).
 	if passive && s.homepage != "" {
-		passiveP, passiveT := ExtractPassiveSlugsIn(s.homepage, s.contentDir)
+		passiveP, passiveT, _ := s.passiveRefs(s.homepage)
 		for _, slug := range passiveP {
 			if !s.enumeratePlugins() {
 				break
@@ -2548,27 +2744,29 @@ func (s *Scanner) buildJobs() []job {
 			}
 		} else {
 			for _, slug := range s.db.TopSlugs(budget) {
-				switch s.db.SlugType(slug) {
-				case "plugin":
-					if !s.enumeratePlugins() {
-						continue
+				for _, typ := range s.db.TypesFor(slug) {
+					switch typ {
+					case "plugin":
+						if !s.enumeratePlugins() {
+							continue
+						}
+						if seen["p:"+slug] {
+							continue
+						}
+						seen["p:"+slug] = true
+						jobs = append(jobs, job{kind: "plugin", slug: slug,
+							path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
+					case "theme":
+						if !s.enumerateThemes() {
+							continue
+						}
+						if seen["t:"+slug] {
+							continue
+						}
+						seen["t:"+slug] = true
+						jobs = append(jobs, job{kind: "theme", slug: slug,
+							path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
 					}
-					if seen["p:"+slug] {
-						continue
-					}
-					seen["p:"+slug] = true
-					jobs = append(jobs, job{kind: "plugin", slug: slug,
-						path: "/" + s.pluginsDir + "/" + slug + "/readme.txt"})
-				case "theme":
-					if !s.enumerateThemes() {
-						continue
-					}
-					if seen["t:"+slug] {
-						continue
-					}
-					seen["t:"+slug] = true
-					jobs = append(jobs, job{kind: "theme", slug: slug,
-						path: "/" + s.contentDir + "/themes/" + slug + "/style.css"})
 				}
 			}
 			// Popular slug seeds (--popular, default true): after the DB
@@ -2670,7 +2868,7 @@ func (s *Scanner) popularSeedLists() (plugins, themes []string) {
 // range matching, as are the CVSS vector strings they carry.
 func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 	f := Finding{Slug: slug, Name: slug, Type: typ, InstalledVersion: rawVersion}
-	if name := s.db.NameFor(slug); name != "" {
+	if name := s.db.NameForType(slug, typ); name != "" {
 		f.Name = name
 	}
 	v, ok := version.Parse(rawVersion)
@@ -2692,7 +2890,7 @@ func (s *Scanner) matchDatabase(slug, typ, rawVersion string) Finding {
 		}
 		for si := range rec.Software {
 			sw := &rec.Software[si]
-			if sw.Slug != slug {
+			if sw.Slug != slug || sw.Type != typ {
 				continue
 			}
 			for label, av := range sw.AffectedVersions {
@@ -2747,16 +2945,13 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 	var found bool
 	source := "readme"
 	var testedUpTo, requiresAtLeast string
-	// probeCode remembers the initial readme/style.css status for the
-	// 401/403/500 presence fallback after all version sources are exhausted.
-	var probeCode int
-	var probeErr error
+	var authentic bool
 	switch j.kind {
 	case "plugin":
 		code, body, err := s.fetch(j.path)
-		probeCode, probeErr = code, err
 		if err == nil && code == http.StatusOK {
 			bodyStr := string(body)
+			authentic = looksLikeReadme(body)
 			ver, found = ExtractVersionFromReadme(bodyStr)
 			if !found {
 				// Readme with no "Stable tag:" line: fall back to the first
@@ -2766,7 +2961,7 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 					source = "readme-changelog"
 				}
 			}
-			found = found && looksLikeReadme(body)
+			found = found && authentic
 			if found {
 				// Readme header metadata: the "Tested up to:" and
 				// "Requires at least:" lines. Both stay empty when the
@@ -2792,25 +2987,25 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 				source = "plugin-main"
 			}
 		}
-		if !found && probeErr == nil && (probeCode == http.StatusUnauthorized || probeCode == http.StatusForbidden || probeCode == http.StatusInternalServerError) {
+		if !found && authentic {
 			ver, found = "unknown", true
 			source = "readme"
 		}
 	case "theme":
 		code, body, err := s.fetch(j.path)
-		probeCode, probeErr = code, err
 		if err == nil && code == http.StatusOK {
 			bodyStr := string(body)
+			authentic = looksLikeThemeCSS(body)
 			ver, found = ExtractVersionFromStyleCSS(bodyStr)
 			source = "style.css"
-			found = found && looksLikeThemeCSS(body)
+			found = found && authentic
 			if found {
 				// style.css carries "Requires at least:" in its header too;
 				// "Tested up to" is a readme.txt-only header.
 				requiresAtLeast = ExtractRequiresAtLeast(bodyStr)
 			}
 		}
-		if !found && probeErr == nil && (probeCode == http.StatusUnauthorized || probeCode == http.StatusForbidden || probeCode == http.StatusInternalServerError) {
+		if !found && authentic {
 			ver, found = "unknown", true
 			source = "style.css"
 		}
@@ -2819,7 +3014,7 @@ func (s *Scanner) scanJob(j job) ([]Detected, []Finding) {
 		return nil, nil
 	}
 	name := j.slug
-	if n := s.db.NameFor(j.slug); n != "" {
+	if n := s.db.NameForType(j.slug, j.kind); n != "" {
 		name = n
 	}
 	detected := []Detected{{Slug: j.slug, Name: name, Type: j.kind, Version: ver, Source: source,
@@ -2888,9 +3083,13 @@ func (s *Scanner) composerVersion(slug string) (string, bool) {
 // counter with fetch(); responses are never served from or written to the
 // disk cache because cached entries do not retain headers.
 func (s *Scanner) fetchHeaders(path string) (int, http.Header, []byte, error) {
-	s.lim.wait()
+	if !s.lim.wait(s.requestCtx()) {
+		return 0, nil, nil, s.requestCtx().Err()
+	}
 	u := s.base + path
-	s.perHostWait(u)
+	if !s.perHostWait(u) {
+		return 0, nil, nil, s.requestCtx().Err()
+	}
 	resp, err := s.sendRequest(s.client, func() (*http.Request, error) {
 		return http.NewRequestWithContext(s.requestCtx(), http.MethodGet, u, nil)
 	})
@@ -2915,78 +3114,38 @@ func (s *Scanner) fetchHeaders(path string) (int, http.Header, []byte, error) {
 // at confidence 85 (Source "rest-routes") when no stronger detection
 // pinned the component already.
 func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding)) {
-	versions := make(map[string]string)
-	for slug, ver := range ExtractPassiveVersionsIn(s.homepage, s.contentDir) {
-		versions[slug] = ver
-	}
-	for slug, ver := range s.sitemapVersions {
-		if _, ok := versions[slug]; !ok {
-			versions[slug] = ver
-		}
-	}
-	for slug, ver := range s.fourohfourVersions {
-		if _, ok := versions[slug]; !ok {
-			versions[slug] = ver
-		}
-	}
-	if len(versions) == 0 && len(s.restRoutePlugins) == 0 {
-		return
-	}
-
-	// slug -> component type; plugins win when a slug collides.
-	typ := make(map[string]string)
-	reg := func(slugs []string, t string) {
-		for _, slug := range slugs {
-			if _, ok := typ[slug]; !ok {
-				typ[slug] = t
+	_, _, homepageVersions := s.passiveRefsByType(s.homepage)
+	versions := make(map[componentRef]string)
+	merge := func(src map[componentRef]string) {
+		for ref, ver := range src {
+			if _, ok := versions[ref]; !ok {
+				versions[ref] = ver
 			}
 		}
 	}
-	hp, ht := ExtractPassiveSlugsIn(s.homepage, s.contentDir)
-	reg(hp, "plugin")
-	reg(ht, "theme")
-	reg(s.fourohfourPlugins, "plugin")
-	reg(s.fourohfourThemes, "theme")
-	reg(s.sitemapPlugins, "plugin")
-	reg(s.sitemapThemes, "theme")
-	// REST-route slugs are plugins by construction (buildJobs only ever
-	// feeds the route index into plugin jobs); registering them lets
-	// their ?ver= versions materialize below.
-	reg(s.restRoutePlugins, "plugin")
-
-	index := make(map[string]int, len(res.Detected))
-	for i := range res.Detected {
-		index[res.Detected[i].Slug] = i
-	}
-
-	// Route-index materialization: plugins whose namespace appeared in the
-	// wp-json route index are reported at "unknown" (Source "rest-routes",
-	// confidence 85) unless a stronger detection already exists. Gated on
-	// the plugin enumerate token like every other plugin source.
-	if s.enumeratePlugins() {
-		for _, slug := range s.restRoutePlugins {
-			restDet := Detected{Slug: slug, Name: slug, Type: "plugin", Version: "unknown",
-				Source: "rest-routes", Confidence: confRestRoutes}
-			if i, ok := index[slug]; ok {
-				if preferDetected(restDet, res.Detected[i]) {
-					res.Detected[i] = restDet
-				}
-				continue
-			}
-			index[slug] = len(res.Detected)
-			res.Detected = append(res.Detected, restDet)
-		}
-	}
-
+	merge(homepageVersions)
+	merge(s.sitemapVersionRefs)
+	merge(s.fourohfourVersionRefs)
 	if len(versions) == 0 {
 		return
 	}
 
-	slugs := make([]string, 0, len(versions))
-	for slug := range versions {
-		slugs = append(slugs, slug)
+	index := make(map[string]int, len(res.Detected))
+	for i := range res.Detected {
+		key := res.Detected[i].Type + "\x00" + res.Detected[i].Slug
+		index[key] = i
 	}
-	sort.Strings(slugs)
+
+	refs := make([]componentRef, 0, len(versions))
+	for ref := range versions {
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].slug != refs[j].slug {
+			return refs[i].slug < refs[j].slug
+		}
+		return refs[i].typ < refs[j].typ
+	})
 
 	// restSlugs marks the route-index namespaces so their versioned
 	// passive entries carry the stronger "rest-routes" source (85) instead
@@ -2998,29 +3157,30 @@ func (s *Scanner) mergePassiveDetections(res *Result, addFindings func([]Finding
 	}
 
 	var findings []Finding
-	for _, slug := range slugs {
-		t, ok := typ[slug]
-		if !ok {
-			continue
-		}
-		ver := versions[slug]
+	for _, ref := range refs {
+		ver := versions[ref]
 		src, conf := "passive-ver", confPassiveVer
-		if restSlugs[slug] {
+		if ref.typ == "plugin" && restSlugs[ref.slug] {
 			src, conf = "rest-routes", confRestRoutes
 		}
-		if i, ok := index[slug]; ok {
-			passive := Detected{Slug: slug, Name: slug, Type: t, Version: ver, Source: src, Confidence: conf}
+		name := ref.slug
+		if n := s.db.NameForType(ref.slug, ref.typ); n != "" {
+			name = n
+		}
+		key := ref.typ + "\x00" + ref.slug
+		if i, ok := index[key]; ok {
+			passive := Detected{Slug: ref.slug, Name: name, Type: ref.typ, Version: ver, Source: src, Confidence: conf}
 			if !preferDetected(passive, res.Detected[i]) {
 				continue // a probed/known version wins over the passive hint
 			}
 			res.Detected[i] = passive
 		} else {
-			index[slug] = len(res.Detected)
+			index[key] = len(res.Detected)
 			res.Detected = append(res.Detected, Detected{
-				Slug: slug, Name: slug, Type: t, Version: ver, Source: src, Confidence: conf,
+				Slug: ref.slug, Name: name, Type: ref.typ, Version: ver, Source: src, Confidence: conf,
 			})
 		}
-		if f := s.matchDatabase(slug, t, ver); len(f.Vulnerabilities) > 0 {
+		if f := s.matchDatabase(ref.slug, ref.typ, ver); len(f.Vulnerabilities) > 0 {
 			findings = append(findings, f)
 		}
 	}
@@ -3043,7 +3203,11 @@ func (s *Scanner) Scan() (*Result, error) {
 	// results collected so far.
 	var cancel context.CancelFunc
 	if s.opts.MaxScanDuration > 0 {
-		s.ctx, cancel = context.WithTimeout(context.Background(), s.opts.MaxScanDuration)
+		parent := s.opts.Context
+		if parent == nil {
+			parent = context.Background()
+		}
+		s.ctx, cancel = context.WithTimeout(parent, s.opts.MaxScanDuration)
 		defer cancel()
 	}
 
@@ -3099,60 +3263,63 @@ func (s *Scanner) Scan() (*Result, error) {
 		pr.LogInf("detected WordPress%s at %s", ver, s.base)
 	}
 
-	// Always-on interesting finders (robots.txt, readme.html, debug.log,
-	// xmlrpc.php, uploads listing, wp-config.php.bak, version.php).
-	res.Interesting = s.interestingFinders()
+	if !s.opts.APIOnly {
+		// Always-on interesting finders (robots.txt, readme.html, debug.log,
+		// xmlrpc.php, uploads listing, wp-config.php.bak, version.php).
+		res.Interesting = s.interestingFinders()
 
-	// Drop-in/cache-layer detection: cache headers on the homepage and an
-	// exposed mu-plugins directory listing.
-	res.Interesting = append(res.Interesting, s.dropinFinder()...)
+		// Drop-in/cache-layer detection: cache headers on the homepage and an
+		// exposed mu-plugins directory listing.
+		res.Interesting = append(res.Interesting, s.dropinFinder()...)
 
-	// Media enumeration: a homepage reference to the uploads directory is
-	// enough for the simple presence check.
-	if s.enumerateMedia() && strings.Contains(s.homepage, "/"+s.contentDir+"/uploads/") {
-		res.Interesting = append(res.Interesting, "media uploads present")
-	}
+		// Media enumeration: a homepage reference to the uploads directory is
+		// enough for the simple presence check.
+		if s.enumerateMedia() && strings.Contains(s.homepage, "/"+s.contentDir+"/uploads/") {
+			res.Interesting = append(res.Interesting, "media uploads present")
+		}
 
-	// XML-RPC ping check (skip with --no-xmlrpc). A positive ping also
-	// reports whether the method list exposes pingback.ping, the SSRF
-	// amplification primitive, and captures the advertised method
-	// inventory (capped at maxXMLRPCMethods).
-	if !s.opts.NoXMLRPC {
-		xmlrpcOK, pingback, methods := s.checkXMLRPC()
-		if xmlrpcOK {
-			res.XMLRPC = true
-			if pr != nil {
-				pr.LogInf("XML-RPC is enabled (xmlrpc.php responded)")
-			}
-			if len(methods) > 0 {
-				res.XMLRPCMethods = methods
-				res.Interesting = append(res.Interesting, fmt.Sprintf("XML-RPC exposes %d methods", len(methods)))
-			}
-			if pingback {
-				res.XMLRPCPingback = true
-				res.Interesting = append(res.Interesting, "XML-RPC pingback enabled (SSRF amplification risk)")
+		// XML-RPC ping check (skip with --no-xmlrpc). A positive ping also
+		// reports whether the method list exposes pingback.ping, the SSRF
+		// amplification primitive, and captures the advertised method
+		// inventory (capped at maxXMLRPCMethods).
+		if !s.opts.NoXMLRPC {
+			xmlrpcOK, pingback, methods := s.checkXMLRPC()
+			if xmlrpcOK {
+				res.XMLRPC = true
+				if pr != nil {
+					pr.LogInf("XML-RPC is enabled (xmlrpc.php responded)")
+				}
+				if len(methods) > 0 {
+					res.XMLRPCMethods = methods
+					res.Interesting = append(res.Interesting, fmt.Sprintf("XML-RPC exposes %d methods", len(methods)))
+				}
+				if pingback {
+					res.XMLRPCPingback = true
+					res.Interesting = append(res.Interesting, "XML-RPC pingback enabled (SSRF amplification risk)")
+				}
 			}
 		}
-	}
 
-	// Optional file-based checks: config backups (cb), DB exports (dbe),
-	// backup folders (bf) and exposed TimThumb copies (timthumb).
-	if s.checks["cb"] {
-		res.ConfigBackups = s.configBackupFinder()
-	}
-	if s.checks["dbe"] {
-		res.DBExports = s.dbExportFinder()
-	}
-	if s.checks["bf"] {
-		if bf := s.backupFolderFinder(); len(bf) > 0 {
-			res.Interesting = append(res.Interesting, bf...)
+		// Optional file-based checks: config backups (cb), DB exports (dbe),
+		// backup folders (bf) and exposed TimThumb copies (timthumb).
+		if s.checks["cb"] {
+			res.ConfigBackups = s.configBackupFinder()
 		}
-	}
-	if s.checks["timthumb"] && len(s.timthumbFinder()) > 0 {
-		res.Interesting = append(res.Interesting, "timthumb.php exposed")
+		if s.checks["dbe"] {
+			res.DBExports = s.dbExportFinder()
+		}
+		if s.checks["bf"] {
+			if bf := s.backupFolderFinder(); len(bf) > 0 {
+				res.Interesting = append(res.Interesting, bf...)
+			}
+		}
+		if s.checks["timthumb"] && len(s.timthumbFinder()) > 0 {
+			res.Interesting = append(res.Interesting, "timthumb.php exposed")
+		}
 	}
 
 	var mu sync.Mutex
+	findingKeys := make(map[string]bool)
 	addDetected := func(list []Detected) {
 		if len(list) == 0 {
 			return
@@ -3165,17 +3332,63 @@ func (s *Scanner) Scan() (*Result, error) {
 		if len(list) == 0 {
 			return
 		}
-		if s.opts.Findings != nil {
-			for i := range list {
-				s.opts.Findings <- list[i]
-			}
-		}
+		added := make([]Finding, 0, len(list))
 		mu.Lock()
-		res.Findings = append(res.Findings, list...)
+		for _, f := range list {
+			key := f.Type + "\x00" + f.Slug
+			if findingKeys[key] {
+				continue
+			}
+			findingKeys[key] = true
+			res.Findings = append(res.Findings, f)
+			added = append(added, f)
+		}
 		n := int64(len(res.Findings))
 		mu.Unlock()
+		if s.opts.Findings != nil {
+			for i := range added {
+				select {
+				case s.opts.Findings <- added[i]:
+				case <-s.requestCtx().Done():
+					return
+				}
+			}
+		}
 		if pr != nil {
 			pr.SetFindings(n)
+		}
+	}
+
+	// Core versions are first-class database software entries too. Match
+	// every core slug present in the loaded feed instead of assuming the
+	// feed always calls it "wordpress".
+	if coreVersion != "" && !s.opts.APIOnly {
+		slugs := s.db.SlugsForType("core")
+		if len(slugs) > 0 {
+			canonical := slugs[0]
+			for _, slug := range slugs {
+				if slug == "wordpress" {
+					canonical = slug
+					break
+				}
+			}
+			coreFinding := Finding{Slug: canonical, Name: canonical, Type: "core", InstalledVersion: coreVersion}
+			if name := s.db.NameForType(canonical, "core"); name != "" {
+				coreFinding.Name = name
+			}
+			seenVulns := make(map[string]bool)
+			for _, slug := range slugs {
+				f := s.matchDatabase(slug, "core", coreVersion)
+				for _, vuln := range f.Vulnerabilities {
+					if !seenVulns[vuln.ID] {
+						seenVulns[vuln.ID] = true
+						coreFinding.Vulnerabilities = append(coreFinding.Vulnerabilities, vuln)
+					}
+				}
+			}
+			if len(coreFinding.Vulnerabilities) > 0 {
+				addFindings([]Finding{coreFinding})
+			}
 		}
 	}
 
@@ -3205,9 +3418,17 @@ func (s *Scanner) Scan() (*Result, error) {
 
 	// REST API plugin listing is always attempted when plugins are enabled
 	// (skipped when --wp-auth already queried it with credentials).
-	if s.enumeratePlugins() && s.wpUser == "" {
+	if s.enumeratePlugins() && s.wpUser == "" && (s.opts.APIOnly || s.mode == "mixed") {
 		apiDetected, apiErrs := s.apiPlugins()
 		addDetected(apiDetected)
+		for _, d := range apiDetected {
+			if d.Version == "unknown" {
+				continue
+			}
+			if f := s.matchDatabase(d.Slug, d.Type, d.Version); len(f.Vulnerabilities) > 0 {
+				addFindings([]Finding{f})
+			}
+		}
 		res.Errors = append(res.Errors, apiErrs...)
 	}
 
@@ -3225,7 +3446,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	// AFTER interestingFinders, which assigns res.Interesting wholesale;
 	// the entry is appended only when the target still passed the
 	// IsWordPress gate above.
-	if s.homepageCode != 0 {
+	if s.homepageCode != 0 && !s.opts.APIOnly {
 		if w := s.wafChallengeEntry(); w != "" {
 			res.Interesting = append(res.Interesting, w)
 			if pr != nil {
@@ -3238,7 +3459,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	// deliberately nonexistent path (WPScan urls_in_404_page parity) can
 	// surface wp-content references a normal homepage never carries. Runs
 	// before buildJobs so discovered slugs join the enumeration jobs.
-	if s.opts.Discover404 && (s.mode == "mixed" || s.mode == "passive") {
+	if s.opts.Discover404 && !s.opts.APIOnly && (s.mode == "mixed" || s.mode == "passive") {
 		s.discover404()
 	}
 
@@ -3294,7 +3515,11 @@ func (s *Scanner) Scan() (*Result, error) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				sem <- struct{}{}
+				select {
+				case sem <- struct{}{}:
+				case <-s.requestCtx().Done():
+					return
+				}
 				defer func() { <-sem }()
 				if s.rateLimitAbort() {
 					if pr != nil {
@@ -3367,7 +3592,9 @@ func (s *Scanner) Scan() (*Result, error) {
 	// Passive ?ver= versions (homepage + sitemap pages): fill in versions
 	// for passively observed components that enumeration could not pin
 	// down, then match them against the database.
-	s.mergePassiveDetections(res, addFindings)
+	if !s.opts.APIOnly && (s.mode == "mixed" || s.mode == "passive") {
+		s.mergePassiveDetections(res, addFindings)
+	}
 
 	if userPlan > 0 {
 		if pr != nil {
@@ -3411,7 +3638,7 @@ func (s *Scanner) Scan() (*Result, error) {
 		// accounts. Candidates come from the --usernames wordlist when
 		// provided, otherwise the common default set. Skipped with
 		// --no-brute, capped at maxAuthorChecks probes.
-		if len(res.Users) == 0 && !s.opts.NoBrute {
+		if len(res.Users) == 0 && !s.opts.NoBrute && !s.opts.APIOnly {
 			candidates := s.usernames
 			if len(candidates) == 0 {
 				candidates = []string{"admin", "administrator"}
@@ -3440,7 +3667,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	// multicall attack (--xmlrpc-brute). Both are loud by nature, so they
 	// are paced by their own throttle (1 req/s unless --rate-limit is
 	// set). XML-RPC only runs when xmlrpc.php answered the ping check.
-	if s.loginBrute {
+	if s.loginBrute && !s.opts.APIOnly {
 		creds := unique(append(append([]string{}, s.usernames...), userSlugs(res.Users)...))
 		if len(creds) > 0 {
 			if pr != nil {
@@ -3452,7 +3679,7 @@ func (s *Scanner) Scan() (*Result, error) {
 			}
 		}
 	}
-	if s.xmlrpcBrute {
+	if s.xmlrpcBrute && !s.opts.APIOnly {
 		if !res.XMLRPC {
 			if pr != nil {
 				pr.LogInf("xmlrpc brute: xmlrpc.php not detected — skipping")
@@ -3476,18 +3703,24 @@ func (s *Scanner) Scan() (*Result, error) {
 	// (100) wins ties against the equally-scored auth-rest inventory.
 	bySlug := make(map[string]Detected, len(res.Detected))
 	for _, d := range res.Detected {
-		if prev, ok := bySlug[d.Slug]; ok {
+		key := d.Type + "\x00" + d.Slug
+		if prev, ok := bySlug[key]; ok {
 			if !preferDetected(d, prev) {
 				continue
 			}
 		}
-		bySlug[d.Slug] = d
+		bySlug[key] = d
 	}
 	res.Detected = res.Detected[:0]
 	for _, d := range bySlug {
 		res.Detected = append(res.Detected, d)
 	}
-	sort.Slice(res.Detected, func(i, j int) bool { return res.Detected[i].Slug < res.Detected[j].Slug })
+	sort.Slice(res.Detected, func(i, j int) bool {
+		if res.Detected[i].Slug != res.Detected[j].Slug {
+			return res.Detected[i].Slug < res.Detected[j].Slug
+		}
+		return res.Detected[i].Type < res.Detected[j].Type
+	})
 	// Severity ordering (no-intel output): findings sort by their worst
 	// CVSS score DESC, then slug ascending, so table/JSON output reads
 	// severity-ordered even without the intel enrichment pass. When intel
@@ -3540,7 +3773,7 @@ func (s *Scanner) Scan() (*Result, error) {
 	}
 
 	res.RateLimitHits = s.rateLimitHits()
-	res.TimedOut = s.scanDone()
+	res.TimedOut = errors.Is(s.requestCtx().Err(), context.DeadlineExceeded)
 	res.RateLimitedAbort = s.rateLimitAbort()
 	s.buildSummary(res, scanStart)
 	return res, nil

@@ -98,13 +98,20 @@ func (s *Scanner) discoverViaSitemap(maxPages int) []string {
 // collectSitemapRefs extracts passive plugin/theme slugs and ?ver= versions
 // from one fetched page body, merging them into the discovery results.
 func (s *Scanner) collectSitemapRefs(html string) {
-	plugs, themes := ExtractPassiveSlugsIn(html, s.contentDir)
+	plugs, themes, versions := s.passiveRefsByType(html)
 	s.sitemapPlugins = unique(append(s.sitemapPlugins, plugs...))
 	s.sitemapThemes = unique(append(s.sitemapThemes, themes...))
 	if s.sitemapVersions == nil {
 		s.sitemapVersions = make(map[string]string)
 	}
-	for slug, ver := range ExtractPassiveVersionsIn(html, s.contentDir) {
+	if s.sitemapVersionRefs == nil {
+		s.sitemapVersionRefs = make(map[componentRef]string)
+	}
+	for ref, ver := range versions {
+		if _, ok := s.sitemapVersionRefs[ref]; !ok {
+			s.sitemapVersionRefs[ref] = ver
+		}
+		slug := ref.slug
 		if _, ok := s.sitemapVersions[slug]; !ok {
 			s.sitemapVersions[slug] = ver
 		}
@@ -185,6 +192,20 @@ func sitemapSitePath(loc, base string) (string, bool) {
 	p := u.Path
 	if p == "" || !strings.HasPrefix(p, "/") {
 		return "", false
+	}
+	b, berr := url.Parse(base)
+	if berr != nil {
+		return "", false
+	}
+	basePath := strings.TrimRight(b.Path, "/")
+	if basePath != "" {
+		if p != basePath && !strings.HasPrefix(p, basePath+"/") {
+			return "", false
+		}
+		p = strings.TrimPrefix(p, basePath)
+		if p == "" {
+			p = "/"
+		}
 	}
 	return p, true
 }

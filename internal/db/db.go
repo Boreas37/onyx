@@ -135,6 +135,58 @@ func (d *DB) NameFor(slug string) string {
 	return ""
 }
 
+// NameForType returns a display name only from software entries matching
+// both slug and typ. This avoids borrowing a theme name for a plugin (or the
+// reverse) when WordPress.org uses the same slug in both directories.
+func (d *DB) NameForType(slug, typ string) string {
+	for _, r := range d.bySlug[slug] {
+		for i := range r.Software {
+			sw := &r.Software[i]
+			if sw.Slug == slug && sw.Type == typ && sw.Name != "" {
+				return sw.Name
+			}
+		}
+	}
+	return ""
+}
+
+// TypesFor returns every software type associated with slug in a stable
+// order. A slug may legitimately identify both a plugin and a theme.
+func (d *DB) TypesFor(slug string) []string {
+	seen := make(map[string]bool)
+	for _, r := range d.bySlug[slug] {
+		for i := range r.Software {
+			if r.Software[i].Slug == slug {
+				seen[r.Software[i].Type] = true
+			}
+		}
+	}
+	var out []string
+	for _, typ := range []string{"plugin", "theme", "core"} {
+		if seen[typ] {
+			out = append(out, typ)
+		}
+	}
+	return out
+}
+
+// SlugsForType returns all indexed slugs carrying typ, sorted and
+// deduplicated. Core matching uses this instead of assuming a feed-specific
+// slug such as "wordpress".
+func (d *DB) SlugsForType(typ string) []string {
+	var out []string
+	for slug := range d.bySlug {
+		for _, candidate := range d.TypesFor(slug) {
+			if candidate == typ {
+				out = append(out, slug)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // SlugType returns the dominant software type ("plugin", "theme", "core")
 // for a slug, or "" when the slug is unknown.
 func (d *DB) SlugType(slug string) string {
@@ -147,12 +199,13 @@ func (d *DB) SlugType(slug string) string {
 			}
 		}
 	}
+	dominant, maxCount := "", 0
 	for _, t := range []string{"plugin", "theme", "core"} {
-		if counts[t] > 0 {
-			return t
+		if counts[t] > maxCount {
+			dominant, maxCount = t, counts[t]
 		}
 	}
-	return ""
+	return dominant
 }
 
 // titleVersionRe matches the version hint inside a scanner-feed record

@@ -50,14 +50,15 @@ jobs:
           - package: ./internal/report
             target: FuzzWriteReportSafety
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
+          cache: false
       - name: "Guard: fuzz target exists"
         id: guard
         run: |
-          if grep -Rqs "func Fuzz${{ matrix.target }}" "${{ matrix.package }}"; then
+          if grep -Rqs "func ${{ matrix.target }}" "${{ matrix.package }}"; then
             echo "exists=1" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::fuzz target Fuzz${{ matrix.target }} not found in ${{ matrix.package }} — skipping (may not have landed yet)"
@@ -70,7 +71,7 @@ jobs:
         run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 120s ${{ matrix.package }}
       - name: Upload crash artifacts
         if: steps.fuzz.outcome == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: |

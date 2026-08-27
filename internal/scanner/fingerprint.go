@@ -398,7 +398,7 @@ var restSlugRe = regexp.MustCompile(`^[a-z0-9_-]+$`)
 // Only these exact prefixes are dropped: a plugin named "wp" or
 // "oembed" would be a false negative, but none exists in the wild and the
 // core routes vastly outweigh that risk.
-var restKnownPrefixes = []string{"wp", "oembed", "wp-site-health", "wp/block-directory"}
+var restKnownPrefixes = []string{"wp", "oembed", "wp-site-health", "wp-block-directory", "wp-block-editor", "batch"}
 
 // restRouteSlug reduces one REST route key to its candidate plugin slug:
 // everything up to the first "/v<digit>" marker, or up to the first "/"
@@ -406,6 +406,7 @@ var restKnownPrefixes = []string{"wp", "oembed", "wp-site-health", "wp/block-dir
 // "contact-form-7", "elementor/v1" -> "elementor", "acme/endpoint" ->
 // "acme"). Routes without any slash ("hello") pass through unchanged.
 func restRouteSlug(route string) string {
+	route = strings.TrimPrefix(route, "/")
 	if i := restRouteVersionRe.FindStringIndex(route); i != nil {
 		return route[:i[0]]
 	}

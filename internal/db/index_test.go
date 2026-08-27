@@ -218,6 +218,16 @@ func TestIndexStaleByMtime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Filesystems differ in timestamp granularity. Pin the old sidecar far
+	// enough in the past so a synchronous rewrite is always observable.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(idxPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	before, err = os.Stat(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	future := time.Now().Add(2 * time.Hour)
 	if err := os.Chtimes(path, future, future); err != nil {
 		t.Fatal(err)

@@ -91,22 +91,22 @@ Rules:
 func userPrompt(tc TargetCtx, vuln scanner.Vulnerability, slug, typ, version, rawPoC string) string {
 	var b strings.Builder
 	b.WriteString("TargetCtx:\n")
-	b.WriteString(fmt.Sprintf("- Target: %s\n", tc.Target))
-	b.WriteString(fmt.Sprintf("- WordPress: %s\n", tc.WordPressVersion))
-	b.WriteString(fmt.Sprintf("- contentDir: %s\n", tc.ContentDir))
-	b.WriteString(fmt.Sprintf("- pluginsDir: %s\n", tc.PluginsDir))
-	b.WriteString(fmt.Sprintf("- WAF: %s\n", tc.WAF))
-	b.WriteString(fmt.Sprintf("- AuthStatus: %s\n", tc.AuthStatus))
-	b.WriteString(fmt.Sprintf("- Component: %s/%s@%s\n", typ, slug, version))
+	fmt.Fprintf(&b, "- Target: %s\n", tc.Target)
+	fmt.Fprintf(&b, "- WordPress: %s\n", tc.WordPressVersion)
+	fmt.Fprintf(&b, "- contentDir: %s\n", tc.ContentDir)
+	fmt.Fprintf(&b, "- pluginsDir: %s\n", tc.PluginsDir)
+	fmt.Fprintf(&b, "- WAF: %s\n", tc.WAF)
+	fmt.Fprintf(&b, "- AuthStatus: %s\n", tc.AuthStatus)
+	fmt.Fprintf(&b, "- Component: %s/%s@%s\n", typ, slug, version)
 	if len(tc.Interesting) > 0 {
 		b.WriteString("- Interesting: " + strings.Join(tc.Interesting, "; ") + "\n")
 	}
 	b.WriteString("\nVuln:\n")
-	b.WriteString(fmt.Sprintf("- ID: %s\n", sanitize.Text(vuln.ID, 200)))
-	b.WriteString(fmt.Sprintf("- CVE: %s\n", sanitize.Text(vuln.CVE, 64)))
-	b.WriteString(fmt.Sprintf("- Title: %s\n", sanitize.Text(vuln.Title, 500)))
-	b.WriteString(fmt.Sprintf("- Rating: %s\n", sanitize.Text(vuln.Rating, 32)))
-	b.WriteString(fmt.Sprintf("- Affected: %s\n", strings.Join(vuln.AffectedLabels, ", ")))
+	fmt.Fprintf(&b, "- ID: %s\n", sanitize.Text(vuln.ID, 200))
+	fmt.Fprintf(&b, "- CVE: %s\n", sanitize.Text(vuln.CVE, 64))
+	fmt.Fprintf(&b, "- Title: %s\n", sanitize.Text(vuln.Title, 500))
+	fmt.Fprintf(&b, "- Rating: %s\n", sanitize.Text(vuln.Rating, 32))
+	fmt.Fprintf(&b, "- Affected: %s\n", strings.Join(vuln.AffectedLabels, ", "))
 	b.WriteString("\nRaw PoC (first 6000 chars, truncated):\n")
 	raw := rawPoC
 	if len(raw) > 6000 {
