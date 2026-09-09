@@ -179,6 +179,12 @@ func DiffStates(prev *State, res *scanner.Result, now time.Time) *Diff {
 		}
 		return d.Resolved[i].CVE < d.Resolved[j].CVE
 	})
+	sort.Slice(d.New, func(i, j int) bool {
+		if d.New[i].Slug != d.New[j].Slug {
+			return d.New[i].Slug < d.New[j].Slug
+		}
+		return d.New[i].CVE < d.New[j].CVE
+	})
 	return d
 }
 

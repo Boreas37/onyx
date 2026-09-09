@@ -222,6 +222,28 @@ func parseBound(s string) (*Version, error) {
 	}
 	return &Version{parts: parts, raw: s}, nil
 }
+// parseStrictVersion parses a single version endpoint with the same
+// strictness as parseBound: trailing junk after the numeric prefix fails
+// closed instead of truncating (fail-open). Prerelease continuations
+// ("-beta", "b") remain accepted via qualifierTail. "*" is rejected here;
+// callers needing "*" handle it separately.
+func parseStrictVersion(s string) (Version, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "*" {
+		return Version{}, false
+	}
+	if s[0] == 'v' || s[0] == 'V' {
+		s = strings.TrimSpace(s[1:])
+		if s == "" {
+			return Version{}, false
+		}
+	}
+	parts, rest, ok := consumeVersion(s)
+	if !ok || !qualifierTail(rest) {
+		return Version{}, false
+	}
+	return Version{parts: parts, raw: s}, true
+}
 
 // splitParts splits a comma-separated union of ranges, ignoring commas
 // that appear inside bracket ranges such as "[*, 3.7)".
@@ -305,7 +327,7 @@ func parseOne(expr string) (Range, error) {
 	for _, op := range []string{"<=", ">=", "<", ">", "="} {
 		if strings.HasPrefix(expr, op) {
 			rest := strings.TrimSpace(expr[len(op):])
-			v, ok := Parse(rest)
+			v, ok := parseStrictVersion(rest)
 			if !ok {
 				return Range{}, ErrInvalidVersion
 			}
@@ -330,7 +352,7 @@ func parseOne(expr string) (Range, error) {
 		if rest == "" {
 			return Range{From: nil, To: nil, FromIncl: true, ToIncl: true, Label: expr}, nil
 		}
-		v, ok := Parse(rest)
+		v, ok := parseStrictVersion(rest)
 		if !ok {
 			return Range{}, ErrInvalidVersion
 		}
@@ -355,7 +377,7 @@ func parseOne(expr string) (Range, error) {
 		}
 		if toStar || (prevSpace && nextSpace) || nextDigit {
 			a := strings.TrimSpace(expr[:idx])
-			from, ok := Parse(a)
+			from, ok := parseStrictVersion(a)
 			if !ok {
 				return Range{}, ErrInvalidVersion
 			}
@@ -363,7 +385,7 @@ func parseOne(expr string) (Range, error) {
 				// "1.0-*": From inclusive, To unbounded (same as "[1.0, *]").
 				return Range{From: &from, To: nil, FromIncl: true, ToIncl: true, Label: expr}, nil
 			}
-			to, ok := Parse(rest)
+			to, ok := parseStrictVersion(rest)
 			if !ok {
 				return Range{}, ErrInvalidVersion
 			}
@@ -372,7 +394,7 @@ func parseOne(expr string) (Range, error) {
 	}
 
 	// Bare version: exact match.
-	v, ok := Parse(expr)
+	v, ok := parseStrictVersion(expr)
 	if !ok {
 		return Range{}, ErrInvalidVersion
 	}

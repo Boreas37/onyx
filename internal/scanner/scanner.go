@@ -438,15 +438,19 @@ func (t *uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // corresponding field of the cloned request untouched, so decoration is a
 // no-op when nothing is configured.
 type headerTransport struct {
-	base      http.RoundTripper
-	basicUser string
-	basicPass string
-	cookie    string
-	headers   map[string]string
-	vhost     string
+	base       http.RoundTripper
+	basicUser  string
+	basicPass  string
+	cookie     string
+	headers    map[string]string
+	vhost      string
+	targetAuth string
 }
 
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.targetAuth != "" && !sameAuthority(normalizeAuthority(req.URL.Host, req.URL.Scheme), t.targetAuth) {
+		return t.base.RoundTrip(req)
+	}
 	if t.basicUser != "" {
 		req = req.Clone(req.Context())
 		req.SetBasicAuth(t.basicUser, t.basicPass)
@@ -798,12 +802,13 @@ func NewScanner(database *db.DB, base string, opts Options) (*Scanner, error) {
 	// is configured, preserving the historical transport.
 	if opts.BasicAuthUser != "" || opts.Cookie != "" || len(opts.Headers) > 0 || opts.VHost != "" {
 		client.Transport = &headerTransport{
-			base:      client.Transport,
-			basicUser: opts.BasicAuthUser,
-			basicPass: opts.BasicAuthPass,
-			cookie:    opts.Cookie,
-			headers:   opts.Headers,
-			vhost:     opts.VHost,
+			base:       client.Transport,
+			basicUser:  opts.BasicAuthUser,
+			basicPass:  opts.BasicAuthPass,
+			cookie:     opts.Cookie,
+			headers:    opts.Headers,
+			vhost:      opts.VHost,
+			targetAuth: targetAuth,
 		}
 	}
 	s := &Scanner{
@@ -1708,6 +1713,9 @@ func (s *Scanner) checkXMLRPC() (enabled bool, pingback bool, methods []string) 
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return false, false, nil
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		s.noteRateLimited(resp.Header)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -3095,6 +3103,9 @@ func (s *Scanner) fetchHeaders(path string) (int, http.Header, []byte, error) {
 	})
 	if err != nil {
 		return 0, nil, nil, err
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		s.noteRateLimited(resp.Header)
 	}
 	defer resp.Body.Close()
 	hdr := resp.Header.Clone()

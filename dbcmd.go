@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +28,12 @@ func runDB(args []string) int {
 	cmd := args[0]
 	rest := args[1:]
 	dbPath := defaultDB
+	for _, r := range rest {
+		if r == "--db" {
+			fmt.Fprintln(os.Stderr, "usage: onyx db <cmd> [--db PATH]")
+			return 2
+		}
+	}
 	for i := 0; i < len(rest)-1; {
 		if rest[i] == "--db" {
 			dbPath = rest[i+1]
@@ -464,7 +469,7 @@ func runDoctor(args []string) int {
 
 	if network {
 		murl := manifestURL()
-		raw, merr := dbupdate.FetchManifestRaw(http.DefaultClient, murl)
+		raw, merr := dbupdate.FetchManifestRaw(nil, murl)
 		if merr != nil {
 			ok(false, "mirror manifest reachable", merr.Error())
 		} else {
@@ -477,11 +482,20 @@ func runDoctor(args []string) int {
 					shortHash(m.Full.Sha256), len(m.Deltas))
 			}
 			if pub := os.Getenv("ONYX_DB_PUBKEY"); pub != "" {
-				sigTmp := murl + ".minisig"
-				if sErr := dbupdate.VerifyManifest(pub, raw, sigTmp); sErr != nil {
-					ok(false, "manifest signature verifies", sErr.Error())
+				sigF, cErr := os.CreateTemp("", ".onyx-manifest-*.minisig")
+				if cErr != nil {
+					ok(false, "manifest signature verifies", cErr.Error())
 				} else {
-					ok(true, "manifest signature verifies", "")
+					sigTmp := sigF.Name()
+					sigF.Close()
+					defer os.Remove(sigTmp)
+					if dErr := downloadToFile(murl+".minisig", sigTmp); dErr != nil {
+						ok(false, "manifest signature verifies", dErr.Error())
+					} else if sErr := dbupdate.VerifyManifest(pub, raw, sigTmp); sErr != nil {
+						ok(false, "manifest signature verifies", sErr.Error())
+					} else {
+						ok(true, "manifest signature verifies", "")
+					}
 				}
 			}
 		}

@@ -497,7 +497,7 @@ func writeSARIF(w io.Writer, version string, res *scanner.Result) {
 					r.HelpURI = "https://wordfence.com/threat-intel/"
 				}
 				r.Properties.Tags = []string{"security"}
-				r.Properties.Severity = v.Rating
+				r.Properties.Severity = sevClass(v.Rating)
 				idx = len(out.Runs[0].Tool.Driver.Rules)
 				out.Runs[0].Tool.Driver.Rules = append(out.Runs[0].Tool.Driver.Rules, r)
 				ruleIdx[ruleID] = idx

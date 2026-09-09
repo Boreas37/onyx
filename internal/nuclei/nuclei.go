@@ -187,13 +187,14 @@ func runBatch(bin, target string, batch []string, extraArgs []string) ([]NucleiR
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	cmd.Stderr = &cappedWriter{W: &stderr, N: 1 << 20}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting nuclei: %w", err)
 	}
 
 	var results []NucleiResult
 	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
@@ -202,6 +203,10 @@ func runBatch(bin, target string, batch []string, extraArgs []string) ([]NucleiR
 		if r, err := ParseLine(line); err == nil {
 			results = append(results, r)
 		}
+	}
+	if sErr := sc.Err(); sErr != nil {
+		_ = cmd.Wait()
+		return results, fmt.Errorf("scan nuclei output: %w", sErr)
 	}
 	err = cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
@@ -216,6 +221,21 @@ func runBatch(bin, target string, batch []string, extraArgs []string) ([]NucleiR
 // ParseLine decodes one JSON Lines match into a NucleiResult. The CVE
 // field is filled from info.classification.cve-id when present, falling
 // back to the template-id itself when it looks like a CVE id.
+type cappedWriter struct {
+	W *bytes.Buffer
+	N int
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if c.W.Len() >= c.N {
+		return len(p), nil
+	}
+	if rem := c.N - c.W.Len(); len(p) > rem {
+		p = p[:rem]
+	}
+	return c.W.Write(p)
+}
+
 func ParseLine(line string) (NucleiResult, error) {
 	var raw jsonLine
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {

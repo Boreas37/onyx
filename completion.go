@@ -15,7 +15,7 @@ var scanFlagList = []string{
 	"--user-agent", "--random-user-agent", "--detection-mode", "--proxy",
 	"--proxy-auth", "--proxy-target-only", "--tls-fingerprint",
 	"--per-host-rate-limit", "--no-xmlrpc", "--checks", "--timeout",
-	"--content-dir", "--plugins-dir", "--exclude-content-based", "--scope",
+	"--wp-content-dir", "--wp-plugins-dir", "--exclude-content-based", "--scope",
 	"--no-update-check", "--no-update", "--plugins-list", "--themes-list",
 	"--max-scan-duration", "--cache-ttl", "--stream", "--config", "--nuclei",
 	"--nuclei-template-dir", "--nuclei-args", "--poc-tracker-dir", "--no-pocs",
@@ -30,6 +30,9 @@ var scanFlagList = []string{
 	"--format", "--db",
 	"--basic-auth", "--cookie", "--headers", "--vhost", "--force",
 	"--exclude-vulns",
+	"--progress", "--plugins-threshold", "--themes-threshold",
+	"--poc-generate", "--poc-output", "--llm-provider", "--llm-model",
+	"--llm-endpoint", "--llm-api-key", "-T",
 }
 
 var onyxSubcommands = []string{"scan", "update", "version", "db", "cache", "watch", "doctor", "diff", "example-config", "completion"}
@@ -66,15 +69,15 @@ _onyx_completions() {
   local i sub=""
   for ((i=1; i < COMP_CWORD; i++)); do
     case "${COMP_WORDS[i]}" in
-      scan|update|version|db|cache|watch|completion) sub="${COMP_WORDS[i]}" ;;
+      scan|update|version|db|cache|watch|doctor|diff|example-config|completion) sub="${COMP_WORDS[i]}" ;;
     esac
   done
   if [[ -z "$sub" ]]; then
-    COMPREPLY=( $(compgen -W "scan update version db cache watch completion" -- "$cur") )
+    COMPREPLY=( $(compgen -W "scan update version db cache watch doctor diff example-config completion" -- "$cur") )
     return
   fi
   if [[ "$sub" == "db" ]]; then
-    COMPREPLY=( $(compgen -W "stats lookup top search --db" -- "$cur") )
+    COMPREPLY=( $(compgen -W "stats lookup top search diff --db" -- "$cur") )
     return
   fi
   if [[ "$sub" == "cache" ]]; then

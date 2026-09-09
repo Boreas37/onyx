@@ -415,6 +415,7 @@ func ApplyDelta(basePath, deltaPath, outPath string) (DeltaStats, error) {
 	}
 
 	if stats.ResultRecords != header.ResultRecords {
+		os.Remove(outPath)
 		return stats, fmt.Errorf("result record count mismatch: got %d, want %d",
 			stats.ResultRecords, header.ResultRecords)
 	}

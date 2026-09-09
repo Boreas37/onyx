@@ -25,7 +25,7 @@ func runExampleConfig(args []string) int {
   "threads": 5,
   "rate_limit": 0,                    // requests/second, 0 = unlimited
   "detection_mode": "mixed",          // passive | aggressive | mixed
-  "format": "table",                  // table | json | jsonl | sarif | csv | cyclonedx | md | html | junit
+  "format": "table",                  // table | json | jsonl | sarif | csv | cyclonedx | md | html | junit | gitlab-sast | cli-no-colour
   "min_severity": "low",              // critical | high | medium | low
   "enumerate": "pt",                  // p plugins, t themes, u users, m media
   "max_requests": 500,
@@ -87,7 +87,7 @@ func runDiff(args []string) int {
 		} else if av != ver {
 			changed = append(changed, fmt.Sprintf("%s/%s %s (%s -> %s)", k.typ, k.slug, k.cve, av, ver))
 		} else {
-			unchanged = append(unchanged, k.slug+"/"+k.cve)
+			unchanged = append(unchanged, fmt.Sprintf("%s/%s %s", k.typ, k.slug, k.cve))
 		}
 	}
 	for k := range ma {

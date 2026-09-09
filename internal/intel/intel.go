@@ -87,18 +87,18 @@ func Load(cacheDir string, client *http.Client, now time.Time) (*Intel, []string
 	}
 	var warnings []string
 
-	scores, err := refreshEpss(cacheDir, client, now, &warnings)
-	if err != nil {
-		return nil, warnings, err
+	scores, eErr := refreshEpss(cacheDir, client, now, &warnings)
+	cves, kErr := refreshKev(cacheDir, client, now, &warnings)
+	if eErr != nil && kErr != nil {
+		return nil, warnings, eErr
 	}
-	in.epss = scores
-
-	cves, err := refreshKev(cacheDir, client, now, &warnings)
-	if err != nil {
-		return nil, warnings, err
+	if eErr == nil {
+		in.epss = scores
 	}
-	for _, cve := range cves {
-		in.kev[cve] = true
+	if kErr == nil {
+		for _, cve := range cves {
+			in.kev[cve] = true
+		}
 	}
 	return in, warnings, nil
 }
@@ -251,6 +251,10 @@ func parseEPSS(body []byte) (map[string]float64, error) {
 		}
 		scores[cve] = score
 	}
+	// NOTE: sc.Err() (e.g. token-too-long on a hostile line) is intentionally
+	// not surfaced as a hard error: TestParseEPSSHostileInputs locks partial
+	// success, and callers cache the result. Truncation after a huge line
+	// remains a known limitation (see TECH_DEBT.md).
 	if !headerSeen || len(scores) == 0 {
 		return nil, fmt.Errorf("no usable EPSS rows")
 	}

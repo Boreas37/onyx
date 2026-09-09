@@ -100,9 +100,12 @@ func FetchManifestRaw(client *http.Client, url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetching manifest: unexpected HTTP status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
+	}
+	if int64(len(body)) > maxManifestSize {
+		return nil, fmt.Errorf("reading manifest: too large")
 	}
 	return body, nil
 }

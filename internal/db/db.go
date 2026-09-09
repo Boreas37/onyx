@@ -116,7 +116,26 @@ func (d *DB) Lookup(slug string) []Vuln {
 	}
 	out := make([]Vuln, 0, len(recs))
 	for _, r := range recs {
-		out = append(out, *r)
+		cp := *r
+		if r.Software != nil {
+			cp.Software = make([]Software, len(r.Software))
+			copy(cp.Software, r.Software)
+			for i := range cp.Software {
+				if r.Software[i].AffectedVersions != nil {
+					m := make(map[string]AffectedVersion, len(r.Software[i].AffectedVersions))
+					for k, v := range r.Software[i].AffectedVersions {
+						m[k] = v
+					}
+					cp.Software[i].AffectedVersions = m
+				}
+				if r.Software[i].PatchedVersions != nil {
+					pv := make([]string, len(r.Software[i].PatchedVersions))
+					copy(pv, r.Software[i].PatchedVersions)
+					cp.Software[i].PatchedVersions = pv
+				}
+			}
+		}
+		out = append(out, cp)
 	}
 	return out
 }
@@ -370,6 +389,9 @@ func Load(path string) (*DB, error) {
 				rec.Software = append(rec.Software, s)
 			}
 		}
+		if len(rec.Software) == 0 {
+			continue
+		}
 		db.Records = append(db.Records, rec)
 	}
 
@@ -442,9 +464,9 @@ func decodeSoftware(rm json.RawMessage) (Software, bool) {
 		return Software{}, true
 	}
 	out := Software{
-		Type:             sanitize.Text(raw.Type, 32),
+		Type:             sanitize.Text(strings.ToLower(strings.TrimSpace(raw.Type)), 32),
 		Name:             sanitize.Text(raw.Name, maxNameLen),
-		Slug:             sanitize.Text(raw.Slug, maxSlugLen),
+		Slug:             slugify(sanitize.Text(raw.Slug, maxSlugLen)),
 		Patched:          raw.Patched,
 		PatchedVersions:  raw.PatchedVersions,
 		Remediation:      sanitize.Text(raw.Remediation, maxDescriptionLen),

@@ -39,6 +39,37 @@ func mdCell(s string) string {
 	return strings.NewReplacer("|", "\\|", "\n", " ", "\r", "").Replace(s)
 }
 
+// isCVEID reports whether s is a strict CVE identifier (CVE-YYYY-NNNN+).
+func isCVEID(s string) bool {
+	if len(s) < 9 || s[:4] != "CVE-" {
+		return false
+	}
+	rest := s[4:]
+	dash := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '-' {
+			dash = i
+			break
+		}
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
+	if dash < 4 {
+		return false
+	}
+	num := rest[dash+1:]
+	if num == "" {
+		return false
+	}
+	for i := 0; i < len(num); i++ {
+		if num[i] < '0' || num[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // WriteMarkdown renders res as a self-contained Markdown document.
 func WriteMarkdown(w io.Writer, res *scanner.Result) {
 	fmt.Fprintf(w, "# onyx scan — %s\n\n", mdCell(res.Target))
@@ -76,7 +107,7 @@ func WriteMarkdown(w io.Writer, res *scanner.Result) {
 				sev += " (CVSS: " + mdCell(v.CVSSVector) + ")"
 			}
 			cveCell := mdCell(cve)
-			if v.CVE != "" && strings.HasPrefix(cve, "CVE-") {
+			if isCVEID(cve) {
 				cveCell = fmt.Sprintf("[%s](https://nvd.nist.gov/vuln/detail/%s)", mdCell(cve), mdCell(cve))
 			}
 			fmt.Fprintf(w, "| %s | %s | %s |\n",
@@ -226,19 +257,27 @@ func WriteJUnit(w io.Writer, version string, res *scanner.Result) error {
 			if cve == "" {
 				cve = "no-cve"
 			}
-			message := strings.ToLower(v.Rating) + ": " + v.Title
+			message := sanitize.Text(strings.ToLower(v.Rating), 64) + ": " + sanitize.Text(v.Title, 300)
 			if v.CVSSVector != "" {
 				message += " | CVSS: " + sanitize.Text(v.CVSSVector, 500)
 			}
 			if v.Remediation != "" {
 				message += " — " + sanitize.Text(v.Remediation, 500)
 			}
-			text := strings.Join(v.AffectedLabels, ", ")
+			labs := make([]string, 0, len(v.AffectedLabels))
+			for _, l := range v.AffectedLabels {
+				labs = append(labs, sanitize.Text(l, 128))
+			}
+			text := strings.Join(labs, ", ")
 			if len(v.PatchedVersions) > 0 {
 				if text != "" {
 					text += ", "
 				}
-				text += "Patched in: " + strings.Join(v.PatchedVersions, ", ")
+				pv := make([]string, 0, len(v.PatchedVersions))
+				for _, s := range v.PatchedVersions {
+					pv = append(pv, sanitize.Text(s, 64))
+				}
+				text += "Patched in: " + strings.Join(pv, ", ")
 			}
 			suite.Cases = append(suite.Cases, junitCase{
 				Name:      cve,

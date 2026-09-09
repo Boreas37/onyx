@@ -297,6 +297,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.apiOnly = true
 		case a == "--stealth":
 			o.stealth = true
+			setFlags["stealth"] = true
 		case a == "--verbose":
 			o.verbose = true
 		case a == "--progress":
@@ -305,6 +306,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.silent = true
 		case a == "--random-user-agent":
 			o.randomUA = true
+			setFlags["random-user-agent"] = true
 		case a == "--user-agent" && i+1 < len(args):
 			i++
 			o.userAgent = args[i]
@@ -326,8 +328,9 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--per-host-rate-limit" && i+1 < len(args):
 			i++
 			phl, err := strconv.ParseFloat(args[i], 64)
-			if err == nil && phl > 0 {
+			if err == nil && phl >= 0 {
 				o.perHostRateLimit = phl
+				setFlags["per-host-rate-limit"] = true
 			}
 		case a == "--no-xmlrpc":
 			o.noXMLRPC = true
@@ -379,16 +382,18 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--rate-limit" && i+1 < len(args):
 			i++
 			rl, err := strconv.ParseFloat(args[i], 64)
-			if err == nil && rl > 0 {
+			if err == nil && rl >= 0 {
 				o.rateLimit = rl
 				setFlags["rate-limit"] = true
 			}
 		case a == "--enumerate" && i+1 < len(args):
 			i++
 			o.enumerate = strings.ToLower(args[i])
+			setFlags["enumerate"] = true
 		case a == "--max-requests" && i+1 < len(args):
 			i++
 			o.maxReq = atoi(args[i], 500)
+			setFlags["max-requests"] = true
 		case a == "--output" && i+1 < len(args):
 			i++
 			o.output = args[i]
@@ -445,16 +450,20 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.wpAuth = args[i]
 		case a == "--no-brute":
 			o.noBrute = true
+			setFlags["no-brute"] = true
 		case a == "--no-summary":
 			o.noSummary = true
 		case a == "--strict-wp":
 			o.strictWP = true
+			setFlags["strict-wp"] = true
 		case a == "--crawl-pages" && i+1 < len(args):
 			i++
 			o.crawlPages = atoi(args[i], 25)
+			setFlags["crawl-pages"] = true
 		case a == "--fail-on" && i+1 < len(args):
 			i++
 			o.failOn = strings.ToLower(args[i])
+			setFlags["fail-on"] = true
 			if severityRankOf(o.failOn) == 0 {
 				fmt.Fprintf(os.Stderr, "error: invalid --fail-on %q (use critical, high, medium or low)\n", args[i])
 				os.Exit(2)
@@ -586,10 +595,6 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			}
 		}
 	}
-	// --stream alone implies --format jsonl.
-	if o.stream && !setFlags["format"] {
-		o.format = "jsonl"
-	}
 	// Config cascade: when no explicit --config was given, look for a
 	// defaults file in the standard locations (first match wins), the
 	// same convention WPScan follows. Explicit CLI flags still win over
@@ -617,6 +622,10 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			fmt.Fprintln(os.Stderr, "error loading profile:", aerr)
 			os.Exit(2)
 		}
+	}
+	// --stream alone implies --format jsonl (after config/profile so explicit config format wins only when set via setFlags logic is bypassed; stream still forces jsonl unless format explicitly set).
+	if o.stream && !setFlags["format"] {
+		o.format = "jsonl"
 	}
 	if o.enumerate != "" {
 		validToken := func(tok string) bool {
@@ -677,7 +686,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.enumerate = string(norm)
 		}
 	}
-	switch o.format {
+		report.NoColor = (o.format == "cli-no-colour")
+switch o.format {
 	case "table", "cli-no-colour", "json", "jsonl", "sarif", "csv", "cyclonedx",
 		"markdown", "md", "html", "junit", "gitlab-sast":
 	default:
@@ -1280,7 +1290,6 @@ func runScan(target string, o scanOptions) int {
 	case "gitlab-sast":
 		report.PrintGitLabSAST(res)
 	case "cli-no-colour":
-		report.NoColor = true
 		report.PrintTable(res, o.verbose, o.minSeverity)
 		if !o.noSummary {
 			report.PrintSummary(res)
@@ -1622,6 +1631,10 @@ func runWatch(target string, o scanOptions, w watchOptions) int {
 			fmt.Fprintln(os.Stderr, "scan failed:", err)
 			return 2
 		}
+		if err != nil || res == nil || res.TimedOut || res.RateLimitedAbort {
+			fmt.Fprintln(os.Stderr, "watch: incomplete scan \u2014 preserving baseline")
+			return 2
+		}
 		if !o.noIntel && res != nil && len(res.Findings) > 0 {
 			enrichFindings(res)
 		}
@@ -1869,33 +1882,39 @@ func generatePoCs(res *scanner.Result, o scanOptions, sc *scanner.Scanner) ([]sc
 // [-H, X-Api-Key: x].
 func splitNucleiArgs(s string) []string {
 	var args []string
-	start := -1
+	var cur []byte
+	inTok := false
 	var quote byte
+	flush := func() {
+		if inTok {
+			args = append(args, string(cur))
+			cur = nil
+			inTok = false
+		}
+	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if quote != 0 {
 			if c == quote {
 				quote = 0
+			} else {
+				cur = append(cur, c)
+				inTok = true
 			}
 			continue
 		}
 		switch c {
 		case '"', '\'':
 			quote = c
+			inTok = true
 		case ' ', '\t', '\r', '\n':
-			if start >= 0 {
-				args = append(args, s[start:i])
-				start = -1
-			}
+			flush()
 		default:
-			if start < 0 {
-				start = i
-			}
+			cur = append(cur, c)
+			inTok = true
 		}
 	}
-	if start >= 0 {
-		args = append(args, s[start:])
-	}
+	flush()
 	return args
 }
 
@@ -2428,7 +2447,9 @@ func updateOptionalAssets(dst string, rel *releaseInfo) {
 			continue
 		}
 		tmpName := tmp.Name()
+		tmp.Close()
 		defer os.Remove(tmpName)
+		defer os.Remove(tmpName + ".sig")
 		if err := downloadToFile(url, tmpName); err != nil {
 			fmt.Fprintf(os.Stderr, "[WARN] %s download: %v\n", asset.name, err)
 			continue
@@ -2446,19 +2467,35 @@ func updateOptionalAssets(dst string, rel *releaseInfo) {
 				continue
 			}
 		}
-		zr, gErr := gzip.NewReader(tmp)
+		gzF, gOpenErr := os.Open(tmpName)
+		if gOpenErr != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] %s open: %v\n", asset.name, gOpenErr)
+			continue
+		}
+		zr, gErr := gzip.NewReader(gzF)
 		if gErr != nil {
+			gzF.Close()
 			fmt.Fprintf(os.Stderr, "[WARN] %s gzip: %v\n", asset.name, gErr)
 			continue
 		}
-		if _, cErr := io.Copy(tmp, zr); cErr != nil {
+		decTmp, dErr := os.CreateTemp(dir, ".onyx-aux-dec-*")
+		if dErr != nil {
 			zr.Close()
+			gzF.Close()
+			fmt.Fprintf(os.Stderr, "[WARN] %s temp: %v\n", asset.name, dErr)
+			continue
+		}
+		decName := decTmp.Name()
+		_, cErr := io.Copy(decTmp, zr)
+		zr.Close()
+		gzF.Close()
+		decTmp.Close()
+		if cErr != nil {
+			os.Remove(decName)
 			fmt.Fprintf(os.Stderr, "[WARN] %s unpack: %v\n", asset.name, cErr)
 			continue
 		}
-		zr.Close()
-		tmp.Close()
-		if rErr := os.Rename(tmpName, outPath); rErr != nil {
+		if rErr := os.Rename(decName, outPath); rErr != nil {
 			fmt.Fprintf(os.Stderr, "[WARN] %s rename: %v\n", asset.name, rErr)
 			continue
 		}
@@ -2572,7 +2609,7 @@ func downloadFeed(url string, gz bool, out io.Writer) (string, error) {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "onyx")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("feed download: %w", err)
 	}

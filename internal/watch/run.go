@@ -51,6 +51,9 @@ func Run(target string, res *scanner.Result, opts Options, now time.Time) (*Diff
 		return nil, err
 	}
 
+	if res == nil || res.TimedOut || res.RateLimitedAbort {
+		return nil, fmt.Errorf("watch: incomplete scan \u2014 preserving baseline")
+	}
 	d := DiffStates(prev, res, now)
 	if d.Target == "" {
 		d.Target = target

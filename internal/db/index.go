@@ -117,7 +117,9 @@ func SaveIndex(path string, d *DB) error {
 //     to a full load.
 func LoadCached(path string) (*DB, error) {
 	if idx, err := readIndexFile(path); err == nil {
-		return rebuildFromIndex(idx, path)
+		if d, err := rebuildFromIndex(idx, path); err == nil {
+			return d, nil
+		}
 	}
 	d, err := Load(path)
 	if err != nil {

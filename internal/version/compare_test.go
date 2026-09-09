@@ -215,6 +215,14 @@ func TestParseRangesErrors(t *testing.T) {
 		"[1.0, 2.0, junk]", "[1.0, 2.0 , junk]", "[1.0, 2.0, extra]",
 		"[0.1-0.9]",      // dash-digit tail inside a bound reads as a range
 		"[1.0, 2.0-3.0]", // same
+		"<= 2.0 junk",
+		">= 1.5 junk",
+		"< 2.0 junk",
+		"> 1.5 junk",
+		"= 1.5 junk",
+		"*-1.37 junk",
+		"1.0 - 2.0 junk",
+		"1.5 junk",
 	}
 	for _, s := range bad {
 		if _, err := ParseRanges(s); err == nil {
