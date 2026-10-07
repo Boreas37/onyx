@@ -87,3 +87,97 @@ func TestRunDBSubcommands(t *testing.T) {
 		t.Errorf("missing db exit = %d, want 2", code)
 	}
 }
+
+// TestRunDBFlagParsing locks the repaired hand-rolled flag parsing: both
+// --db PATH and --db=PATH are accepted, the flag may precede or follow the
+// positional argument, and missing values / unknown flags fail with exit 2.
+// Regression for the stray loop that rejected every --db invocation.
+func TestRunDBFlagParsing(t *testing.T) {
+	dbPath := dbFixture(t)
+
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"stats --db=PATH", []string{"stats", "--db=" + dbPath}, "records:      3"},
+		{"stats --db PATH before cmd", []string{"--db", dbPath, "stats"}, "records:      3"},
+		{"lookup --db=PATH", []string{"lookup", "elementor", "--db=" + dbPath}, "CVE-2026-1111"},
+		{"lookup flag before slug", []string{"lookup", "--db", dbPath, "elementor"}, "patched in: 1.0"},
+		{"top --db=PATH", []string{"top", "1", "--db=" + dbPath}, "vulnerabilities"},
+		{"top flag before N", []string{"top", "--db=" + dbPath, "2"}, "elementor"},
+		{"search --db=PATH", []string{"search", "CVE-2026-2222", "--db=" + dbPath}, "CVE-2026-2222"},
+		{"search flag before query", []string{"search", "--db", dbPath, "CVE-2026-22"}, "CVE-2026-2222"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var code int
+			out := captureStdoutDB(t, func() { code = runDB(tc.args) })
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0", code)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("output missing %q in:\n%s", tc.want, out)
+			}
+		})
+	}
+
+	// diff must accept --db=PATH and compare against the fixture.
+	bPath := filepath.Join(t.TempDir(), "b.json")
+	feedB := `{"r1":{"id":"r1","title":"Elementor < 1.0","software":[{"type":"plugin","slug":"elementor"}]}}`
+	if err := os.WriteFile(bPath, []byte(feedB), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var code int
+	out := captureStdoutDB(t, func() { code = runDB([]string{"diff", bPath, "--db=" + dbPath}) })
+	if code != 0 {
+		t.Fatalf("diff exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "db diff: 3 records vs 1 records") {
+		t.Errorf("diff output unexpected:\n%s", out)
+	}
+
+	// Failure cases: every one must be usage + exit 2.
+	errCases := []struct {
+		name string
+		args []string
+	}{
+		{"missing value after --db", []string{"stats", "--db"}},
+		{"missing value, flag last", []string{"lookup", "elementor", "--db"}},
+		{"empty --db=", []string{"stats", "--db="}},
+		{"unknown flag", []string{"stats", "--bogus"}},
+		{"unknown flag with valid db", []string{"stats", "--db=" + dbPath, "--bogus"}},
+		{"no subcommand after flag", []string{"--db", dbPath}},
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if code := runDB(tc.args); code != 2 {
+				t.Errorf("exit = %d, want 2", code)
+			}
+		})
+	}
+}
+
+// TestAuditDBEqualsFlagParsers covers the same class of bug outside dbcmd:
+// scan, watch and doctor also parse args by hand and previously rejected the
+// --db=PATH form that the stdlib-based `update` subcommand accepts.
+func TestAuditDBEqualsFlagParsers(t *testing.T) {
+	const p = "/tmp/onyx-regression-db.json"
+
+	if _, o := parseScanArgs([]string{"http://example.test", "--db=" + p}); o.dbPath != p {
+		t.Errorf("scan --db=PATH dbPath = %q, want %q", o.dbPath, p)
+	}
+	if _, o := parseScanArgs([]string{"--db", p, "http://example.test"}); o.dbPath != p {
+		t.Errorf("scan --db PATH dbPath = %q, want %q", o.dbPath, p)
+	}
+	if _, o, _ := parseWatchArgs([]string{"http://example.test", "--db=" + p}); o.dbPath != p {
+		t.Errorf("watch --db=PATH dbPath = %q, want %q", o.dbPath, p)
+	}
+	// doctor returns 1 (db missing) when --db=PATH is accepted, 2 (usage)
+	// when it is not: distinguishes the two without network access.
+	var code int
+	captureStdoutDB(t, func() { code = runDoctor([]string{"--db=" + p}) })
+	if code != 1 {
+		t.Errorf("doctor --db=PATH exit = %d, want 1 (accepted, db missing)", code)
+	}
+}

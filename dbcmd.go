@@ -25,23 +25,41 @@ func runDB(args []string) int {
 		dbUsage()
 		return 2
 	}
-	cmd := args[0]
-	rest := args[1:]
+	// Hand-rolled flag parsing so `--db PATH` and `--db=PATH` both work and
+	// the flag may sit before or after the subcommand's positional argument.
 	dbPath := defaultDB
-	for _, r := range rest {
-		if r == "--db" {
-			fmt.Fprintln(os.Stderr, "usage: onyx db <cmd> [--db PATH]")
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--db":
+			if i+1 >= len(args) {
+				dbUsage()
+				return 2
+			}
+			i++
+			dbPath = args[i]
+		case strings.HasPrefix(a, "--db="):
+			v := strings.TrimPrefix(a, "--db=")
+			if v == "" {
+				dbUsage()
+				return 2
+			}
+			dbPath = v
+		case strings.HasPrefix(a, "-"):
+			fmt.Fprintln(os.Stderr, "unknown flag:", a)
+			dbUsage()
 			return 2
+		default:
+			rest = append(rest, a)
 		}
 	}
-	for i := 0; i < len(rest)-1; {
-		if rest[i] == "--db" {
-			dbPath = rest[i+1]
-			rest = append(rest[:i:i], rest[i+2:]...)
-			continue
-		}
-		i++
+	if len(rest) == 0 {
+		dbUsage()
+		return 2
 	}
+	cmd := rest[0]
+	rest = rest[1:]
 
 	database, err := db.LoadCached(dbPath)
 	if err != nil {
@@ -384,6 +402,8 @@ func runDoctor(args []string) int {
 		case args[i] == "--db" && i+1 < len(args):
 			i++
 			dbPath = args[i]
+		case strings.HasPrefix(args[i], "--db="):
+			dbPath = strings.TrimPrefix(args[i], "--db=")
 		case args[i] == "--network":
 			network = true
 		default:

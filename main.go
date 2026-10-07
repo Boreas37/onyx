@@ -372,6 +372,8 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--db" && i+1 < len(args):
 			i++
 			o.dbPath = args[i]
+		case strings.HasPrefix(a, "--db="):
+			o.dbPath = strings.TrimPrefix(a, "--db=")
 		case a == "--threads" && i+1 < len(args):
 			i++
 			o.threads = atoi(args[i], 5)
@@ -1569,6 +1571,8 @@ func parseWatchArgs(args []string) (target string, o scanOptions, w watchOptions
 		case a == "--db" && i+1 < len(args):
 			i++
 			o.dbPath = args[i]
+		case strings.HasPrefix(a, "--db="):
+			o.dbPath = strings.TrimPrefix(a, "--db=")
 		case a == "--threads" && i+1 < len(args):
 			i++
 			o.threads = atoi(args[i], 5)
