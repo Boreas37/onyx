@@ -2,6 +2,28 @@
 
 All notable changes to `onyx`. Versions follow semver; dates are UTC.
 
+## Unreleased — multi-target aggregate output (RM6 additive)
+
+### Added
+- Batch multi-target output: `--format json` emits ONE aggregate document
+  (`{"targets":[{target,ok,error?,findings,stats}],"summary":{targets,ok,failed,findings_by_severity,duration_s}}`)
+  and `--format sarif` ONE log with a `run` per host (host in the run name).
+  `--output-dir DIR` writes `<host>.json` per reachable target plus
+  `DIR/batch-summary.json`.
+- `--input FILE` as a documented alias for `-T`/`--targets`.
+- Batch progress: one compact line per finished host
+  (`[4/10] example.com  ok  7 findings (2 critical)  12.3s`) and a single
+  `\r`-updated progress bar on stderr (TTY only, throttled to ~12 redraws/s),
+  disabled by `--silent`; `--verbose` keeps the legacy per-target section headers.
+- The vulnerability database and the PoC-tracker index are loaded ONCE per
+  batch instead of once per target.
+
+### Changed
+- `onyx scan -T FILE` (or `--input FILE`) now scans with no positional target.
+- Multi-target exit-code aggregation is unchanged (worst code wins: hard failure
+  `2` > findings `5` > strict-WP miss `3` > clean `0`).
+- Single-target `json` / `sarif` / `table` output is byte-identical to before.
+
 ## 1.1.1 — 2026-08-25
 
 ### Fixed

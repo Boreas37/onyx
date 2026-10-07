@@ -86,14 +86,16 @@ onyx scan https://example.com
 | `--no-brute` | Disable credential brute force (wp-login and XML-RPC) |
 | `--strict-wp` | Exit `3` when the target does not look like WordPress (default: warn, exit `0`) |
 | `--crawl-pages N` | Fetch N pages from the target's sitemap and mine them for plugin/theme references + `?ver=` versions (default 0 = off) |
-| `-T FILE`, `--targets FILE` | Scan many sites sequentially (one URL per line, `#` comments). Extra URLs can also be passed positionally. Exit code aggregates: any hard failure → `2`, else any findings → `5`. Formats that cannot be concatenated (`json`, `sarif`, `cyclonedx`) require a single target |
+| `-T FILE`, `--targets FILE` | Scan many sites (one URL per line, `#` comments). Extra URLs can also be passed positionally. `--input FILE` is an alias. Exit code aggregates: any hard failure → `2`, else any findings → `5` |
+| `--input FILE` | Alias for `-T`/`--targets` (same target-list file) |
+| `--output-dir DIR` | Multi-target: write one `<host>.json` (single-target JSON shape) per reachable target plus `DIR/batch-summary.json` |
 | `--fail-on SEV` | Exit `5` only when a finding is `SEV` or worse (`critical`/`high`/`medium`/`low`); default: any finding. Nuclei-verified hits always exit `5` |
 | `--no-intel` | Skip EPSS / CISA KEV enrichment (enabled by default; findings are annotated and sorted by exploitation priority) |
 | `--fingerprint-db FILE` | JSON table of static-file MD5 hashes → WordPress versions, used as a core-version fallback when meta/RSS/OPML yield nothing |
 | `--no-popular` | Do not append the built-in popular plugin/theme slug lists during aggressive enumeration |
 | `--allow-foreign-redirect` | Follow HTTP redirects to hosts other than the scanned target (default: blocked — SSRF hardening) |
 | `--retries N` | Retry transient network errors N times with exponential backoff + jitter (default 2, `0` disables) |
-| `--jobs N` | Scan `-T`/extra targets with up to N concurrent scans (default 1 = sequential; output order may vary) |
+| `--jobs N` | Scan `-T`/extra targets with up to N concurrent scans (default 1 = sequential) |
 | `--no-discover-404` | Do not probe a nonexistent path for plugin/theme references |
 | `--fail-on-rate-limited` | Exit `4` when the target's 429 throttling cut the scan short (CI: incomplete != clean) |
 | `--nuclei-min-severity S` | Only run nuclei templates of `S` or worse (`critical`/`high`/`medium`/`low`/`info`) |
@@ -110,6 +112,45 @@ onyx scan https://example.com
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
+
+### Multi-target scanning (batch mode)
+
+Pass more than one target — positionally, with `-T/--targets FILE` (or its
+alias `--input FILE`) — and `onyx` runs a **batch**: the vulnerability database
+and the PoC-tracker index are loaded **once** for the whole run, and hosts are
+scanned with up to `--jobs N` in flight.
+
+```bash
+onyx scan -T targets.txt --jobs 4 --format json  > batch.json
+onyx scan -T targets.txt --jobs 4 --output-dir reports/
+```
+
+- **Aggregate output.** With multiple targets `--format json` emits ONE
+  document, `{"targets":[{"target","ok","error"?,"findings":[…],"stats":{…}}],
+  "summary":{"targets","ok","failed","findings_by_severity","duration_s"}}`;
+  `--format sarif` emits ONE SARIF log with one `run` per host (host in the run
+  name). `--format table`, `cli-no-colour`, `csv` and `jsonl` aggregate too.
+  Single-target `json`/`sarif` output is unchanged. Formats that cannot
+  represent several hosts (`cyclonedx`, `markdown`, `html`, `junit`,
+  `gitlab-sast`) are still rejected up front.
+- **`--output-dir DIR`** writes one `<host>.json` (the single-target JSON shape)
+  per reachable target plus `DIR/batch-summary.json`; the directory is created
+  if missing and host names are filesystem-sanitised (ports/colons safe).
+- **Output hygiene.** By default the batch prints one compact line per finished
+  host on stderr (`[4/10] example.com  ok  7 findings (2 critical)  12.3s`) and a
+  single `\r`-updated progress line (`[####------] 40% 4/10 hosts 38s`) that is
+  drawn only on a terminal — piped output carries no control characters. Both
+  are disabled by `--silent`. `--verbose` restores the legacy per-target section
+  headers and each host's full report; outside `--verbose` there is no
+  per-finding flood.
+- **Isolation.** A dead or unreachable host does not stop the others; it appears
+  as `ok:false` with an `error` while the rest keep their own findings. Exit
+  codes aggregate exactly as before (any hard failure → `2`, else findings →
+  `5`, else strict-WP misses → `3`, else `0`).
+- **Limits are per target.** `--threads`, `--rate-limit` / `--per-host-rate-limit`,
+  `--max-requests`, `--max-scan-duration`, request timeouts and retries all apply
+  to each host independently, so a batch of N hosts may issue up to N× those
+  budgets in total.
 
 ### Exploit-oriented checks
 
