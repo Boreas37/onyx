@@ -19,7 +19,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -66,14 +65,18 @@ func main() {
 	switch os.Args[1] {
 	case "scan":
 		target, opts := parseScanArgs(os.Args[2:])
-		if target == "" {
-			fmt.Fprintln(os.Stderr, "error: scan needs a target URL")
+		var all []string
+		if target != "" {
+			all = append(all, target)
+		}
+		all = append(all, opts.targets...)
+		if len(all) == 0 {
+			fmt.Fprintln(os.Stderr, "error: scan needs a target URL or -T/--input FILE")
 			usage()
 			os.Exit(2)
 		}
-		all := append([]string{target}, opts.targets...)
 		if len(all) == 1 {
-			os.Exit(runScan(target, opts))
+			os.Exit(runScan(all[0], opts))
 		}
 		os.Exit(runMulti(all, opts))
 	case "update":
@@ -232,6 +235,7 @@ type scanOptions struct {
 	strictWP             bool
 	targets              []string
 	targetsFile          string
+	outputDir            string
 	profile              string
 	crawlPages           int
 	failOn               string
@@ -527,9 +531,12 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 		case a == "--profile" && i+1 < len(args):
 			i++
 			o.profile = args[i]
-		case a == "-T" && i+1 < len(args), a == "--targets" && i+1 < len(args):
+		case a == "-T" && i+1 < len(args), a == "--targets" && i+1 < len(args), a == "--input" && i+1 < len(args):
 			i++
 			o.targetsFile = args[i]
+		case a == "--output-dir" && i+1 < len(args):
+			i++
+			o.outputDir = args[i]
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -1013,7 +1020,9 @@ Scan flags:
   --no-brute         disable credential brute force (wp-login and XML-RPC)
   --strict-wp        exit with code 3 when the target does not look like WordPress (default: warn and continue)
   --crawl-pages N    fetch N sitemap pages for passive plugin/theme discovery (default: 0 = off)
-  -T, --targets FILE scan several targets sequentially (one URL per line; # comments); exit code aggregates
+  -T, --targets FILE scan several targets (one URL per line; # comments); exit code aggregates
+  --input FILE       alias for -T/--targets (same target-list file)
+  --output-dir DIR   multi-target: write <host>.json per target plus DIR/batch-summary.json
   --fail-on SEV      only exit 5 when findings >= SEV exist (critical/high/medium/low); default: any finding
   --no-intel         skip EPSS/CISA KEV enrichment
   --fingerprint-db FILE  JSON core-fingerprint table (md5 file hashes -> versions)
@@ -1303,24 +1312,27 @@ func runScan(target string, o scanOptions) int {
 	return scanExitCode(res, err, o.strictWP, o.failOn, o.failOnRateLimited)
 }
 
-// runMulti scans several targets, printing a section header per target and
-// aggregating exit codes: any hard failure (2) wins, then findings (5),
-// then strict-WP misses (3), else 0. With --jobs N (N > 1) the targets are
-// scanned concurrently with at most N in flight; because scans are
-// network-bound this can cut wall time for large target files. Output
-// order may then differ from the input order (each target still prints
-// under its own "=== [i/N] target ===" header).
+// runMulti scans several targets, aggregating per-target exit codes: any hard
+// failure (2) wins, then findings (5), then strict-WP misses (3), else 0. The
+// rank-preserving aggregation is unchanged.
 //
-// Formats that cannot be meaningfully concatenated (json document, sarif,
-// cyclonedx) are rejected up front; jsonl and csv are flat formats and
-// concatenate naturally, table output simply repeats per target.
+// A single target keeps the historical path exactly (runScan). With more than
+// one target the batch runner (batch.go) loads the vulnerability database and
+// the PoC tracker index once for the whole batch, scans hosts with up to
+// --jobs in flight, and renders either compact per-host progress (default) or
+// the legacy per-target section headers under --verbose.
+//
+// Formats: table, cli-no-colour, jsonl and csv aggregate naturally; json and
+// sarif now emit ONE aggregate document. Formats that cannot represent
+// multiple hosts (cyclonedx, markdown, html, junit, gitlab-sast) are rejected
+// up front.
 func runMulti(targets []string, o scanOptions) int {
 	if len(targets) > 1 {
 		switch o.format {
-		case "table", "cli-no-colour", "jsonl", "csv":
+		case "table", "cli-no-colour", "jsonl", "csv", "json", "sarif":
 		default:
 			fmt.Fprintf(os.Stderr,
-				"error: --format %s cannot represent multiple targets (use table, jsonl or csv)\n", o.format)
+				"error: --format %s cannot represent multiple targets (use table, cli-no-colour, json, jsonl, sarif or csv)\n", o.format)
 			return 2
 		}
 	}
@@ -1335,45 +1347,17 @@ func runMulti(targets []string, o scanOptions) int {
 		}
 		return 0
 	}
-	worst := 0
-	jobs := o.jobs
-	if jobs < 1 {
-		jobs = 1
-	}
-	if jobs == 1 || len(targets) == 1 {
-		for i, t := range targets {
-			if len(targets) > 1 {
-				fmt.Fprintf(os.Stderr, "\n=== [%d/%d] %s ===\n", i+1, len(targets), t)
-			}
-			code := runScan(t, o)
-			if rank(code) > rank(worst) {
-				worst = code
+	// A single target is exactly the historical single-scan behaviour.
+	if len(targets) <= 1 {
+		worst := 0
+		for _, t := range targets {
+			if c := runScan(t, o); rank(c) > rank(worst) {
+				worst = c
 			}
 		}
 		return worst
 	}
-	// Concurrent mode: bounded worker pool, codes aggregated afterwards.
-	codes := make([]int, len(targets))
-	sem := make(chan struct{}, jobs)
-	var wg sync.WaitGroup
-	for i, t := range targets {
-		i, t := i, t
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			fmt.Fprintf(os.Stderr, "\n=== [%d/%d] %s ===\n", i+1, len(targets), t)
-			codes[i] = runScan(t, o)
-		}()
-	}
-	wg.Wait()
-	for _, c := range codes {
-		if rank(c) > rank(worst) {
-			worst = c
-		}
-	}
-	return worst
+	return runBatch(targets, o, rank)
 }
 
 // severityRankOf maps a severity name to a rank (critical=4 … low=1);
@@ -1748,17 +1732,7 @@ func collectPoCs(res *scanner.Result, o scanOptions) {
 	if len(res.Nuclei) == 0 {
 		return
 	}
-	dir := o.pocTrackerDir
-	if dir == "" {
-		dir = os.Getenv("POC_TRACKER_DIR")
-	}
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			dir = filepath.Join(home, "projects", "cve-tracker")
-		}
-	}
-	dir = expandHome(dir)
+	dir := resolvePocTrackerDir(o)
 	if dir == "" {
 		return
 	}
@@ -1916,6 +1890,23 @@ func splitNucleiArgs(s string) []string {
 	}
 	flush()
 	return args
+}
+
+// resolvePocTrackerDir resolves the CVE-PoC-Tracker directory from
+// --poc-tracker-dir, $POC_TRACKER_DIR, or ~/projects/cve-tracker, expanding a
+// leading ~. It returns "" when no candidate is set.
+func resolvePocTrackerDir(o scanOptions) string {
+	dir := o.pocTrackerDir
+	if dir == "" {
+		dir = os.Getenv("POC_TRACKER_DIR")
+	}
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dir = filepath.Join(home, "projects", "cve-tracker")
+		}
+	}
+	return expandHome(dir)
 }
 
 // expandHome replaces a leading ~/ (and bare ~) with the user's home

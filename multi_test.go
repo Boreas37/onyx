@@ -91,8 +91,10 @@ func TestRunMultiRejectsUnmergeableFormats(t *testing.T) {
 		w.Write([]byte("x"))
 	}))
 	defer clean.Close()
-	for _, format := range []string{"json", "sarif", "cyclonedx"} {
-		o := scanOptions{dbPath: emptyDB(t), format: format, silent: true}
+	// json and sarif are now aggregate formats (see batch_test.go); the
+	// remaining single-document formats are still rejected up front.
+	for _, format := range []string{"cyclonedx", "markdown", "md", "html", "junit", "gitlab-sast"} {
+		o := scanOptions{dbPath: emptyDB(t), format: format, silent: true, noIntel: true}
 		if code := runMulti([]string{clean.URL, clean.URL}, o); code != 2 {
 			t.Errorf("--format %s multi-target exit = %d, want 2", format, code)
 		}

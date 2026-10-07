@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 
@@ -423,61 +424,70 @@ func PrintSARIF(version string, res *scanner.Result) {
 	writeSARIF(os.Stdout, version, res)
 }
 
-// writeSARIF renders res as a SARIF 2.1.0 report into w: one rule per
-// distinct vulnerability id (CVE or feed id), with the severity recorded as
-// an onyx:severity property; results reference their rule by index as well
-// as by id. Split from PrintSARIF so tests can render into a buffer.
-func writeSARIF(w io.Writer, version string, res *scanner.Result) {
-	type location struct {
-		ArtifactLocation struct {
-			URI string `json:"uri"`
-		} `json:"artifactLocation"`
-	}
-	type message struct {
-		Text string `json:"text"`
-	}
-	type rule struct {
-		ID               string  `json:"id"`
-		Name             string  `json:"name"`
-		ShortDescription message `json:"shortDescription"`
-		HelpURI          string  `json:"helpURI"`
-		Properties       struct {
-			Tags     []string `json:"tags"`
-			Severity string   `json:"onyx:severity"`
-		} `json:"properties"`
-	}
-	type result struct {
-		RuleID    string     `json:"ruleId"`
-		RuleIndex int        `json:"ruleIndex"`
-		Level     string     `json:"level"`
-		Message   message    `json:"message"`
-		Locations []location `json:"locations"`
-	}
-	type run struct {
-		Tool struct {
-			Driver struct {
-				Name           string `json:"name"`
-				Version        string `json:"version"`
-				InformationURI string `json:"informationUri"`
-				Rules          []rule `json:"rules"`
-			} `json:"driver"`
-		} `json:"tool"`
-		Results []result `json:"results"`
-	}
-	type sarif struct {
-		Schema  string `json:"$schema"`
-		Version string `json:"version"`
-		Runs    []run  `json:"runs"`
-	}
+// The sarif* types are the SARIF 2.1.0 document shapes shared by the
+// single-target and multi-run writers. Field order and JSON tags are
+// load-bearing: keeping them identical to the historical inline definitions
+// is what makes the single-target document byte-identical.
+type sarifLocation struct {
+	ArtifactLocation struct {
+		URI string `json:"uri"`
+	} `json:"artifactLocation"`
+}
 
-	out := sarif{
-		Schema:  "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-		Version: "2.1.0",
-		Runs:    []run{{}},
-	}
-	out.Runs[0].Tool.Driver.Name = "onyx"
-	out.Runs[0].Tool.Driver.Version = version
-	out.Runs[0].Tool.Driver.InformationURI = "https://github.com/Boreas37/onyx"
+type sarifMessage struct {
+	Text string `json:"text"`
+}
+
+type sarifRule struct {
+	ID               string       `json:"id"`
+	Name             string       `json:"name"`
+	ShortDescription sarifMessage `json:"shortDescription"`
+	HelpURI          string       `json:"helpURI"`
+	Properties       struct {
+		Tags     []string `json:"tags"`
+		Severity string   `json:"onyx:severity"`
+	} `json:"properties"`
+}
+
+type sarifResult struct {
+	RuleID    string          `json:"ruleId"`
+	RuleIndex int             `json:"ruleIndex"`
+	Level     string          `json:"level"`
+	Message   sarifMessage    `json:"message"`
+	Locations []sarifLocation `json:"locations"`
+}
+
+type sarifRun struct {
+	Tool struct {
+		Driver struct {
+			Name           string      `json:"name"`
+			Version        string      `json:"version"`
+			InformationURI string      `json:"informationUri"`
+			Rules          []sarifRule `json:"rules"`
+		} `json:"driver"`
+	} `json:"tool"`
+	Results []sarifResult `json:"results"`
+	// Name identifies the scanned host in multi-run logs; it is omitted for
+	// the single-target document so its bytes do not change.
+	Name string `json:"name,omitempty"`
+}
+
+type sarifLog struct {
+	Schema  string     `json:"$schema"`
+	Version string     `json:"version"`
+	Runs    []sarifRun `json:"runs"`
+}
+
+const sarifSchema = "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json"
+
+// buildSARIFRun builds one SARIF run for a scan result: one rule per distinct
+// vulnerability id (CVE or feed id), with the severity recorded as an
+// onyx:severity property, and results referencing their rule by index and id.
+func buildSARIFRun(version string, res *scanner.Result) sarifRun {
+	run := sarifRun{}
+	run.Tool.Driver.Name = "onyx"
+	run.Tool.Driver.Version = version
+	run.Tool.Driver.InformationURI = "https://github.com/Boreas37/onyx"
 
 	ruleIdx := make(map[string]int)
 	for i := range res.Findings {
@@ -489,33 +499,68 @@ func writeSARIF(w io.Writer, version string, res *scanner.Result) {
 			}
 			idx, ok := ruleIdx[ruleID]
 			if !ok {
-				r := rule{ID: ruleID, Name: ruleID}
-				r.ShortDescription.Text = v.Title
+				rule := sarifRule{ID: ruleID, Name: ruleID}
+				rule.ShortDescription.Text = v.Title
 				if v.CVE != "" {
-					r.HelpURI = "https://nvd.nist.gov/vuln/detail/" + v.CVE
+					rule.HelpURI = "https://nvd.nist.gov/vuln/detail/" + v.CVE
 				} else {
-					r.HelpURI = "https://wordfence.com/threat-intel/"
+					rule.HelpURI = "https://wordfence.com/threat-intel/"
 				}
-				r.Properties.Tags = []string{"security"}
-				r.Properties.Severity = sevClass(v.Rating)
-				idx = len(out.Runs[0].Tool.Driver.Rules)
-				out.Runs[0].Tool.Driver.Rules = append(out.Runs[0].Tool.Driver.Rules, r)
+				rule.Properties.Tags = []string{"security"}
+				rule.Properties.Severity = sevClass(v.Rating)
+				idx = len(run.Tool.Driver.Rules)
+				run.Tool.Driver.Rules = append(run.Tool.Driver.Rules, rule)
 				ruleIdx[ruleID] = idx
 			}
-			r := result{
+			rr := sarifResult{
 				RuleID:    ruleID,
 				RuleIndex: idx,
 				Level:     sarifLevel(v.Rating),
-				Locations: []location{{}},
+				Locations: []sarifLocation{{}},
 			}
-			r.Message.Text = v.Title
-			r.Locations[0].ArtifactLocation.URI = res.Target
-			out.Runs[0].Results = append(out.Runs[0].Results, r)
+			rr.Message.Text = v.Title
+			rr.Locations[0].ArtifactLocation.URI = res.Target
+			run.Results = append(run.Results, rr)
 		}
+	}
+	return run
+}
+
+// writeSARIF renders res as a single-run SARIF 2.1.0 report into w. Split
+// from PrintSARIF so tests can render into a buffer.
+func writeSARIF(w io.Writer, version string, res *scanner.Result) {
+	out := sarifLog{
+		Schema:  sarifSchema,
+		Version: "2.1.0",
+		Runs:    []sarifRun{buildSARIFRun(version, res)},
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
+}
+
+// WriteMultiSARIF writes ONE SARIF 2.1.0 log to w with one run per scanned
+// host, each run named after its host (used by batch mode). Single-target
+// output is unaffected: PrintSARIF/WriteSARIF still emit one unnamed run.
+func WriteMultiSARIF(w io.Writer, version string, results []*scanner.Result) {
+	out := sarifLog{Schema: sarifSchema, Version: "2.1.0"}
+	for _, res := range results {
+		run := buildSARIFRun(version, res)
+		run.Name = hostOfTarget(res.Target)
+		out.Runs = append(out.Runs, run)
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}
+
+// hostOfTarget returns the host[:port] of a target URL for run naming,
+// falling back to the raw string when it cannot be parsed.
+func hostOfTarget(target string) string {
+	if u, err := url.Parse(target); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return target
 }
 
 // gitlabSeverity maps a rating onto the GitLab SAST severity set. The
