@@ -83,9 +83,59 @@ onyx scan https://example.com
 | `--multicall-max-passwords N` | Passwords per XML-RPC multicall request (default 3) |
 | `--wp-auth USER:PASS` | Authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (create one in wp-admin → Users → Profile → Application Passwords) |
 | `--no-brute` | Disable credential brute force (wp-login and XML-RPC) |
+| `--input FILE` | Batch: scan every target in `FILE` (one per line; blank lines and `#` comments ignored) |
+| `--host-concurrency N` | Batch: hosts scanned in parallel (default 2, max 16) — `--threads`, `--rate-limit`, `--max-requests` and `--max-scan-duration` are **per host** |
+| `--output-dir DIR` | Batch: write a `<host>.json` per target plus `DIR/batch-summary.json` |
 | `--silent` | Suppress progress output; only the result is printed |
 
 Run `onyx` with no arguments for the full flag reference.
+
+### Batch scanning
+
+Scan many hosts in one run — from a file, from positional arguments, or both:
+
+```bash
+onyx scan --input targets.txt --host-concurrency 4 --format json
+onyx scan https://a.example https://b.example --output-dir results/
+```
+
+`targets.txt` holds one target per line: blank lines and `#` comments are
+ignored, CRLF is tolerated, bare hostnames get an `https://` scheme, and the
+list is deduplicated by host (max 5000).
+
+- The vulnerability database is loaded **once per batch**, not once per host
+  (same for the PoC tracker index) — reloading the ~151 MB feed for every
+  target would be a bug.
+- `--host-concurrency N` (default **2**, range 1–16) sets how many hosts run at
+  once. Every other budget flag — `--threads`, `--rate-limit`,
+  `--per-host-rate-limit`, `--max-requests` and `--max-scan-duration` — is
+  **applied per host**, so each target keeps its own request cap and pacing.
+- A host that fails (DNS, TLS, timeout, connection refused, out of scope) is
+  recorded as a failed target with its reason and the batch keeps going.
+  Ctrl-C stops dispatching new hosts and still prints the summary of the hosts
+  that already finished.
+- Progress is a single `\r`-updated stderr line plus one compact
+  line per finished host (`[4/10] example.com  ok  7 findings (2 critical)  12.3s`).
+  Both are drawn **only in a terminal** and disabled by `--silent`; a piped run
+  writes nothing to stderr. Per-finding output stays behind `--verbose`.
+- Output: the table formats print an end-of-batch summary (totals, ok/failed,
+  findings by severity, the 5 worst hosts); `--format json` emits one aggregate
+  document `{"targets":[…],"summary":{…}}`; `--format csv` prepends a `target`
+  column; `--format sarif` emits one run per host; `--output-dir DIR` writes a
+  `<host>.json` per target plus `DIR/batch-summary.json`; `--output FILE`
+  writes the aggregate document to `FILE`.
+- In batch mode the exit code is `0` when at least one target was scanned, `1`
+  when every target failed, and `2` for a usage error (bad flags, empty list).
+  Single-target exit codes (`0`/`5`/`2`) are unchanged.
+
+Two deliberate decisions from the RM6 spec: a reachable target that is **not**
+WordPress is recorded as `ok:true` (it was scanned, just not WordPress) with
+zero findings — only unreachable/unscannable targets are `failed`; and
+deduplication keys on the lowercased host, so `example.com`, `EXAMPLE.com/` and
+`https://example.com` collapse to the first occurrence. The version bump to
+`0.3.0` changes only the version string in the table banner and the SARIF
+`driver.version` — single-target JSON, CSV, JSONL and the table body are
+byte-identical to `0.2.x`.
 
 ### Exploit-oriented checks
 
@@ -139,8 +189,9 @@ or missing tracker clone only print a `[WARN]` and the scan still completes.
 | Code | Meaning |
 |---|---|
 | `0` | Scan finished, no vulnerable components found |
-| `5` | Vulnerabilities found |
-| `2` | Error (bad URL, unreachable target, missing DB) |
+| `5` | Vulnerabilities found (single-target) |
+| `2` | Error (bad URL, unreachable target, missing DB, usage error) |
+| `1` | Batch only: every target failed (batch success is `0`, and findings do not change the code) |
 
 ## How it works
 
@@ -177,7 +228,10 @@ scan may be incomplete.
 During a scan a single live progress line renders on stderr in a terminal
 (`[##########----------] 50% 252/500 12s`). When output is piped or logged,
 no control characters are emitted — just `[INF]` log lines. `--silent`
-disables progress entirely; stdout always carries only the results.
+disables progress entirely; stdout always carries only the results. In batch
+mode the progress bar and the per-host completion lines are drawn only in a
+terminal, so a piped batch writes nothing to stderr at all — the aggregate
+result on stdout is the whole story.
 
 ## The database
 

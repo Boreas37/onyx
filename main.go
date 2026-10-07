@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	onyxVersion     = "0.2.0"
+	onyxVersion     = "0.3.0"
 	defaultDB       = "data/wordfence.json"
 	feedProduction  = "production"
 	feedScanner     = "scanner"
@@ -54,13 +54,22 @@ func main() {
 
 	switch os.Args[1] {
 	case "scan":
-		target, opts := parseScanArgs(os.Args[2:])
-		if target == "" {
-			fmt.Fprintln(os.Stderr, "error: scan needs a target URL")
+		_, opts := parseScanArgs(os.Args[2:])
+		targets, err := loadTargetList(opts)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
 			usage()
 			os.Exit(2)
 		}
-		os.Exit(runScan(target, opts))
+		if len(targets) == 0 {
+			fmt.Fprintln(os.Stderr, "error: scan needs a target URL or --input FILE")
+			usage()
+			os.Exit(2)
+		}
+		if len(targets) == 1 {
+			os.Exit(runScan(targets[0], opts))
+		}
+		os.Exit(runBatch(targets, opts))
 	case "update":
 		updCmd.Parse(os.Args[2:])
 		feed := strings.ToLower(*updFeed)
@@ -174,6 +183,11 @@ type scanOptions struct {
 	wpAuth              string
 	noBrute             bool
 	noSummary           bool
+	// RM6 batch scanning.
+	targets         []string // every positional target, in order (target is targets[0])
+	input           string   // --input FILE: targets list
+	hostConcurrency int      // --host-concurrency N: hosts scanned in parallel
+	outputDir       string   // --output-dir DIR: per-host JSON files
 }
 
 // parseScanArgs parses `scan` arguments by hand so flags can come before or
@@ -188,6 +202,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	o.connectTimeout = 10
 	o.contentDir = "wp-content"
 	o.pluginsDir = "wp-content/plugins"
+	o.hostConcurrency = 2
 	setFlags := make(map[string]bool)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -349,6 +364,20 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			o.noBrute = true
 		case a == "--no-summary":
 			o.noSummary = true
+		case a == "--input" && i+1 < len(args):
+			i++
+			o.input = args[i]
+		case a == "--host-concurrency" && i+1 < len(args):
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < minHostConcurrency || n > maxHostConcurrency {
+				fmt.Fprintf(os.Stderr, "invalid --host-concurrency %q (use %d-%d)\n", args[i], minHostConcurrency, maxHostConcurrency)
+				os.Exit(2)
+			}
+			o.hostConcurrency = n
+		case a == "--output-dir" && i+1 < len(args):
+			i++
+			o.outputDir = args[i]
 		case a == "--config" && i+1 < len(args):
 			i++
 			o.configPath = args[i]
@@ -356,6 +385,7 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 			fmt.Fprintln(os.Stderr, "unknown flag:", a)
 			os.Exit(2)
 		default:
+			o.targets = append(o.targets, a)
 			if target == "" {
 				target = a
 				setFlags["url"] = true
@@ -386,6 +416,20 @@ func parseScanArgs(args []string) (target string, o scanOptions) {
 	default:
 		fmt.Fprintf(os.Stderr, "invalid --format %q (use table, cli-no-colour, json, jsonl, sarif or csv)\n", o.format)
 		os.Exit(2)
+	}
+	// A config-file URL is not a positional target, so mirror it into the
+	// target list (first, matching its precedence over file entries).
+	if target != "" {
+		found := false
+		for _, t := range o.targets {
+			if t == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			o.targets = append([]string{target}, o.targets...)
+		}
 	}
 	return target, o
 }
@@ -473,7 +517,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `onyx — local-first WordPress vulnerability scanner
 
 Usage:
-  onyx scan <url> [flags]    scan a WordPress site
+  onyx scan <url> [url...] [flags]   scan one or more WordPress sites
   onyx update [flags]        fetch the latest database
   onyx version               print the version
 
@@ -529,6 +573,9 @@ Scan flags:
   --multicall-max-passwords N  passwords per XML-RPC multicall request (default: 3)
   --wp-auth USER:PASS  authenticated REST inventory over HTTP Basic auth — use a WordPress Application Password (wp-admin → Users → Profile → Application Passwords)
   --no-brute         disable credential brute force (wp-login and XML-RPC)
+  --input FILE       scan every target in FILE (one target per line; blank lines and # comments ignored)
+  --host-concurrency N  hosts scanned in parallel (default: 2, range 1-16); threads/rate-limit/max-requests/max-scan-duration are per host
+  --output-dir DIR   batch mode: write a <host>.json per target plus DIR/batch-summary.json
   --config FILE      JSON config file; explicit CLI flags win over config values
 
 Update flags:
@@ -792,17 +839,7 @@ func collectPoCs(res *scanner.Result, o scanOptions) {
 	if len(res.Nuclei) == 0 {
 		return
 	}
-	dir := o.pocTrackerDir
-	if dir == "" {
-		dir = os.Getenv("POC_TRACKER_DIR")
-	}
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			dir = filepath.Join(home, "projects", "cve-tracker")
-		}
-	}
-	dir = expandHome(dir)
+	dir := resolvePocTrackerDir(o)
 	if dir == "" {
 		return
 	}
@@ -872,6 +909,23 @@ func splitNucleiArgs(s string) []string {
 		args = append(args, s[start:])
 	}
 	return args
+}
+
+// resolvePocTrackerDir resolves the CVE-PoC-Tracker directory from
+// --poc-tracker-dir, $POC_TRACKER_DIR, or ~/projects/cve-tracker, expanding
+// a leading ~. It returns "" when no candidate is set.
+func resolvePocTrackerDir(o scanOptions) string {
+	dir := o.pocTrackerDir
+	if dir == "" {
+		dir = os.Getenv("POC_TRACKER_DIR")
+	}
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dir = filepath.Join(home, "projects", "cve-tracker")
+		}
+	}
+	return expandHome(dir)
 }
 
 // expandHome replaces a leading ~/ (and bare ~) with the user's home

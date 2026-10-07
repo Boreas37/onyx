@@ -331,6 +331,13 @@ func sarifLevel(rating string) string {
 // PrintSARIF writes res as a minimal SARIF 2.1.0 report: a single run whose
 // tool driver is "onyx" and whose results are the scan findings.
 func PrintSARIF(version string, res *scanner.Result) {
+	WriteMultiSARIF(os.Stdout, version, []*scanner.Result{res})
+}
+
+// WriteMultiSARIF writes a SARIF 2.1.0 log to w with one run per result
+// (used by batch mode: one run per scanned host). Single-target output is
+// byte-identical to PrintSARIF's historical shape.
+func WriteMultiSARIF(w io.Writer, version string, results []*scanner.Result) {
 	type location struct {
 		ArtifactLocation struct {
 			URI string `json:"uri"`
@@ -362,28 +369,31 @@ func PrintSARIF(version string, res *scanner.Result) {
 	out := sarif{
 		Schema:  "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
 		Version: "2.1.0",
-		Runs:    []run{{}},
 	}
-	out.Runs[0].Tool.Driver.Name = "onyx"
-	out.Runs[0].Tool.Driver.Version = version
-	for i := range res.Findings {
-		f := &res.Findings[i]
-		for _, v := range f.Vulnerabilities {
-			ruleID := v.CVE
-			if ruleID == "" {
-				ruleID = v.ID
+	for _, res := range results {
+		r := run{}
+		r.Tool.Driver.Name = "onyx"
+		r.Tool.Driver.Version = version
+		for i := range res.Findings {
+			f := &res.Findings[i]
+			for _, v := range f.Vulnerabilities {
+				ruleID := v.CVE
+				if ruleID == "" {
+					ruleID = v.ID
+				}
+				rr := result{
+					RuleID:    ruleID,
+					Level:     sarifLevel(v.Rating),
+					Locations: []location{{}},
+				}
+				rr.Message.Text = v.Title
+				rr.Locations[0].ArtifactLocation.URI = res.Target
+				r.Results = append(r.Results, rr)
 			}
-			r := result{
-				RuleID:    ruleID,
-				Level:     sarifLevel(v.Rating),
-				Locations: []location{{}},
-			}
-			r.Message.Text = v.Title
-			r.Locations[0].ArtifactLocation.URI = res.Target
-			out.Runs[0].Results = append(out.Runs[0].Results, r)
 		}
+		out.Runs = append(out.Runs, r)
 	}
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
 }
