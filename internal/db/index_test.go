@@ -214,8 +214,7 @@ func TestIndexStaleByMtime(t *testing.T) {
 		t.Fatal(err)
 	}
 	idxPath := path + ".idx"
-	before, err := os.Stat(idxPath)
-	if err != nil {
+	if _, err := os.Stat(idxPath); err != nil {
 		t.Fatal(err)
 	}
 	// Filesystems differ in timestamp granularity. Pin the old sidecar far
@@ -224,7 +223,7 @@ func TestIndexStaleByMtime(t *testing.T) {
 	if err := os.Chtimes(idxPath, old, old); err != nil {
 		t.Fatal(err)
 	}
-	before, err = os.Stat(idxPath)
+	before, err := os.Stat(idxPath)
 	if err != nil {
 		t.Fatal(err)
 	}
